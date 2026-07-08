@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GrokHack — Multiplayer Roguelike MMO</title>
+  <meta name="description" content="A massively multiplayer NetHack-inspired roguelike. Play in your browser. Shared dungeon floors. Permadeath. Free & open source." />
+  <meta property="og:title" content="GrokHack MMO" />
+  <meta property="og:description" content="Multiplayer terminal roguelike. Descend 10 floors. Don't starve. Don't die." />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="GrokHack MMO" />
+  <meta name="twitter:description" content="NetHack meets MMO. Play free in browser. Open source." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/landing.css" />
+</head>
+<body>
+  <div class="hero">
+    <p class="eyebrow">open source · multiplayer · permadeath</p>
+    <h1>GrokHack</h1>
+    <p class="tagline">A NetHack-inspired roguelike MMO. Shared dungeon floors. One life. Ten depths. A dragon.</p>
+
+    <div class="live" id="live">
+      <span class="dot"></span>
+      <span id="online">…</span> adventurers online
+    </div>
+
+    <div class="cta">
+      <a class="btn primary" href="/play.html">Play in Browser</a>
+      <a class="btn" href="https://github.com/romanmondello/grokhack" target="_blank" rel="noopener">GitHub</a>
+    </div>
+
+    <p class="telnet" id="telnet-hint">Also playable via telnet — see README</p>
+  </div>
+
+  <section class="grid">
+    <article>
+      <h2>Shared World</h2>
+      <p>Every depth is one dungeon. Monsters, loot, and other players are real. First to the stairs wins the race down.</p>
+    </article>
+    <article>
+      <h2>Classic Roguelike</h2>
+      <p>Turn-based. Unidentified potions. Hunger. Permadeath. If you know NetHack, you already know half the controls.</p>
+    </article>
+    <article>
+      <h2>Play Anywhere</h2>
+      <p>Browser, telnet, or WebSocket client. No install. Jump in, pick a name, die horribly within minutes.</p>
+    </article>
+  </section>
+
+  <section class="controls">
+    <h2>Controls</h2>
+    <code>hjkl</code> move · <code>i</code> inventory · <code>.</code> wait · <code>&gt;</code> descend · <code>:say hi</code> chat · <code>who</code> players
+  </section>
+
+  <footer>
+    <p>MIT licensed. Built for the roguelike curious.</p>
+    <p><a href="https://github.com/romanmondello/grokhack">Star on GitHub</a> · Share on X with <code>#roguelike #nethack #indiedev</code></p>
+  </footer>
+
+  <script>
+    const api = window.GROKHACK_API || '/api/status';
+    fetch(api).then(r => r.json()).then(d => {
+      document.getElementById('online').textContent = d.onlinePlayers ?? 0;
+    }).catch(() => {
+      document.getElementById('online').textContent = '?';
+    });
+  </script>
+</body>
+</html>

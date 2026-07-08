@@ -1,0 +1,230 @@
+:root {
+  --bg: #0a0a0f;
+  --panel: #12121a;
+  --border: #2a2a3a;
+  --text: #c8c8d8;
+  --dim: #6a6a7a;
+  --accent: #c9a227;
+  --danger: #c94a4a;
+  --heal: #4ac97a;
+  --floor: #1a1a24;
+  --wall: #3a3a4a;
+  --fog: #050508;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "IBM Plex Mono", "Courier New", monospace;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 1rem;
+}
+
+#app {
+  width: min(1200px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.title-bar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.5rem;
+}
+
+.title-bar h1 {
+  font-size: 1.4rem;
+  color: var(--accent);
+  letter-spacing: 0.08em;
+}
+
+.subtitle {
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+
+.game-layout {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 0.75rem;
+}
+
+.dungeon-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#dungeon {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem;
+}
+
+.panel h2 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  margin-bottom: 0.5rem;
+}
+
+.hint {
+  font-weight: 400;
+  color: var(--dim);
+}
+
+#hud {
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+#hud .stat-row {
+  display: flex;
+  justify-content: space-between;
+}
+
+#hud .bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 2px;
+  margin: 2px 0 6px;
+  overflow: hidden;
+}
+
+#hud .bar-fill {
+  height: 100%;
+  transition: width 0.15s;
+}
+
+#hud .hp-fill { background: var(--danger); }
+#hud .hunger-fill { background: var(--accent); }
+#hud .xp-fill { background: var(--heal); }
+
+#inventory {
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+#inventory .item {
+  color: var(--text);
+}
+
+#inventory .item.equipped {
+  color: var(--accent);
+}
+
+#message-log {
+  font-size: 0.75rem;
+  line-height: 1.45;
+  max-height: 200px;
+  overflow-y: auto;
+  color: var(--dim);
+}
+
+#message-log .msg {
+  margin-bottom: 0.2rem;
+}
+
+#message-log .msg.recent {
+  color: var(--text);
+}
+
+.controls-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  font-size: 0.75rem;
+  color: var(--dim);
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.overlay.hidden {
+  display: none;
+}
+
+.overlay-content {
+  background: var(--panel);
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+  padding: 2rem;
+  max-width: 480px;
+  text-align: center;
+}
+
+.overlay-content h2 {
+  color: var(--accent);
+  font-size: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.overlay-content p {
+  line-height: 1.6;
+  margin-bottom: 0.75rem;
+  color: var(--text);
+}
+
+.overlay-content .tombstone {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+}
+
+.overlay-content button {
+  margin-top: 1rem;
+  padding: 0.6rem 1.5rem;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.overlay-content button:hover {
+  filter: brightness(1.1);
+}
+
+@media (max-width: 900px) {
+  .game-layout {
+    grid-template-columns: 1fr;
+  }
+}

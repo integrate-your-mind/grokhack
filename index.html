@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GrokHack — A NetHack-inspired Roguelike</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="title-bar">
+        <h1>GrokHack</h1>
+        <span class="subtitle">descend into the depths</span>
+      </header>
+      <main class="game-layout">
+        <div class="dungeon-panel">
+          <canvas id="dungeon" width="800" height="480"></canvas>
+        </div>
+        <aside class="sidebar">
+          <section class="panel hud-panel">
+            <h2>Status</h2>
+            <div id="hud"></div>
+          </section>
+          <section class="panel inventory-panel">
+            <h2>Inventory <span class="hint">[i]</span></h2>
+            <div id="inventory"></div>
+          </section>
+          <section class="panel log-panel">
+            <h2>Messages</h2>
+            <div id="message-log"></div>
+          </section>
+        </aside>
+      </main>
+      <footer class="controls-bar">
+        <span>Move: arrows / hjkl</span>
+        <span>Wait: .</span>
+        <span>Inventory: i</span>
+        <span>Descend: &gt;</span>
+        <span>Quit: Q</span>
+      </footer>
+      <div id="overlay" class="overlay hidden">
+        <div class="overlay-content" id="overlay-content"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,149 @@
+:root {
+  --bg: #08080c;
+  --text: #d8d8e8;
+  --dim: #6a6a7a;
+  --gold: #c9a227;
+  --panel: #12121a;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "IBM Plex Mono", monospace;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.6;
+}
+
+.hero {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 4rem 1.5rem 2rem;
+  text-align: center;
+}
+
+.eyebrow {
+  color: var(--dim);
+  font-size: 0.75rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 1rem;
+}
+
+h1 {
+  font-size: clamp(2.5rem, 8vw, 4rem);
+  color: var(--gold);
+  letter-spacing: 0.08em;
+  margin-bottom: 1rem;
+}
+
+.tagline {
+  font-size: 1.05rem;
+  color: var(--dim);
+  margin-bottom: 2rem;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--panel);
+  border: 1px solid #2a2a3a;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  margin-bottom: 2rem;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ac97a;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.cta {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.85rem 1.6rem;
+  border-radius: 6px;
+  text-decoration: none;
+  font-weight: 600;
+  border: 1px solid #3a3a4a;
+  color: var(--text);
+  transition: filter 0.15s;
+}
+
+.btn:hover { filter: brightness(1.15); }
+
+.btn.primary {
+  background: var(--gold);
+  color: #0a0a0f;
+  border-color: var(--gold);
+}
+
+.telnet { font-size: 0.8rem; color: var(--dim); }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  max-width: 960px;
+  margin: 2rem auto;
+  padding: 0 1.5rem;
+}
+
+.grid article {
+  background: var(--panel);
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 1.25rem;
+}
+
+.grid h2 {
+  color: var(--gold);
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
+}
+
+.grid p { font-size: 0.85rem; color: var(--dim); }
+
+.controls {
+  max-width: 720px;
+  margin: 2rem auto;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.controls h2 { font-size: 0.8rem; color: var(--dim); margin-bottom: 0.75rem; }
+
+.controls code {
+  background: var(--panel);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  display: inline-block;
+}
+
+footer {
+  text-align: center;
+  padding: 3rem 1.5rem;
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
+footer a { color: var(--gold); }

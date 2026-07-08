@@ -1,0 +1,32 @@
+{
+  "name": "grok-hack",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "tsx server/index.ts",
+    "build": "tsc && vite build",
+    "build:server": "tsc -p server/tsconfig.json",
+    "server": "tsx server/index.ts",
+    "tunnel": "cloudflared tunnel --url http://localhost:8080",
+    "tunnel:prod": "cloudflared tunnel --config cloudflare/grokhack-tunnel.yml run grokhack",
+    "deploy:pages": "wrangler pages deploy public --project-name grokhack",
+    "deploy": "bash scripts/deploy.sh",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:sim": "tsx scripts/test-and-simulate.mjs",
+    "test:all": "vitest run && tsx -e \"import { runBatchSimulation } from './src/test-harness.ts'; const r=runBatchSimulation(50); console.log('Sim wins:', r.filter(x=>x.outcome==='won').length+'/50');\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.23.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^4.1.10"
+  }
+}

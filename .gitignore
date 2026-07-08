@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-server/
+dist-test/
+.wrangler/
+.env
+.env.*
+*.log
+.DS_Store
+.agent-tools/

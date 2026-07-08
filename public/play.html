@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Play — GrokHack MMO</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/play.css" />
+</head>
+<body>
+  <div id="join-screen" class="join-screen">
+    <h1>GrokHack</h1>
+    <p>Enter the shared dungeon</p>
+    <input id="name-input" type="text" maxlength="16" placeholder="adventurer name" autocomplete="off" />
+    <button id="join-btn">Descend</button>
+    <p class="err" id="join-err"></p>
+    <p class="hint"><a href="/">← Back</a> · <span id="join-online">…</span> online</p>
+  </div>
+
+  <div id="game" class="game hidden">
+    <header>
+      <a href="/">GrokHack</a>
+      <span id="header-status"></span>
+    </header>
+    <canvas id="canvas" width="800" height="240"></canvas>
+    <div class="panels">
+      <div class="panel" id="hud"></div>
+      <div class="panel" id="log"></div>
+    </div>
+    <footer>hjkl · i inv · . wait · &gt; descend · :say chat · who</footer>
+  </div>
+
+  <div id="overlay" class="overlay hidden">
+    <div class="overlay-box" id="overlay-box"></div>
+  </div>
+
+  <script src="/play.js"></script>
+</body>
+</html>
