@@ -10,7 +10,8 @@
     "build:server": "tsc -p server/tsconfig.json",
     "server": "tsx server/index.ts",
     "tunnel": "cloudflared tunnel --url http://localhost:8080",
-    "tunnel:prod": "cloudflared tunnel --config cloudflare/grokhack-tunnel.yml run grokhack",
+    "tunnel:prod": "cloudflared tunnel --config cloudflare/grokhack-tunnel.yml run 48eb2839-41c7-426b-9bed-8cce35b7b545",
+    "prod": "bash scripts/run-prod.sh",
     "deploy:pages": "wrangler pages deploy public --project-name grokhack",
     "deploy": "bash scripts/deploy.sh",
     "preview": "vite preview",
@@ -20,6 +21,7 @@
     "mcp:build": "cd mcp && npm install && npm run build"
   },
   "dependencies": {
+    "irc-upd": "^0.11.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

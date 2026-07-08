@@ -10,6 +10,15 @@ import { buildAgentState, AGENT_DOCS } from "./agent-protocol.js";
 import { getLeaderboard, getRecentRuns } from "./leaderboard.js";
 import { logEvent, getRecentEvents, getSessionTrace } from "./audit.js";
 import { getGlobalWall, getSocialSnapshot } from "./social.js";
+import {
+  BIND_HOST,
+  rateLimit,
+  requireAdmin,
+  readBody,
+  securityHeaders,
+  safePublicPath,
+  MAX_WS_MESSAGE_BYTES,
+} from "./security.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -24,21 +33,16 @@ const MIME: Record<string, string> = {
 };
 
 function serveStatic(urlPath: string, res: http.ServerResponse): boolean {
-  const safe = urlPath === "/" ? "/index.html" : urlPath;
-  const file = path.join(PUBLIC_DIR, safe.replace(/^\//, ""));
-  if (!file.startsWith(PUBLIC_DIR)) return false;
-  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return false;
+  const file = safePublicPath(PUBLIC_DIR, urlPath);
+  if (!file || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return false;
   const ext = path.extname(file);
-  res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream" });
+  res.writeHead(200, securityHeaders({ "Content-Type": MIME[ext] ?? "application/octet-stream" }));
   res.end(fs.readFileSync(file));
   return true;
 }
 
 function json(res: http.ServerResponse, data: unknown, status = 200): void {
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-  });
+  res.writeHead(status, securityHeaders({ "Content-Type": "application/json" }));
   res.end(JSON.stringify(data));
 }
 
@@ -103,10 +107,27 @@ function pushState(ws: import("ws").WebSocket, world: WorldServer, conn: ClientC
 function attachWebSocket(server: http.Server, world: WorldServer): void {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
-  wss.on("connection", (ws) => {
+  const wsAlive = new WeakMap<import("ws").WebSocket, boolean>();
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (wsAlive.get(ws) === false) return ws.terminate();
+      wsAlive.set(ws, false);
+      ws.ping();
+    });
+  }, 25_000);
+  wss.on("close", () => clearInterval(heartbeat));
+
+  wss.on("connection", (ws, req) => {
+    if (!rateLimit(req)) {
+      ws.close(1008, "Rate limited");
+      return;
+    }
+
     const connId = randomUUID();
     const sessionId = randomUUID();
     let named = false;
+    wsAlive.set(ws, true);
+    ws.on("pong", () => wsAlive.set(ws, true));
 
     logEvent("session_connect", sessionId, { transport: "websocket" });
 
@@ -151,6 +172,10 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
     }));
 
     ws.on("message", (raw) => {
+      if (raw.toString().length > MAX_WS_MESSAGE_BYTES) {
+        ws.close(1009, "Message too large");
+        return;
+      }
       let msg: {
         type: string;
         name?: string;
@@ -182,7 +207,13 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
             chat_history: world.getChatLog(30),
           }));
         }
+        world.broadcastPresence();
         pushState(ws, world, conn);
+        return;
+      }
+
+      if (msg.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", online: world.getOnlineCount() }));
         return;
       }
 
@@ -216,6 +247,7 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
     ws.on("close", () => {
       logEvent("session_disconnect", sessionId, { transport: "websocket", playerId: conn.playerId ?? undefined });
       world.removeConnection(connId);
+      world.broadcastPresence();
     });
   });
 
@@ -223,7 +255,13 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
 }
 
 export function startHttpServer(world: WorldServer, port: number): http.Server {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
+    if (!rateLimit(req)) {
+      res.writeHead(429, securityHeaders({ "Content-Type": "application/json" }));
+      res.end(JSON.stringify({ error: "Rate limited" }));
+      return;
+    }
+
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/api/status") {
@@ -278,29 +316,35 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
       return;
     }
 
+    if (url.pathname === "/api/presence") {
+      json(res, world.getPresence());
+      return;
+    }
+
     if (url.pathname === "/api/audit/client-error" && req.method === "POST") {
-      let body = "";
-      req.on("data", (c) => { body += c; });
-      req.on("end", () => {
-        try {
-          const data = JSON.parse(body) as { sessionId?: string; message?: string; context?: string };
-          logEvent("client_error", data.sessionId || "unknown", {
-            detail: { message: data.message, context: data.context, ua: data },
-          });
-        } catch (err) {
-          logEvent("server_error", "unknown", { detail: { message: String(err) } });
-        }
+      try {
+        const body = await readBody(req, 4096);
+        const data = JSON.parse(body) as { sessionId?: string; message?: string; context?: string };
+        const msg = String(data.message || "").slice(0, 500);
+        logEvent("client_error", String(data.sessionId || "unknown").slice(0, 64), {
+          detail: { message: msg, context: String(data.context || "").slice(0, 100) },
+        });
         json(res, { ok: true });
-      });
+      } catch {
+        res.writeHead(400, securityHeaders({ "Content-Type": "application/json" }));
+        res.end(JSON.stringify({ error: "Bad request" }));
+      }
       return;
     }
 
     if (url.pathname === "/api/audit/recent") {
+      if (!requireAdmin(req, res)) return;
       json(res, { events: getRecentEvents(100) });
       return;
     }
 
     if (url.pathname.startsWith("/api/audit/session/")) {
+      if (!requireAdmin(req, res)) return;
       const sid = url.pathname.split("/").pop() || "";
       json(res, { sessionId: sid, events: getSessionTrace(sid) });
       return;
@@ -323,8 +367,8 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
 
   attachWebSocket(server, world);
 
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`[http] http://0.0.0.0:${port}`);
+  server.listen(port, BIND_HOST, () => {
+    console.log(`[http] http://${BIND_HOST}:${port}`);
   });
 
   return server;

@@ -10,6 +10,7 @@ import {
   stripTelnetCommands,
 } from "./terminal.js";
 import { logEvent } from "./audit.js";
+import { BIND_HOST } from "./security.js";
 import type { ClientConnection } from "./types.js";
 
 export function startTelnetServer(world: WorldServer, port: number): net.Server {
@@ -150,8 +151,8 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     socket.on("error", () => world.removeConnection(connId));
   });
 
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`[telnet] listening on port ${port}`);
+  server.listen(port, BIND_HOST, () => {
+    console.log(`[telnet] ${BIND_HOST}:${port} (localhost only — not exposed via tunnel)`);
   });
 
   return server;

@@ -33,6 +33,8 @@ import {
   setBio,
   touchProfile,
 } from "./social.js";
+import { bridgeOutboundChat } from "./bridge.js";
+import { sanitizeChatText } from "./security.js";
 import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, PlayerKind, WorldStats } from "./types.js";
 
 const MAX_DEPTH = 10;
@@ -59,11 +61,49 @@ export class WorldServer {
 
   getStats(): WorldStats {
     return {
-      onlinePlayers: this.players.size,
+      onlinePlayers: this.getOnlineCount(),
       floorsActive: this.floors.size,
       totalTurns: this.totalTurns,
       uptimeMs: Date.now() - this.startedAt,
     };
+  }
+
+  getPresence() {
+    const players = [...this.players.values()]
+      .filter((p) => p.connected && p.state.alive)
+      .map((p) => ({
+        name: p.name,
+        glyph: p.glyph,
+        kind: p.kind,
+        depth: p.floorDepth,
+        level: p.state.level,
+        hp: p.state.entity.hp,
+      }));
+    return {
+      online: players.length,
+      connections: this.connections.size,
+      players,
+    };
+  }
+
+  broadcastPresence(): void {
+    const payload = { type: "presence", ...this.getPresence() };
+    for (const p of this.players.values()) {
+      if (!p.connected) continue;
+      this.pushRealtime(p, payload);
+    }
+    for (const conn of this.connections.values()) {
+      if (!conn.playerId) {
+        conn.send(`RT:${JSON.stringify(payload)}`);
+      }
+    }
+  }
+
+  ingestExternalChat(from: string, text: string, source: "irc" | "discord"): void {
+    const safeFrom = from.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16) || source;
+    const safeText = sanitizeChatText(text);
+    if (!safeText) return;
+    this.broadcastChat(`[${source}] ${safeFrom}: ${safeText}`, undefined, "global", safeFrom, safeText);
   }
 
   registerConnection(conn: ClientConnection): void {
@@ -404,8 +444,10 @@ export class WorldServer {
     }
 
     if (key.startsWith(":say ") || key.startsWith(":chat ")) {
-      const text = key.includes(" ") ? key.slice(key.indexOf(" ") + 1) : "";
+      const text = sanitizeChatText(key.includes(" ") ? key.slice(key.indexOf(" ") + 1) : "");
+      if (!text) return;
       this.broadcastChat(`${player.name}: ${text}`, player.id, "global", player.name, text);
+      bridgeOutboundChat(player.name, text);
       return;
     }
 

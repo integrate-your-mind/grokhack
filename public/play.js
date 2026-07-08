@@ -10,6 +10,10 @@ let explored = [];
 let sessionId = null;
 let inputLocked = false;
 let joined = false;
+let playerName = null;
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+let pingTimer = null;
 let social = null;
 const chatLines = [];
 const dmLines = [];
@@ -35,10 +39,35 @@ function sendSocial(action, fields = {}) {
   ws.send(JSON.stringify({ type: "social", action, ...fields }));
 }
 
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = Math.min(30_000, 1000 * 2 ** reconnectAttempt);
+  reconnectAttempt++;
+  $("join-err").textContent = `Reconnecting in ${Math.round(delay / 1000)}s…`;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
+}
+
+function startPing() {
+  clearInterval(pingTimer);
+  pingTimer = setInterval(() => {
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "ping" }));
+  }, 20_000);
+}
+
 function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   ws = new WebSocket(WS_URL);
   ws.onopen = () => {
+    reconnectAttempt = 0;
     sessionId = sessionId || crypto.randomUUID();
+    $("join-err").textContent = "";
+    startPing();
+    if (playerName) {
+      ws.send(JSON.stringify({ type: "join", name: playerName, sessionId }));
+    }
   };
   ws.onmessage = (e) => {
     inputLocked = false;
@@ -58,18 +87,28 @@ function connect() {
   ws.onerror = () => reportClientError("websocket error", "ws_error");
   ws.onclose = () => {
     inputLocked = false;
+    clearInterval(pingTimer);
     if (joined) {
-      $("log")?.insertAdjacentHTML("beforeend", `<div style="color:#c94a4a">Disconnected.</div>`);
+      $("log")?.insertAdjacentHTML("beforeend", `<div style="color:#c94a4a">Connection lost — reconnecting…</div>`);
+      scheduleReconnect();
     } else {
-      $("join-err").textContent = "Disconnected from server.";
+      $("join-err").textContent = "Server unreachable — retrying…";
+      scheduleReconnect();
     }
   };
 }
 
 function handleMessage(msg) {
   if (msg.type === "welcome") {
-    $("join-online").textContent = msg.online;
+    $("join-online").textContent = msg.online ?? 0;
     if (msg.sessionId) sessionId = msg.sessionId;
+  } else if (msg.type === "presence" || msg.type === "pong") {
+    const n = msg.online ?? msg.players?.length ?? 0;
+    $("join-online").textContent = n;
+    if (state) state.online = n;
+    if (state?.player && $("header-status")) {
+      $("header-status").textContent = $("header-status").textContent.replace(/· \d+ online/, `· ${n} online`);
+    }
   } else if (msg.type === "error") {
     $("join-err").textContent = msg.message;
   } else if (msg.type === "social_snapshot") {
@@ -313,8 +352,13 @@ function sendText(text) {
 $("join-btn").onclick = () => {
   const name = $("name-input").value.trim();
   if (!name) return;
+  playerName = name;
   joined = true;
-  ws.send(JSON.stringify({ type: "join", name, sessionId }));
+  if (ws?.readyState === 1) {
+    ws.send(JSON.stringify({ type: "join", name, sessionId }));
+  } else {
+    connect();
+  }
 };
 
 $("name-input").onkeydown = (e) => {
@@ -383,8 +427,13 @@ document.addEventListener("keydown", (e) => {
   sendKey(map[e.key] || e.key);
 });
 
-fetch("/api/status").then(r => r.json()).then(d => {
-  $("join-online").textContent = d.onlinePlayers ?? 0;
-}).catch(() => {});
-
+function refreshOnlineCount() {
+  fetch("/api/status").then(r => r.json()).then(d => {
+    $("join-online").textContent = d.onlinePlayers ?? 0;
+  }).catch(() => {
+    $("join-online").textContent = "?";
+  });
+}
+refreshOnlineCount();
+setInterval(refreshOnlineCount, 15_000);
 connect();
