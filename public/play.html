@@ -5,77 +5,106 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Play — GrokHack MMO</title>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/play.css" />
+  <link rel="stylesheet" href="/play.css?v=2" />
 </head>
 <body>
   <div id="join-screen" class="join-screen">
     <h1>GrokHack</h1>
     <p>Enter the shared dungeon</p>
     <input id="name-input" type="text" maxlength="16" placeholder="adventurer name" autocomplete="off" />
-    <button id="join-btn">Descend</button>
+    <button id="join-btn" type="button">Descend</button>
     <p class="err" id="join-err"></p>
     <p class="hint"><a href="/">← Back</a> · <span id="join-online">…</span> online</p>
   </div>
 
   <div id="game" class="game hidden">
-    <header>
-      <a href="/">GrokHack</a>
-      <span id="header-status"></span>
-    </header>
-    <div class="game-layout">
-      <div class="game-main">
-        <canvas id="canvas" width="800" height="240"></canvas>
-        <div class="panels">
-          <div class="panel" id="hud"></div>
-          <div class="panel" id="log"></div>
-        </div>
+    <header class="topbar">
+      <div class="topbar-left">
+        <a href="/">GrokHack</a>
+        <span id="conn-dot" class="conn-dot" title="Connecting"></span>
       </div>
-      <aside class="social-panel" id="social-panel">
-        <div class="social-tabs">
-          <button class="tab active" data-tab="chat">Chat</button>
-          <button class="tab" data-tab="friends">Friends</button>
-          <button class="tab" data-tab="dms">DMs</button>
-          <button class="tab" data-tab="wall">Wall</button>
-        </div>
-        <div class="tab-pane active" id="tab-chat">
-          <div class="feed" id="chat-feed"></div>
-          <form id="chat-form" class="social-form">
-            <input id="chat-input" type="text" maxlength="200" placeholder="Say something…" autocomplete="off" />
-            <button type="submit">Send</button>
-          </form>
-        </div>
-        <div class="tab-pane" id="tab-friends">
-          <form id="friend-form" class="social-form inline">
-            <input id="friend-input" type="text" maxlength="16" placeholder="Add friend…" autocomplete="off" />
-            <button type="submit">+</button>
-          </form>
-          <div id="pending-in" class="sublist"></div>
-          <ul id="friends-list" class="friend-list"></ul>
-        </div>
-        <div class="tab-pane" id="tab-dms">
-          <form id="dm-form" class="social-form stacked">
-            <input id="dm-target" type="text" maxlength="16" placeholder="To…" autocomplete="off" />
-            <input id="dm-text" type="text" maxlength="280" placeholder="Message…" autocomplete="off" />
-            <button type="submit">DM</button>
-          </form>
-          <div class="feed" id="dm-feed"></div>
-        </div>
-        <div class="tab-pane" id="tab-wall">
-          <div class="feed" id="wall-feed"></div>
-          <form id="wall-form" class="social-form">
-            <input id="wall-input" type="text" maxlength="280" placeholder="Post to wall…" autocomplete="off" />
-            <button type="submit">Post</button>
-          </form>
-        </div>
-      </aside>
+      <span id="header-status"></span>
+      <div class="topbar-actions">
+        <button type="button" id="btn-chat" class="pill" title="Enter or /">Chat</button>
+        <button type="button" id="btn-social" class="pill">Social</button>
+      </div>
+    </header>
+
+    <div class="play-area" id="play-area">
+      <canvas id="canvas" width="800" height="240" tabindex="0" aria-label="Dungeon map"></canvas>
+      <div id="hud" class="hud-bar"></div>
+      <div id="log" class="game-log"></div>
     </div>
-    <footer>hjkl · i inv · . wait · &gt; descend · chat panel →</footer>
+
+    <div id="chat-dock" class="chat-dock collapsed">
+      <button type="button" id="chat-toggle" class="chat-toggle">
+        <span>Chat</span>
+        <span id="chat-badge" class="badge hidden">0</span>
+      </button>
+      <div class="chat-body">
+        <div class="feed" id="chat-feed" role="log" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" type="text" maxlength="200" placeholder="Message everyone… (Enter send, Esc close)" autocomplete="off" />
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </div>
+
+    <aside id="social-drawer" class="social-drawer" aria-hidden="true">
+      <div class="drawer-head">
+        <strong>Social</strong>
+        <button type="button" id="social-close" aria-label="Close">×</button>
+      </div>
+      <div class="social-tabs">
+        <button type="button" class="tab active" data-tab="friends">Friends</button>
+        <button type="button" class="tab" data-tab="dms">DMs</button>
+        <button type="button" class="tab" data-tab="wall">Wall</button>
+      </div>
+      <div class="tab-pane active" id="tab-friends">
+        <form id="friend-form" class="inline-form">
+          <input id="friend-input" type="text" maxlength="16" placeholder="Add friend…" autocomplete="off" />
+          <button type="submit">Add</button>
+        </form>
+        <div id="pending-in" class="sublist"></div>
+        <ul id="friends-list" class="friend-list"></ul>
+      </div>
+      <div class="tab-pane" id="tab-dms">
+        <form id="dm-form" class="stack-form">
+          <input id="dm-target" type="text" maxlength="16" placeholder="To…" autocomplete="off" />
+          <input id="dm-text" type="text" maxlength="280" placeholder="Message…" autocomplete="off" />
+          <button type="submit">Send DM</button>
+        </form>
+        <div class="feed" id="dm-feed"></div>
+      </div>
+      <div class="tab-pane" id="tab-wall">
+        <div class="feed" id="wall-feed"></div>
+        <form id="wall-form" class="inline-form">
+          <input id="wall-input" type="text" maxlength="280" placeholder="Post…" autocomplete="off" />
+          <button type="submit">Post</button>
+        </form>
+      </div>
+    </aside>
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+
+    <footer class="controls-bar">
+      <span class="keys">Move <kbd>h</kbd><kbd>j</kbd><kbd>k</kbd><kbd>l</kbd> · <kbd>.</kbd> wait · <kbd>i</kbd> inv · <kbd>&gt;</kbd> stairs</span>
+      <span class="keys"><kbd>Enter</kbd> chat · <kbd>Esc</kbd> close · <kbd>1-9</kbd> use</span>
+      <div class="dpad" id="dpad" aria-label="Touch controls">
+        <button type="button" data-key="k" class="dpad-btn up">▲</button>
+        <button type="button" data-key="h" class="dpad-btn left">◀</button>
+        <button type="button" data-key="." class="dpad-btn mid">•</button>
+        <button type="button" data-key="l" class="dpad-btn right">▶</button>
+        <button type="button" data-key="j" class="dpad-btn down">▼</button>
+      </div>
+    </footer>
   </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
 
   <div id="overlay" class="overlay hidden">
     <div class="overlay-box" id="overlay-box"></div>
   </div>
 
-  <script src="/play.js"></script>
+  <script src="/play.js?v=2"></script>
 </body>
 </html>
