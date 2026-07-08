@@ -34,6 +34,7 @@ import {
   touchProfile,
 } from "./social.js";
 import { bridgeOutboundChat } from "./bridge.js";
+import { redeemLinkCode } from "./discord-links.js";
 import { sanitizeChatText } from "./security.js";
 import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, PlayerKind, WorldStats } from "./types.js";
 
@@ -453,6 +454,14 @@ export class WorldServer {
 
     if (key === "who" || key === ":who" || key === "?") {
       this.addMessage(player, this.listWho());
+      this.sendToPlayer(player);
+      return;
+    }
+
+    if (key.startsWith(":verify ")) {
+      const code = key.slice(8).trim();
+      const result = redeemLinkCode(code, player.name);
+      this.addMessage(player, result.message);
       this.sendToPlayer(player);
       return;
     }

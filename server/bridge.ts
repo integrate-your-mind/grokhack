@@ -5,6 +5,7 @@
  */
 
 import { Client } from "irc-upd";
+import { discordOutboundChat, getDiscordBotStatus } from "./discord-bot.js";
 
 export interface BridgeHooks {
   onExternalChat: (from: string, text: string, channel: "irc" | "discord") => void;
@@ -72,7 +73,10 @@ export function bridgeOutboundChat(playerName: string, text: string): void {
     }
   }
 
-  if (DISCORD_WEBHOOK) {
+  const bot = getDiscordBotStatus();
+  if (bot.ready) {
+    discordOutboundChat(playerName, text);
+  } else if (DISCORD_WEBHOOK) {
     fetch(DISCORD_WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -102,8 +106,6 @@ export function getBridgeStatus() {
       channel: IRC_CHANNEL,
       connected: ircConnected,
     },
-    discord: {
-      enabled: Boolean(DISCORD_WEBHOOK),
-    },
+    discord: getDiscordBotStatus(),
   };
 }

@@ -19,6 +19,8 @@ import {
   safePublicPath,
   MAX_WS_MESSAGE_BYTES,
 } from "./security.js";
+import { getBridgeStatus } from "./bridge.js";
+import { getDiscordBotStatus, repostRules } from "./discord-bot.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -265,7 +267,37 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/api/status") {
-      json(res, { name: "GrokHack MMO", ...world.getStats() });
+      json(res, {
+        name: "GrokHack MMO",
+        ...world.getStats(),
+        bridges: getBridgeStatus(),
+        discord: getDiscordBotStatus(),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/discord") {
+      const d = getDiscordBotStatus();
+      let clientId = process.env.DISCORD_CLIENT_ID || "";
+      if (!clientId && process.env.DISCORD_BOT_TOKEN?.includes(".")) {
+        try {
+          clientId = Buffer.from(process.env.DISCORD_BOT_TOKEN.split(".")[0], "base64").toString("utf8");
+        } catch { /* ignore */ }
+      }
+      json(res, {
+        ...d,
+        inviteUrl: clientId
+          ? `https://discord.com/api/oauth2/authorize?client_id=${clientId}&permissions=${d.invitePermissions}&scope=bot%20applications.commands`
+          : null,
+        onboarding: ["Join server", "Verify in #rules-and-verify", "/link gamename", ":verify CODE in-game"],
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/discord/repost-rules" && req.method === "POST") {
+      if (!requireAdmin(req, res)) return;
+      const ok = await repostRules();
+      json(res, { ok });
       return;
     }
 

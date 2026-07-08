@@ -1,41 +1,49 @@
-# Discord Community Setup
+# GrokHack Discord — managed bot + secure onboarding
 
-I can't click inside your Discord app from here — follow these steps once (~5 min), then paste your webhook URL into `.env`.
+The game server runs a **Discord bot** that auto-manages your community when `DISCORD_BOT_TOKEN` is set.
 
-## 1. Create the server (in Discord app)
-
-1. Open **Discord** → left sidebar **+** → **Create My Own**
-2. Name: **GrokHack**
-3. Upload icon (optional) — dungeon/skull emoji works
-4. Create channels:
-   - `#general` — announcements
-   - `#in-game-chat` — bridged from game (webhook)
-   - `#deaths` — screenshot your runs
-   - `#agents` — MCP / bot discussion
-   - `#dev` — GitHub / PRs
-
-## 2. Enable chat bridge (webhook)
-
-1. Server Settings → **Integrations** → **Webhooks** → **New Webhook**
-2. Name: `GrokHack Bridge`, channel: `#in-game-chat`
-3. Copy webhook URL
-4. On your Mac:
+## Quick start (one command after token)
 
 ```bash
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-npm run server
+npm run discord:setup   # opens Developer Portal, validates token, saves .env
+npm run server          # bot auto-creates channels, roles, slash commands
 ```
 
-Game `:say` messages appear in `#in-game-chat`.
+## What the bot does automatically
 
-## 3. Invite link
+| Feature | Behavior |
+|---------|----------|
+| **Roles** | `@Unverified` → `@Player`, `@Agent`, `@Moderator` |
+| **Channels** | `#rules-and-verify`, `#welcome`, `#in-game-chat`, `#death-screenshots`, `#agents`, `#mod-log` |
+| **Onboarding** | New members only see rules until they click **Verify** |
+| **Security** | Links/invites deleted for unverified users; young accounts logged |
+| **Game bridge** | `:say` in game ↔ `#in-game-chat` (two-way, rate-limited) |
+| **Account link** | `/link Name` in Discord → `:verify CODE` in game |
+| **Slash cmds** | `/play`, `/link`, `/status` |
 
-Server Settings → **Invites** → create permanent link → add to `public/index.html` and X posts.
+## Security checklist (do in Discord app)
 
-## 4. Optional: Discord bot (two-way)
+1. **Server Settings → Safety → Verification Level: Medium** (or High)
+2. **Enable 2FA** on your Discord account (required for mod actions)
+3. **Never** paste bot token in chat — only in `.env` on your Mac
+4. Set `DISCORD_MIN_ACCOUNT_AGE_MS=604800000` (7 days) for stricter onboarding
 
-For IRC-style two-way chat, create an application at https://discord.com/developers — out of scope for v1; webhook is one-way (game → Discord).
+## Env vars
 
-## IRC (already wired)
+```bash
+DISCORD_BOT_TOKEN=       # required for bot
+DISCORD_GUILD_ID=        # optional — auto-detects first guild
+DISCORD_WEBHOOK_URL=     # fallback if bot offline (one-way only)
+```
 
-Join **`#grokhack`** on Libera Chat — game chat bridges automatically when server runs.
+## Admin API
+
+```bash
+curl -X POST -H "Authorization: Bearer $GROKHACK_ADMIN_TOKEN" \
+  https://grokhack.mondello.dev/api/discord/repost-rules
+```
+
+## Public pages
+
+- https://grokhack.mondello.dev/discord.html
+- https://grokhack.mondello.dev/api/discord

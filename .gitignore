@@ -2,6 +2,8 @@ node_modules/
 data/scores.json
 data/audit/
 data/social/
+data/discord/
+.env
 dist/
 dist-server/
 dist-test/
