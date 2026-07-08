@@ -6,6 +6,8 @@ import { WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
 import type { WorldServer } from "./world.js";
 import type { ClientConnection } from "./types.js";
+import { buildAgentState, AGENT_DOCS } from "./agent-protocol.js";
+import { getLeaderboard, getRecentRuns } from "./leaderboard.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -30,12 +32,21 @@ function serveStatic(urlPath: string, res: http.ServerResponse): boolean {
   return true;
 }
 
-function serializePlayer(p: ReturnType<WorldServer["getPlayer"]>) {
+function json(res: http.ServerResponse, data: unknown, status = 200): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  });
+  res.end(JSON.stringify(data));
+}
+
+export function serializePlayer(p: ReturnType<WorldServer["getPlayer"]>) {
   if (!p) return null;
   return {
     id: p.id,
     name: p.name,
     glyph: p.glyph,
+    kind: p.kind,
     x: p.state.entity.x,
     y: p.state.entity.y,
     hp: p.state.entity.hp,
@@ -53,7 +64,7 @@ function serializePlayer(p: ReturnType<WorldServer["getPlayer"]>) {
   };
 }
 
-function serializeFloor(floor: ReturnType<WorldServer["buildView"]>["floor"]) {
+export function serializeFloor(floor: ReturnType<WorldServer["buildView"]>["floor"]) {
   return {
     depth: floor.depth,
     width: floor.dungeon.width,
@@ -67,6 +78,26 @@ function serializeFloor(floor: ReturnType<WorldServer["buildView"]>["floor"]) {
   };
 }
 
+function pushState(ws: import("ws").WebSocket, world: WorldServer, conn: ClientConnection): void {
+  if (!conn.playerId || ws.readyState !== 1) return;
+  const p = world.getPlayer(conn.playerId);
+  if (!p) return;
+
+  if (conn.agentMode) {
+    ws.send(JSON.stringify(buildAgentState(world, p)));
+    return;
+  }
+
+  const { floor, others } = world.buildView(p);
+  ws.send(JSON.stringify({
+    type: "state",
+    player: serializePlayer(p),
+    floor: serializeFloor(floor),
+    others: others.map(serializePlayer),
+    online: world.getOnlineCount(),
+  }));
+}
+
 function attachWebSocket(server: http.Server, world: WorldServer): void {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -78,21 +109,15 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       id: connId,
       transport: "websocket",
       playerId: null,
+      agentMode: false,
       send: (msg: string) => {
         if (ws.readyState !== 1) return;
-        if (msg === "VIEW" && conn.playerId) {
-          const p = world.getPlayer(conn.playerId);
-          if (p) {
-            const { floor, others } = world.buildView(p);
-            ws.send(JSON.stringify({
-              type: "state",
-              player: serializePlayer(p),
-              floor: serializeFloor(floor),
-              others: others.map(serializePlayer),
-              online: world.getOnlineCount(),
-            }));
-          }
-        } else if (msg === "DEAD" || msg === "WON") {
+        if (msg.startsWith("SCORE:")) {
+          ws.send(JSON.stringify({ type: "score", entry: JSON.parse(msg.slice(6)) }));
+          return;
+        }
+        if (msg === "VIEW") pushState(ws, world, conn);
+        else if (msg === "DEAD" || msg === "WON") {
           ws.send(JSON.stringify({ type: msg.toLowerCase() }));
         }
       },
@@ -104,10 +129,11 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       type: "welcome",
       online: world.getOnlineCount(),
       maxPlayers: 500,
+      agent_docs: "/api/agent",
     }));
 
     ws.on("message", (raw) => {
-      let msg: { type: string; name?: string; key?: string; text?: string };
+      let msg: { type: string; name?: string; key?: string; text?: string; kind?: string };
       try {
         msg = JSON.parse(raw.toString());
       } catch {
@@ -115,13 +141,14 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       }
 
       if (msg.type === "join" && msg.name && !named) {
-        const result = world.joinPlayer(connId, msg.name);
+        conn.agentMode = msg.kind === "agent";
+        const result = world.joinPlayer(connId, msg.name, msg.kind === "agent" ? "agent" : "human");
         if (typeof result === "string") {
           ws.send(JSON.stringify({ type: "error", message: result }));
           return;
         }
         named = true;
-        conn.send("VIEW");
+        pushState(ws, world, conn);
         return;
       }
 
@@ -131,19 +158,19 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
         } else if (msg.key) {
           world.handleInput(conn.playerId, msg.key);
         }
-        conn.send("VIEW");
+        pushState(ws, world, conn);
       }
 
       if (msg.type === "who" && conn.playerId) {
         world.handleInput(conn.playerId, "who");
-        conn.send("VIEW");
+        pushState(ws, world, conn);
       }
     });
 
     ws.on("close", () => world.removeConnection(connId));
   });
 
-  console.log("[ws] attached at /ws");
+  console.log("[ws] attached at /ws (human + agent modes)");
 }
 
 export function startHttpServer(world: WorldServer, port: number): http.Server {
@@ -151,20 +178,21 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (url.pathname === "/api/status") {
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      });
-      res.end(JSON.stringify({ name: "GrokHack MMO", ...world.getStats() }));
+      json(res, { name: "GrokHack MMO", ...world.getStats() });
       return;
     }
 
-    if (url.pathname === "/api/who") {
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
+    if (url.pathname === "/api/agent") {
+      json(res, AGENT_DOCS);
+      return;
+    }
+
+    if (url.pathname === "/api/leaderboard") {
+      const kind = url.searchParams.get("kind") as "human" | "agent" | null;
+      json(res, {
+        top: getLeaderboard(kind ?? undefined, 50),
+        recent: getRecentRuns(15),
       });
-      res.end(JSON.stringify({ players: world.getOnlineCount() }));
       return;
     }
 
@@ -177,7 +205,7 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
   attachWebSocket(server, world);
 
   server.listen(port, "0.0.0.0", () => {
-    console.log(`[http] http://0.0.0.0:${port} (landing + /play + /ws + /api/status)`);
+    console.log(`[http] http://0.0.0.0:${port}`);
   });
 
   return server;

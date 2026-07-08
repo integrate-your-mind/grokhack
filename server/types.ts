@@ -14,10 +14,13 @@ export interface FloorState {
   seed: number;
 }
 
+export type PlayerKind = "human" | "agent";
+
 export interface OnlinePlayer {
   id: string;
   name: string;
   glyph: string;
+  kind: PlayerKind;
   state: PlayerState;
   explored: boolean[][];
   messages: string[];
@@ -25,6 +28,7 @@ export interface OnlinePlayer {
   floorDepth: number;
   connected: boolean;
   lastActive: number;
+  scoreRecorded: boolean;
 }
 
 export type ClientTransport = "telnet" | "websocket";
@@ -33,6 +37,7 @@ export interface ClientConnection {
   id: string;
   transport: ClientTransport;
   playerId: string | null;
+  agentMode: boolean;
   send: (data: string) => void;
   close: () => void;
 }

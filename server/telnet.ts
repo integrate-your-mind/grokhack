@@ -24,6 +24,7 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
       id: connId,
       transport: "telnet",
       playerId: null,
+      agentMode: false,
       send: (msg: string) => {
         if (msg === "DEAD") {
           const p = playerId ? world.getPlayer(playerId) : null;

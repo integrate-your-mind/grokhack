@@ -16,7 +16,8 @@ import {
   useItem,
 } from "../src/combat.js";
 import type { Direction, Entity, GamePhase, PlayerState } from "../src/types.js";
-import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, WorldStats } from "./types.js";
+import { recordRun } from "./leaderboard.js";
+import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, PlayerKind, WorldStats } from "./types.js";
 
 const MAX_DEPTH = 10;
 const HUNGER_PER_TURN = 2;
@@ -59,7 +60,7 @@ export class WorldServer {
     this.connections.delete(connId);
   }
 
-  joinPlayer(connId: string, name: string): OnlinePlayer | string {
+  joinPlayer(connId: string, name: string, kind: PlayerKind = "human"): OnlinePlayer | string {
     if (this.players.size >= MAX_PLAYERS) return "World is full. Try again later.";
 
     const trimmed = name.trim().slice(0, 16);
@@ -92,13 +93,19 @@ export class WorldServer {
       id: nextId("player"),
       name: trimmed,
       glyph,
+      kind,
       state,
       explored: this.createExplored(floor.dungeon.width, floor.dungeon.height),
-      messages: [`Welcome, ${trimmed}! Type :say <msg> to chat. Shared dungeon — beware other adventurers.`],
+      messages: [
+        kind === "agent"
+          ? `Agent ${trimmed} online. JSON state on each action. Keys: hjkl, ., >, i, :say`
+          : `Welcome, ${trimmed}! Type :say <msg> to chat. Shared dungeon — beware other adventurers.`,
+      ],
       phase: "playing",
       floorDepth: 1,
       connected: true,
       lastActive: Date.now(),
+      scoreRecorded: false,
     };
 
     this.players.set(player.id, player);
@@ -262,6 +269,7 @@ export class WorldServer {
       }
       player.phase = "won";
       this.addMessage(player, "You have conquered the dungeon!");
+      this.recordScore(player, "won");
       this.broadcastChat(`${player.name} has conquered the dungeon!`, player.id);
       return;
     }
@@ -298,6 +306,7 @@ export class WorldServer {
         player.state.alive = false;
         player.phase = "dead";
         this.addMessage(player, "You have died...");
+        this.recordScore(player, "died");
         this.broadcastChat(`${player.name} has died on depth ${player.floorDepth}.`, player.id);
         this.usedGlyphs.delete(player.glyph);
       }
@@ -337,6 +346,7 @@ export class WorldServer {
           nearest.state.alive = false;
           nearest.phase = "dead";
           this.addMessage(nearest, "Game over.");
+          this.recordScore(nearest, "died");
           this.broadcastChat(`${nearest.name} was slain by a ${monster.name}.`, nearest.id);
           this.usedGlyphs.delete(nearest.glyph);
         }
@@ -549,6 +559,25 @@ export class WorldServer {
       }
     }
     return "+";
+  }
+
+  recordScore(player: OnlinePlayer, outcome: "won" | "died"): void {
+    if (player.scoreRecorded) return;
+    player.scoreRecorded = true;
+    const entry = recordRun(
+      player.name,
+      player.kind,
+      outcome,
+      player.floorDepth,
+      player.state.level,
+      player.state.gold,
+      player.state.turns
+    );
+    this.addMessage(player, `Run recorded. Score: ${entry.score}`);
+    const conn = [...this.connections.values()].find((c) => c.playerId === player.id);
+    if (conn?.agentMode) {
+      conn.send(`SCORE:${JSON.stringify(entry)}`);
+    }
   }
 
   private addMessage(player: OnlinePlayer, msg: string): void {

@@ -13,29 +13,28 @@ npm run dev
 
 Open the URL shown in the terminal (usually http://localhost:5173).
 
-## Play (Terminal — multiplayer MMO)
+## Play Live
 
-Start the server:
+**https://grokhack.mondello.dev** — browser MMO (landing + `/play.html`)
+
+**Telnet:** `telnet grokhack.mondello.dev 4000` (when server exposes port 4000 publicly)
+
+## Play Locally (Terminal — multiplayer MMO)
 
 ```bash
-npm run server
+npm run server          # http://localhost:8080 + telnet :4000
+npm run tunnel:prod     # expose via Cloudflare (production)
 ```
-
-Connect via telnet (in another terminal):
 
 ```bash
 telnet localhost 4000
-# or: nc localhost 4000
 ```
 
-Enter your name, then play with `hjkl` movement. You'll share each dungeon floor with other online players.
-
-**Server ports:**
+**Server ports (local):**
 | Port | Service |
 |------|---------|
+| 8080 | HTTP landing + `/play` + `/ws` + `/api/status` |
 | 4000 | Telnet (terminal) |
-| 4001 | WebSocket (browser MMO client) |
-| 4002 | HTTP status API |
 
 ## Controls
 
