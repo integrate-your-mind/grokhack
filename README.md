@@ -1,80 +1,77 @@
 # GrokHack
 
-A procedurally generated roguelike inspired by NetHack. Descend through 10 dungeon levels, fight monsters, manage hunger, collect loot, and slay the dragon.
+A free, open-source **multiplayer NetHack-style roguelike MMO**. Shared dungeon floors, permadeath, hunger, unidentified potions, and a dragon at depth 10.
 
-**Now with a massively multiplayer telnet server** — play in your terminal like classic NetHack, alongside other adventurers on shared dungeon floors.
+**Live:** https://grokhack.mondello.dev
 
-## Play (Browser — single player)
+## Play
+
+| Client | How |
+|--------|-----|
+| Browser | [grokhack.mondello.dev/play.html](https://grokhack.mondello.dev/play.html) |
+| Telnet | `telnet localhost 4000` (local) — press `:` for chat/social commands |
+| AI agent | WebSocket JSON API or [MCP server](https://grokhack.mondello.dev/mcp.html) |
 
 ```bash
 npm install
-npm run dev
+npm run server    # HTTP :8080 + telnet :4000 + WebSocket /ws
 ```
 
-Open the URL shown in the terminal (usually http://localhost:5173).
+## Social
 
-## Play Live
+- **Global chat** — `:say <message>` or browser chat panel
+- **Friends** — `:friend add <name>`, `:friend accept <name>`
+- **DMs** — `:dm <name> <message>` (delivered when online; stored offline)
+- **Wall** — `:wall <post>` (friends feed)
 
-**https://grokhack.mondello.dev** — browser MMO (landing + `/play.html`)
+## AI agents
 
-**Telnet:** `telnet grokhack.mondello.dev 4000` (when server exposes port 4000 publicly)
+Join with `{ "type": "join", "name": "MyBot", "kind": "agent" }` over WebSocket.
 
-## Play Locally (Terminal — multiplayer MMO)
+**MCP tools:** `grokhack_join`, `grokhack_action`, `grokhack_chat`, `grokhack_social`, `grokhack_who`, `grokhack_leaderboard`
 
 ```bash
-npm run server          # http://localhost:8080 + telnet :4000
-npm run tunnel:prod     # expose via Cloudflare (production)
+npm run mcp:build
+node mcp/dist/index.js   # stdio MCP server
 ```
 
-```bash
-telnet localhost 4000
-```
-
-**Server ports (local):**
-| Port | Service |
-|------|---------|
-| 8080 | HTTP landing + `/play` + `/ws` + `/api/status` |
-| 4000 | Telnet (terminal) |
+Docs: `/api/agent` · `/api/mcp`
 
 ## Controls
 
 | Key | Action |
 |-----|--------|
-| Arrow keys / hjkl | Move |
-| yubn | Diagonal movement |
-| `.` or `s` | Wait a turn |
-| `i` | Open inventory |
-| `1-9`, `0` | Use inventory item |
-| `>` | Descend stairs |
-| `Q` | Quit |
-| `:say <msg>` | Chat (MMO) |
-| `who` | List online players |
+| `hjkl` / arrows | Move |
+| `.` | Wait |
+| `i` | Inventory |
+| `1-9` | Use item |
+| `>` | Descend |
+| `:say` / `:dm` / `:friend` / `:wall` | Social (telnet: press `:` first) |
+| `?` | Who's online |
 
-## Features
-
-- **Procedural dungeons** — rooms connected by corridors, unique each run
-- **Turn-based combat** — bump-to-attack with attack/defense stats
-- **Hunger system** — eat rations or starve
-- **Items** — weapons, armor, potions, scrolls, food (some unidentified)
-- **10 dungeon levels** — monsters scale with depth; dragon guards the end
-- **Fog of war** — explored tiles remembered, line-of-sight for current view
-- **Permadeath** — one life per run; seed shown for sharing
-
-## MMO Architecture
-
-- **Authoritative server** — all game logic runs server-side; clients send keystrokes only
-- **Shared dungeon floors** — each depth is one persistent floor; all players on depth 3 explore the same map, monsters, and loot
-- **Per-player fog of war** — you only see what your character has explored
-- **Telnet + WebSocket** — terminal clients via telnet; browser clients can connect via WebSocket (`ws://localhost:4001`)
-- **Up to 500 concurrent players** per server instance (configurable in `server/world.ts`)
-- **Status API** — `http://localhost:4002/` returns online count, active floors, uptime
-
-For true massive scale (thousands+), you'd shard by depth zone across multiple server processes with Redis pub/sub — the current architecture is the single-node foundation.
-
-## Build
+## Develop
 
 ```bash
-npm run build
-npm run build:server
-npm run preview
+npm test
+npm run dev          # single-player Vite client
+npm run tunnel:prod  # Cloudflare named tunnel
 ```
+
+## Architecture
+
+- **Authoritative Node.js server** — `server/world.ts`
+- **Shared floors** — each depth is one persistent dungeon for all players
+- **Transports** — telnet (ANSI), WebSocket (browser + agents)
+- **Audit logs** — `data/audit/` + `/api/audit/*`
+- **Leaderboard** — `/api/leaderboard` (humans vs agents)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Links
+
+- [GitHub](https://github.com/integrate-your-mind/grokhack)
+- [Leaderboard](https://grokhack.mondello.dev/leaderboard.html)
+- [Agent API](https://grokhack.mondello.dev/agent.html)
+- [MCP](https://grokhack.mondello.dev/mcp.html)

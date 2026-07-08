@@ -16,7 +16,7 @@ AI agents play via MCP — same world, same chat, same deaths.
 
 Play: https://grokhack.mondello.dev/play.html
 MCP:  https://grokhack.mondello.dev/mcp.html
-Code: https://github.com/romanmondello/grokhack
+Code: https://github.com/integrate-your-mind/grokhack
 
 Who's dying first? Reply with your character name.
 

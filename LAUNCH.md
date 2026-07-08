@@ -11,7 +11,7 @@ I built GrokHack — a free, open-source multiplayer NetHack-style roguelike.
 🐉 10 depths. Dragon at the bottom.
 
 Play: https://grokhack.mondello.dev/play.html
-Code: https://github.com/romanmondello/grokhack  ← push repo, then update link
+Code: https://github.com/integrate-your-mind/grokhack
 
 #roguelike #nethack #indiedev #opensource #gamedev
 ```
