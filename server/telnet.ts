@@ -4,12 +4,14 @@ import type { WorldServer } from "./world.js";
 import {
   negotiateTelnet,
   renderDeath,
+  renderHelp,
   renderTerminalView,
   renderVictory,
   renderWelcome,
   stripTelnetCommands,
 } from "./terminal.js";
 import { logEvent } from "./audit.js";
+import { initSession, finalizeSession } from "./session-metrics.js";
 import { BIND_HOST } from "./security.js";
 import type { ClientConnection } from "./types.js";
 
@@ -21,10 +23,13 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     let naming = true;
     let nameBuffer = "";
     let cmdBuffer: string | null = null;
+    /** When true, next non-control key dismisses help and redraws the map. */
+    let helpOpen = false;
 
     negotiateTelnet(socket);
 
     logEvent("session_connect", sessionId, { transport: "telnet" });
+    initSession(sessionId, "telnet");
 
     const conn: ClientConnection = {
       id: connId,
@@ -75,11 +80,22 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
 
     const refresh = () => {
       if (!playerId) return;
+      helpOpen = false;
       const p = world.getPlayer(playerId);
       if (p && p.connected) {
         const { floor, others } = world.buildView(p);
         socket.write(renderTerminalView(p, floor, others));
       }
+    };
+
+    const showHelp = () => {
+      helpOpen = true;
+      socket.write(renderHelp());
+    };
+
+    const isHelpCommand = (line: string): boolean => {
+      const t = line.trim().toLowerCase();
+      return t === ":help" || t === "help" || t === "?";
     };
 
     socket.on("data", (data) => {
@@ -93,16 +109,18 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
         nameBuffer = "";
         naming = false;
 
-        const result = world.joinPlayer(connId, name);
-        if (typeof result === "string") {
-          socket.write(`\r\n${result}\r\nEnter thy name, adventurer: `);
-          naming = true;
-          return;
-        }
+        void (async () => {
+          const result = await world.joinPlayer(connId, name);
+          if (typeof result === "string") {
+            socket.write(`\r\n${result}\r\nEnter thy name, adventurer: `);
+            naming = true;
+            return;
+          }
 
-        playerId = result.id;
-        conn.playerId = playerId;
-        refresh();
+          playerId = result.id;
+          conn.playerId = playerId;
+          refresh();
+        })();
         return;
       }
 
@@ -114,7 +132,13 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
             const line = cmdBuffer.trim();
             cmdBuffer = null;
             if (line && playerId) {
-              world.handleInput(playerId, line.startsWith(":") ? line : `:${line}`);
+              if (isHelpCommand(line)) {
+                showHelp();
+              } else {
+                world.handleInput(playerId, line.startsWith(":") ? line : `:${line}`);
+                refresh();
+              }
+            } else if (helpOpen) {
               refresh();
             }
           } else if (ch === "\x7f" || ch === "\b") {
@@ -131,13 +155,24 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
           continue;
         }
 
+        // Local help overlay — does not change world semantics (:who still lists players).
         if (ch === "?") {
-          if (playerId) world.handleInput(playerId, "?");
-          refresh();
+          showHelp();
           continue;
         }
 
-        if (ch === "\n") continue;
+        if (ch === "\n") {
+          if (helpOpen) refresh();
+          continue;
+        }
+
+        // Any other key dismisses help, then is played as a normal input.
+        if (helpOpen) {
+          helpOpen = false;
+          if (playerId) world.handleInput(playerId, ch);
+          refresh();
+          continue;
+        }
 
         if (playerId) world.handleInput(playerId, ch);
         refresh();
@@ -146,6 +181,7 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
 
     socket.on("close", () => {
       logEvent("session_disconnect", sessionId, { transport: "telnet", playerId: playerId ?? undefined });
+      finalizeSession(sessionId, playerId ?? undefined);
       world.removeConnection(connId);
     });
     socket.on("error", () => world.removeConnection(connId));
