@@ -255,12 +255,13 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
         cursor_config: {
           mcpServers: {
             grokhack: {
-              command: "npx",
-              args: ["-y", "@grokhack/mcp"],
+              command: "node",
+              args: ["mcp/dist/index.js"],
               env: { GROKHACK_URL: "wss://grokhack.mondello.dev/ws" },
             },
           },
         },
+        local_install: "npm run mcp:build && node mcp/dist/index.js",
       });
       return;
     }
