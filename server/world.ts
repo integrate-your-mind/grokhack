@@ -16,6 +16,7 @@ import {
   useItem,
 } from "../src/combat.js";
 import type { Direction, Entity, GamePhase, PlayerState } from "../src/types.js";
+import { logEvent } from "./audit.js";
 import { recordRun } from "./leaderboard.js";
 import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, PlayerKind, WorldStats } from "./types.js";
 
@@ -24,6 +25,12 @@ const HUNGER_PER_TURN = 2;
 const FOV_RADIUS = 8;
 const MAX_PLAYERS = 500;
 const PLAYER_GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+const DIR_KEYS: Record<string, Direction> = {
+  h: { dx: -1, dy: 0 }, j: { dx: 0, dy: 1 }, k: { dx: 0, dy: -1 }, l: { dx: 1, dy: 0 },
+  y: { dx: -1, dy: -1 }, u: { dx: 1, dy: -1 }, b: { dx: -1, dy: 1 }, n: { dx: 1, dy: 1 },
+  w: { dx: 0, dy: -1 }, a: { dx: -1, dy: 0 }, s: { dx: 0, dy: 1 }, d: { dx: 1, dy: 0 },
+};
 
 export class WorldServer {
   private floors = new Map<number, FloorState>();
@@ -110,7 +117,15 @@ export class WorldServer {
 
     this.players.set(player.id, player);
     const conn = this.connections.get(connId);
-    if (conn) conn.playerId = player.id;
+    if (conn) {
+      conn.playerId = player.id;
+      logEvent("player_join", conn.sessionId, {
+        playerId: player.id,
+        playerName: trimmed,
+        transport: conn.transport,
+        detail: { kind, depth: 1 },
+      });
+    }
 
     this.revealFOV(player, floor);
     this.broadcastChat(`${trimmed} enters the dungeon.`, player.id);
@@ -145,6 +160,14 @@ export class WorldServer {
 
     player.lastActive = Date.now();
     const key = raw.length === 1 ? raw : raw.trim();
+    const conn = [...this.connections.values()].find((c) => c.playerId === playerId);
+    if (conn && key.length <= 8) {
+      logEvent("player_input", conn.sessionId, {
+        playerId,
+        playerName: player.name,
+        detail: { key, phase: player.phase },
+      });
+    }
 
     if (key.startsWith(":say ")) {
       this.broadcastChat(`${player.name}: ${key.slice(5)}`, player.id);
@@ -162,6 +185,7 @@ export class WorldServer {
     if (player.phase === "inventory") {
       if (key === "i" || key === "\x1b") {
         player.phase = "playing";
+        this.addMessage(player, "You close your pack.");
       } else {
         const num = parseInt(key, 10);
         if (!isNaN(num)) {
@@ -170,6 +194,11 @@ export class WorldServer {
           if (msg) this.addMessage(player, msg);
           player.phase = "playing";
           this.endPlayerTurn(player);
+        } else if (DIR_KEYS[key]) {
+          player.phase = "playing";
+          this.tryMove(player, DIR_KEYS[key]);
+        } else {
+          this.addMessage(player, "Pick 1-9 to use an item, i to close.");
         }
       }
       this.sendToPlayer(player);
@@ -206,13 +235,7 @@ export class WorldServer {
       return;
     }
 
-    const dirs: Record<string, Direction> = {
-      h: { dx: -1, dy: 0 }, j: { dx: 0, dy: 1 }, k: { dx: 0, dy: -1 }, l: { dx: 1, dy: 0 },
-      y: { dx: -1, dy: -1 }, u: { dx: 1, dy: -1 }, b: { dx: -1, dy: 1 }, n: { dx: 1, dy: 1 },
-      w: { dx: 0, dy: -1 }, a: { dx: -1, dy: 0 }, s: { dx: 0, dy: 1 }, d: { dx: 1, dy: 0 },
-    };
-
-    const dir = dirs[key];
+    const dir = DIR_KEYS[key];
     if (dir) {
       this.tryMove(player, dir);
       this.sendToPlayer(player);
@@ -241,6 +264,7 @@ export class WorldServer {
       const result = meleeAttack(effectivePlayerEntity(player.state), monster);
       this.addMessage(player, result.message);
       if (result.killed) this.killMonster(player, floor, monster);
+      this.logCombat(player, monster.name, result.damage, true);
       this.endPlayerTurn(player);
       return;
     }
@@ -342,6 +366,7 @@ export class WorldServer {
       if (nearestDist === 1) {
         const result = meleeAttack(monster, effectivePlayerEntity(nearest.state));
         this.addMessage(nearest, result.message);
+        this.logCombat(nearest, monster.name, result.damage, false);
         if (result.killed) {
           nearest.state.alive = false;
           nearest.phase = "dead";
@@ -561,6 +586,16 @@ export class WorldServer {
     return "+";
   }
 
+  private logCombat(player: OnlinePlayer, attacker: string, damage: number, playerDealt: boolean): void {
+    const conn = [...this.connections.values()].find((c) => c.playerId === player.id);
+    if (!conn || !damage) return;
+    logEvent("combat", conn.sessionId, {
+      playerId: player.id,
+      playerName: player.name,
+      detail: { attacker, damage, playerDealt, hp: player.state.entity.hp },
+    });
+  }
+
   recordScore(player: OnlinePlayer, outcome: "won" | "died"): void {
     if (player.scoreRecorded) return;
     player.scoreRecorded = true;
@@ -575,6 +610,13 @@ export class WorldServer {
     );
     this.addMessage(player, `Run recorded. Score: ${entry.score}`);
     const conn = [...this.connections.values()].find((c) => c.playerId === player.id);
+    if (conn) {
+      logEvent(outcome === "won" ? "player_victory" : "player_death", conn.sessionId, {
+        playerId: player.id,
+        playerName: player.name,
+        detail: { score: entry.score, depth: player.floorDepth, level: player.state.level },
+      });
+    }
     if (conn?.agentMode) {
       conn.send(`SCORE:${JSON.stringify(entry)}`);
     }

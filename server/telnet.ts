@@ -9,19 +9,24 @@ import {
   renderWelcome,
   stripTelnetCommands,
 } from "./terminal.js";
+import { logEvent } from "./audit.js";
 import type { ClientConnection } from "./types.js";
 
 export function startTelnetServer(world: WorldServer, port: number): net.Server {
   const server = net.createServer((socket) => {
     const connId = randomUUID();
+    const sessionId = randomUUID();
     let playerId: string | null = null;
     let naming = true;
     let nameBuffer = "";
 
     negotiateTelnet(socket);
 
+    logEvent("session_connect", sessionId, { transport: "telnet" });
+
     const conn: ClientConnection = {
       id: connId,
+      sessionId,
       transport: "telnet",
       playerId: null,
       agentMode: false,
@@ -88,7 +93,10 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
       }
     });
 
-    socket.on("close", () => world.removeConnection(connId));
+    socket.on("close", () => {
+      logEvent("session_disconnect", sessionId, { transport: "telnet", playerId: playerId ?? undefined });
+      world.removeConnection(connId);
+    });
     socket.on("error", () => world.removeConnection(connId));
   });
 

@@ -7,30 +7,85 @@ const MONSTER = { rat: "#8a6a4a", kobold: "#7a9a5a", goblin: "#5a8a4a", orc: "#c
 let ws = null;
 let state = null;
 let explored = [];
+let sessionId = null;
+let inputLocked = false;
+let joined = false;
 
 const $ = (id) => document.getElementById(id);
 
+function reportClientError(err, context) {
+  const payload = {
+    sessionId,
+    message: String(err?.message || err),
+    context,
+    url: location.href,
+    userAgent: navigator.userAgent,
+  };
+  fetch("/api/audit/client-error", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
 function connect() {
   ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    sessionId = sessionId || crypto.randomUUID();
+  };
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === "welcome") {
-      $("join-online").textContent = msg.online;
-    } else if (msg.type === "error") {
-      $("join-err").textContent = msg.message;
-    } else if (msg.type === "state") {
-      state = msg;
-      ensureExplored(msg.floor.width, msg.floor.height);
-      revealFOV(msg);
-      showGame();
-      render();
-    } else if (msg.type === "dead" || msg.type === "won") {
-      showOverlay(msg.type === "won" ? "Victory!" : "You Died", "Refresh to play again.");
+    inputLocked = false;
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch (err) {
+      reportClientError(err, "ws_parse");
+      return;
+    }
+    try {
+      handleMessage(msg);
+    } catch (err) {
+      reportClientError(err, "handle_message:" + (msg?.type || "unknown"));
     }
   };
+  ws.onerror = () => reportClientError("websocket error", "ws_error");
   ws.onclose = () => {
-    $("join-err").textContent = "Disconnected from server.";
+    inputLocked = false;
+    if (joined) {
+      $("log")?.insertAdjacentHTML("beforeend", `<div style="color:#c94a4a">Disconnected.</div>`);
+    } else {
+      $("join-err").textContent = "Disconnected from server.";
+    }
   };
+}
+
+function handleMessage(msg) {
+  if (msg.type === "welcome") {
+    $("join-online").textContent = msg.online;
+    if (msg.sessionId) sessionId = msg.sessionId;
+  } else if (msg.type === "error") {
+    $("join-err").textContent = msg.message;
+  } else if (msg.type === "state" || msg.type === "agent_state") {
+    if (msg.type === "agent_state") {
+      state = { player: msg.you, floor: msg.floor, others: msg.visible?.players || [], online: msg.online };
+    } else {
+      state = msg;
+    }
+    if (state.player.phase === "dead") {
+      showOverlay("You Died", (state.player.messages || []).slice(-1)[0] || "Game over.");
+      return;
+    }
+    if (state.player.phase === "won") {
+      showOverlay("Victory!", "You conquered the dungeon!");
+      return;
+    }
+    ensureExplored(state.floor.width, state.floor.height);
+    revealFOV(state);
+    showGame();
+    render();
+  } else if (msg.type === "dead" || msg.type === "won") {
+    showOverlay(msg.type === "won" ? "Victory!" : "You Died", "Refresh to play again.");
+  }
 }
 
 function ensureExplored(w, h) {
@@ -58,12 +113,12 @@ function showGame() {
 
 function showOverlay(title, body) {
   $("overlay").classList.remove("hidden");
-  $("overlay-box").innerHTML = `<h2>${title}</h2><p>${body}</p><button onclick="location.reload()">Play Again</button>`;
+  $("overlay-box").innerHTML = `<h2>${esc(title)}</h2><p>${esc(body)}</p><button onclick="location.reload()">Play Again</button>`;
 }
 
 function render() {
-  if (!state) return;
-  const { player, floor, others } = state;
+  if (!state?.player || !state?.floor) return;
+  const { player, floor, others = [] } = state;
   const canvas = $("canvas");
   const ctx = canvas.getContext("2d");
   const w = floor.width * TILE, h = floor.height * TILE;
@@ -74,7 +129,7 @@ function render() {
 
   for (let y = 0; y < floor.height; y++) {
     for (let x = 0; x < floor.width; x++) {
-      if (!explored[y][x]) continue;
+      if (!explored[y]?.[x]) continue;
       const vis = (x - player.x) ** 2 + (y - player.y) ** 2 <= FOV * FOV;
       const tile = floor.tiles[y][x];
       ctx.fillStyle = vis ? (COLORS[tile] || "#1a1a24") : "#0d0d14";
@@ -87,11 +142,11 @@ function render() {
     }
   }
 
-  for (const item of floor.items) {
+  for (const item of floor.items || []) {
     if (!inFov(player, item.x, item.y)) continue;
     drawChar(ctx, item.x, item.y, item.char, "#8a8a4a");
   }
-  for (const m of floor.monsters) {
+  for (const m of floor.monsters || []) {
     if (!inFov(player, m.x, m.y)) continue;
     drawChar(ctx, m.x, m.y, m.char, MONSTER[m.kind] || "#fff");
   }
@@ -101,15 +156,16 @@ function render() {
   }
   drawChar(ctx, player.x, player.y, player.glyph, "#c9a227");
 
-  $("header-status").textContent = `${player.name} · depth ${player.depth} · ${state.online ?? "?"} online`;
+  const phaseLabel = player.phase === "inventory" ? " [INVENTORY — press 1-9 or i to close]" : "";
+  $("header-status").textContent = `${player.name} · depth ${player.depth} · ${state.online ?? "?"} online${phaseLabel}`;
   $("hud").innerHTML = [
-    `HP ${player.hp}/${player.maxHp}`,
-    `Lv ${player.level}  XP ${player.xp}/${player.xpToLevel}`,
+    `HP ${Math.max(0, player.hp)}/${player.maxHp}`,
+    `Lv ${player.level}  XP ${player.xp ?? 0}/${player.xpToLevel ?? "?"}`,
     `Hunger: ${player.hunger}`,
     `Gold ${player.gold}  Turns ${player.turns}`,
-    `Inv: ${player.inventory.map(i => i.char).join(" ") || "empty"}`,
+    `Inv: ${(player.inventory || []).map((i) => i.char).join(" ") || "empty"}`,
   ].join("<br>");
-  $("log").innerHTML = (player.messages || []).slice(-8).map(m => `<div>${esc(m)}</div>`).join("");
+  $("log").innerHTML = (player.messages || []).slice(-8).map((m) => `<div>${esc(m)}</div>`).join("");
 }
 
 function inFov(player, x, y) {
@@ -123,18 +179,21 @@ function drawChar(ctx, x, y, ch, color) {
 }
 
 function esc(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
 function sendKey(key) {
-  if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ type: "input", key }));
+  if (!ws || ws.readyState !== 1 || inputLocked) return;
+  if ($("overlay") && !$("overlay").classList.contains("hidden")) return;
+  inputLocked = true;
+  ws.send(JSON.stringify({ type: "input", key, sessionId }));
 }
 
 $("join-btn").onclick = () => {
   const name = $("name-input").value.trim();
   if (!name) return;
-  ws.send(JSON.stringify({ type: "join", name }));
+  joined = true;
+  ws.send(JSON.stringify({ type: "join", name, sessionId }));
 };
 
 $("name-input").onkeydown = (e) => {
@@ -143,6 +202,7 @@ $("name-input").onkeydown = (e) => {
 
 const KEYS = new Set([
   "h","j","k","l","y","u","b","n","i",".","s",">",
+  "0","1","2","3","4","5","6","7","8","9",
   "ArrowUp","ArrowDown","ArrowLeft","ArrowRight",
 ]);
 

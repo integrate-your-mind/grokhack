@@ -1,5 +1,6 @@
 node_modules/
 data/scores.json
+data/audit/
 dist/
 dist-server/
 dist-test/

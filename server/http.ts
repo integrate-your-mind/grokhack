@@ -8,6 +8,7 @@ import type { WorldServer } from "./world.js";
 import type { ClientConnection } from "./types.js";
 import { buildAgentState, AGENT_DOCS } from "./agent-protocol.js";
 import { getLeaderboard, getRecentRuns } from "./leaderboard.js";
+import { logEvent, getRecentEvents, getSessionTrace } from "./audit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -103,10 +104,14 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
 
   wss.on("connection", (ws) => {
     const connId = randomUUID();
+    const sessionId = randomUUID();
     let named = false;
+
+    logEvent("session_connect", sessionId, { transport: "websocket" });
 
     const conn: ClientConnection = {
       id: connId,
+      sessionId,
       transport: "websocket",
       playerId: null,
       agentMode: false,
@@ -127,6 +132,7 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
     world.registerConnection(conn);
     ws.send(JSON.stringify({
       type: "welcome",
+      sessionId,
       online: world.getOnlineCount(),
       maxPlayers: 500,
       agent_docs: "/api/agent",
@@ -167,7 +173,10 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       }
     });
 
-    ws.on("close", () => world.removeConnection(connId));
+    ws.on("close", () => {
+      logEvent("session_disconnect", sessionId, { transport: "websocket", playerId: conn.playerId ?? undefined });
+      world.removeConnection(connId);
+    });
   });
 
   console.log("[ws] attached at /ws (human + agent modes)");
@@ -184,6 +193,34 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
 
     if (url.pathname === "/api/agent") {
       json(res, AGENT_DOCS);
+      return;
+    }
+
+    if (url.pathname === "/api/audit/client-error" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        try {
+          const data = JSON.parse(body) as { sessionId?: string; message?: string; context?: string };
+          logEvent("client_error", data.sessionId || "unknown", {
+            detail: { message: data.message, context: data.context, ua: data },
+          });
+        } catch (err) {
+          logEvent("server_error", "unknown", { detail: { message: String(err) } });
+        }
+        json(res, { ok: true });
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/audit/recent") {
+      json(res, { events: getRecentEvents(100) });
+      return;
+    }
+
+    if (url.pathname.startsWith("/api/audit/session/")) {
+      const sid = url.pathname.split("/").pop() || "";
+      json(res, { sessionId: sid, events: getSessionTrace(sid) });
       return;
     }
 

@@ -8,6 +8,7 @@ function mockConn(id: string): ClientConnection {
     id,
     transport: "telnet",
     playerId: null,
+    sessionId: "test-session",
     agentMode: false,
     send: (m) => msgs.push(m),
     close: () => {},

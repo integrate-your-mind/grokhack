@@ -35,6 +35,7 @@ export type ClientTransport = "telnet" | "websocket";
 
 export interface ClientConnection {
   id: string;
+  sessionId: string;
   transport: ClientTransport;
   playerId: string | null;
   agentMode: boolean;
