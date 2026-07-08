@@ -16,7 +16,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:sim": "tsx scripts/test-and-simulate.mjs",
-    "test:all": "vitest run && tsx -e \"import { runBatchSimulation } from './src/test-harness.ts'; const r=runBatchSimulation(50); console.log('Sim wins:', r.filter(x=>x.outcome==='won').length+'/50');\""
+    "test:all": "vitest run && tsx -e \"import { runBatchSimulation } from './src/test-harness.ts'; const r=runBatchSimulation(50); console.log('Sim wins:', r.filter(x=>x.outcome==='won').length+'/50');\"",
+    "mcp:build": "cd mcp && npm install && npm run build"
   },
   "dependencies": {
     "ws": "^8.18.0"

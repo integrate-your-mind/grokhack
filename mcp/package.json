@@ -1,0 +1,27 @@
+{
+  "name": "@grokhack/mcp",
+  "version": "1.0.0",
+  "description": "MCP server for GrokHack MMO — play, chat, and socialize via AI agents",
+  "type": "module",
+  "bin": {
+    "grokhack-mcp": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "grokhack", "roguelike", "nethack", "mmo"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  }
+}

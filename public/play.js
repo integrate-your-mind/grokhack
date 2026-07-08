@@ -10,22 +10,29 @@ let explored = [];
 let sessionId = null;
 let inputLocked = false;
 let joined = false;
+let social = null;
+const chatLines = [];
+const dmLines = [];
 
 const $ = (id) => document.getElementById(id);
 
 function reportClientError(err, context) {
-  const payload = {
-    sessionId,
-    message: String(err?.message || err),
-    context,
-    url: location.href,
-    userAgent: navigator.userAgent,
-  };
   fetch("/api/audit/client-error", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      sessionId,
+      message: String(err?.message || err),
+      context,
+      url: location.href,
+      userAgent: navigator.userAgent,
+    }),
   }).catch(() => {});
+}
+
+function sendSocial(action, fields = {}) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "social", action, ...fields }));
 }
 
 function connect() {
@@ -65,6 +72,31 @@ function handleMessage(msg) {
     if (msg.sessionId) sessionId = msg.sessionId;
   } else if (msg.type === "error") {
     $("join-err").textContent = msg.message;
+  } else if (msg.type === "social_snapshot") {
+    social = msg.snapshot;
+    if (msg.chat_history) {
+      for (const line of msg.chat_history) {
+        appendChat(line, "sys");
+      }
+    }
+    renderSocial();
+  } else if (msg.type === "social_result") {
+    if (msg.result?.snapshot) social = msg.result.snapshot;
+    else if (msg.action === "snapshot" && msg.result) social = msg.result;
+    if (msg.action === "dm_thread" && msg.result?.thread) {
+      dmLines.length = 0;
+      for (const m of msg.result.thread) {
+        appendDM(m.from, m.to, m.text, m.at);
+      }
+    }
+    renderSocial();
+  } else if (msg.type === "chat") {
+    if (msg.channel === "dm") appendDM(msg.from, msg.to, msg.text, msg.at);
+    else appendChat(`${msg.from}: ${msg.text}`, msg.channel === "global" ? "chat" : "sys");
+  } else if (msg.type === "social") {
+    if (msg.event === "friends_updated" && msg.snapshot) social = msg.snapshot;
+    if (msg.event === "wall_post" && msg.post) appendWall(msg.post);
+    renderSocial();
   } else if (msg.type === "state" || msg.type === "agent_state") {
     if (msg.type === "agent_state") {
       state = { player: msg.you, floor: msg.floor, others: msg.visible?.players || [], online: msg.online };
@@ -86,6 +118,90 @@ function handleMessage(msg) {
   } else if (msg.type === "dead" || msg.type === "won") {
     showOverlay(msg.type === "won" ? "Victory!" : "You Died", "Refresh to play again.");
   }
+}
+
+function appendChat(text, kind = "chat") {
+  chatLines.push({ text, kind });
+  if (chatLines.length > 80) chatLines.shift();
+  renderChatFeed();
+}
+
+function appendDM(from, to, text, at) {
+  dmLines.push({ from, to, text, at });
+  if (dmLines.length > 80) dmLines.shift();
+  renderDMFeed();
+}
+
+function appendWall(post) {
+  if (!social) social = { wall: [] };
+  social.wall = [post, ...(social.wall || [])].slice(0, 20);
+  renderWallFeed();
+}
+
+function renderChatFeed() {
+  const el = $("chat-feed");
+  if (!el) return;
+  el.innerHTML = chatLines
+    .map((l) => {
+      const cls = l.kind === "sys" ? "line sys" : "line";
+      return `<div class="${cls}">${esc(l.text)}</div>`;
+    })
+    .join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderDMFeed() {
+  const el = $("dm-feed");
+  if (!el) return;
+  const me = state?.player?.name;
+  el.innerHTML = dmLines
+    .map((m) => {
+      const arrow = m.from === me ? `→${m.to}` : `←${m.from}`;
+      return `<div class="line dm"><span class="who">${esc(arrow)}</span> ${esc(m.text)}</div>`;
+    })
+    .join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderWallFeed() {
+  const el = $("wall-feed");
+  if (!el || !social) return;
+  el.innerHTML = (social.wall || [])
+    .map((p) => `<div class="line"><span class="who">${esc(p.author)}</span> ${esc(p.text)}</div>`)
+    .join("") || '<div class="line sys">Wall is quiet.</div>';
+}
+
+function renderSocial() {
+  renderWallFeed();
+  const pending = $("pending-in");
+  const list = $("friends-list");
+  if (!pending || !list || !social) return;
+
+  pending.innerHTML = (social.pendingIn || [])
+    .map(
+      (n) =>
+        `${esc(n)} <button type="button" data-accept="${esc(n)}">accept</button>`
+    )
+    .join("<br>");
+
+  pending.querySelectorAll("[data-accept]").forEach((btn) => {
+    btn.onclick = () => sendSocial("friend_accept", { target: btn.dataset.accept });
+  });
+
+  list.innerHTML = (social.friends || [])
+    .map(
+      (n) =>
+        `<li><span>${esc(n)}</span><button type="button" data-dm="${esc(n)}">dm</button></li>`
+    )
+    .join("") || '<li class="sys">No friends yet</li>';
+
+  list.querySelectorAll("[data-dm]").forEach((btn) => {
+    btn.onclick = () => {
+      $("dm-target").value = btn.dataset.dm;
+      document.querySelector('.tab[data-tab="dms"]').click();
+      $("dm-text").focus();
+    };
+  });
 }
 
 function ensureExplored(w, h) {
@@ -179,7 +295,7 @@ function drawChar(ctx, x, y, ch, color) {
 }
 
 function esc(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 }
 
 function sendKey(key) {
@@ -187,6 +303,11 @@ function sendKey(key) {
   if ($("overlay") && !$("overlay").classList.contains("hidden")) return;
   inputLocked = true;
   ws.send(JSON.stringify({ type: "input", key, sessionId }));
+}
+
+function sendText(text) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: "input", text, sessionId }));
 }
 
 $("join-btn").onclick = () => {
@@ -200,6 +321,52 @@ $("name-input").onkeydown = (e) => {
   if (e.key === "Enter") $("join-btn").click();
 };
 
+document.querySelectorAll(".social-tabs .tab").forEach((tab) => {
+  tab.onclick = () => {
+    document.querySelectorAll(".social-tabs .tab").forEach((t) => t.classList.remove("active"));
+    document.querySelectorAll(".tab-pane").forEach((p) => p.classList.remove("active"));
+    tab.classList.add("active");
+    $(`tab-${tab.dataset.tab}`).classList.add("active");
+    if (tab.dataset.tab === "dms" && $("dm-target").value) {
+      sendSocial("dm_thread", { target: $("dm-target").value });
+    }
+  };
+});
+
+$("chat-form").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("chat-input").value.trim();
+  if (!text) return;
+  sendText(`:say ${text}`);
+  $("chat-input").value = "";
+};
+
+$("friend-form").onsubmit = (e) => {
+  e.preventDefault();
+  const target = $("friend-input").value.trim();
+  if (!target) return;
+  sendSocial("friend_add", { target });
+  $("friend-input").value = "";
+};
+
+$("dm-form").onsubmit = (e) => {
+  e.preventDefault();
+  const target = $("dm-target").value.trim();
+  const text = $("dm-text").value.trim();
+  if (!target || !text) return;
+  sendSocial("dm_send", { target, text });
+  appendDM(state?.player?.name || "you", target, text, new Date().toISOString());
+  $("dm-text").value = "";
+};
+
+$("wall-form").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("wall-input").value.trim();
+  if (!text) return;
+  sendSocial("wall_post", { text });
+  $("wall-input").value = "";
+};
+
 const KEYS = new Set([
   "h","j","k","l","y","u","b","n","i",".","s",">",
   "0","1","2","3","4","5","6","7","8","9",
@@ -208,6 +375,8 @@ const KEYS = new Set([
 
 document.addEventListener("keydown", (e) => {
   if ($("join-screen").classList.contains("hidden") === false) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
   if (!KEYS.has(e.key)) return;
   e.preventDefault();
   const map = { ArrowUp:"k", ArrowDown:"j", ArrowLeft:"h", ArrowRight:"l" };

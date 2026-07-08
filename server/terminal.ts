@@ -118,7 +118,11 @@ export function renderTerminalView(
 
   lines.push(ANSI.gray + "─".repeat(vw) + ANSI.reset);
   lines.push(renderStatus(viewer.state));
-  lines.push(ANSI.dim + "hjkl move | i inv | . wait | > descend | :say chat | who | Q quit" + ANSI.reset);
+  lines.push(
+    ANSI.dim +
+      ": opens command line — :say :dm :friend :wall :who :social | ? who | hjkl move" +
+      ANSI.reset
+  );
 
   const recent = viewer.messages.slice(-4);
   for (const msg of recent) {

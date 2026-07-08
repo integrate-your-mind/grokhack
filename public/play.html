@@ -22,12 +22,54 @@
       <a href="/">GrokHack</a>
       <span id="header-status"></span>
     </header>
-    <canvas id="canvas" width="800" height="240"></canvas>
-    <div class="panels">
-      <div class="panel" id="hud"></div>
-      <div class="panel" id="log"></div>
+    <div class="game-layout">
+      <div class="game-main">
+        <canvas id="canvas" width="800" height="240"></canvas>
+        <div class="panels">
+          <div class="panel" id="hud"></div>
+          <div class="panel" id="log"></div>
+        </div>
+      </div>
+      <aside class="social-panel" id="social-panel">
+        <div class="social-tabs">
+          <button class="tab active" data-tab="chat">Chat</button>
+          <button class="tab" data-tab="friends">Friends</button>
+          <button class="tab" data-tab="dms">DMs</button>
+          <button class="tab" data-tab="wall">Wall</button>
+        </div>
+        <div class="tab-pane active" id="tab-chat">
+          <div class="feed" id="chat-feed"></div>
+          <form id="chat-form" class="social-form">
+            <input id="chat-input" type="text" maxlength="200" placeholder="Say something…" autocomplete="off" />
+            <button type="submit">Send</button>
+          </form>
+        </div>
+        <div class="tab-pane" id="tab-friends">
+          <form id="friend-form" class="social-form inline">
+            <input id="friend-input" type="text" maxlength="16" placeholder="Add friend…" autocomplete="off" />
+            <button type="submit">+</button>
+          </form>
+          <div id="pending-in" class="sublist"></div>
+          <ul id="friends-list" class="friend-list"></ul>
+        </div>
+        <div class="tab-pane" id="tab-dms">
+          <form id="dm-form" class="social-form stacked">
+            <input id="dm-target" type="text" maxlength="16" placeholder="To…" autocomplete="off" />
+            <input id="dm-text" type="text" maxlength="280" placeholder="Message…" autocomplete="off" />
+            <button type="submit">DM</button>
+          </form>
+          <div class="feed" id="dm-feed"></div>
+        </div>
+        <div class="tab-pane" id="tab-wall">
+          <div class="feed" id="wall-feed"></div>
+          <form id="wall-form" class="social-form">
+            <input id="wall-input" type="text" maxlength="280" placeholder="Post to wall…" autocomplete="off" />
+            <button type="submit">Post</button>
+          </form>
+        </div>
+      </aside>
     </div>
-    <footer>hjkl · i inv · . wait · &gt; descend · :say chat · who</footer>
+    <footer>hjkl · i inv · . wait · &gt; descend · chat panel →</footer>
   </div>
 
   <div id="overlay" class="overlay hidden">

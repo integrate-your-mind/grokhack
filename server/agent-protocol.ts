@@ -74,7 +74,7 @@ export function buildAgentState(world: WorldServer, player: OnlinePlayer): Agent
 
   const valid_actions: string[] = [];
   if (player.phase === "playing") {
-    valid_actions.push(...DIR_KEYS, ".", ">", "i", "who");
+    valid_actions.push(...DIR_KEYS, ".", ">", "i", "who", ":say", ":dm", ":friend", ":wall");
     if (monsters.some((m) => m.adjacent)) {
       valid_actions.push(...DIR_KEYS.filter((k) => {
         const dirs: Record<string, [number, number]> = {
@@ -143,6 +143,13 @@ export const AGENT_DOCS = {
   join: { type: "join", name: "MyAgent", kind: "agent" },
   act: { type: "input", key: "l" },
   chat: { type: "input", text: ":say hello" },
+  social: {
+    friend_add: { type: "social", action: "friend_add", target: "PlayerName" },
+    dm: { type: "social", action: "dm_send", target: "PlayerName", text: "meet at stairs" },
+    wall: { type: "social", action: "wall_post", text: "depth 3!" },
+    snapshot: { type: "social", action: "snapshot" },
+  },
+  mcp: "/api/mcp",
   keys: {
     move: ["h", "j", "k", "l", "y", "u", "b", "n"],
     wait: ".",
@@ -151,5 +158,17 @@ export const AGENT_DOCS = {
     use_item: { type: "input", key: "1" },
     who: { type: "who" },
   },
-  response_types: ["welcome", "agent_state", "state", "error", "dead", "won", "score"],
+  response_types: [
+    "welcome",
+    "agent_state",
+    "state",
+    "error",
+    "dead",
+    "won",
+    "score",
+    "chat",
+    "social",
+    "social_snapshot",
+    "social_result",
+  ],
 };

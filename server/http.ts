@@ -9,6 +9,7 @@ import type { ClientConnection } from "./types.js";
 import { buildAgentState, AGENT_DOCS } from "./agent-protocol.js";
 import { getLeaderboard, getRecentRuns } from "./leaderboard.js";
 import { logEvent, getRecentEvents, getSessionTrace } from "./audit.js";
+import { getGlobalWall, getSocialSnapshot } from "./social.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "..", "public");
@@ -117,6 +118,10 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       agentMode: false,
       send: (msg: string) => {
         if (ws.readyState !== 1) return;
+        if (msg.startsWith("RT:")) {
+          ws.send(msg.slice(3));
+          return;
+        }
         if (msg.startsWith("SCORE:")) {
           ws.send(JSON.stringify({ type: "score", entry: JSON.parse(msg.slice(6)) }));
           return;
@@ -136,10 +141,25 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
       online: world.getOnlineCount(),
       maxPlayers: 500,
       agent_docs: "/api/agent",
+      mcp_docs: "/api/mcp",
+      social: {
+        chat: ":say <msg>",
+        friends: ":friend add|accept|remove <name>",
+        dm: ":dm <name> <msg>",
+        wall: ":wall <msg>",
+      },
     }));
 
     ws.on("message", (raw) => {
-      let msg: { type: string; name?: string; key?: string; text?: string; kind?: string };
+      let msg: {
+        type: string;
+        name?: string;
+        key?: string;
+        text?: string;
+        kind?: string;
+        action?: string;
+        target?: string;
+      };
       try {
         msg = JSON.parse(raw.toString());
       } catch {
@@ -154,7 +174,27 @@ function attachWebSocket(server: http.Server, world: WorldServer): void {
           return;
         }
         named = true;
+        const p = world.getPlayer(conn.playerId!);
+        if (p) {
+          ws.send(JSON.stringify({
+            type: "social_snapshot",
+            snapshot: getSocialSnapshot(p.name),
+            chat_history: world.getChatLog(30),
+          }));
+        }
         pushState(ws, world, conn);
+        return;
+      }
+
+      if (msg.type === "social" && conn.playerId) {
+        const result = world.handleSocialApi(conn.playerId, msg.action || "", {
+          target: msg.target || "",
+          text: msg.text || "",
+        });
+        ws.send(JSON.stringify({ type: "social_result", action: msg.action, result }));
+        if (msg.action === "snapshot" || msg.action?.startsWith("friend") || msg.action === "dm_thread") {
+          pushState(ws, world, conn);
+        }
         return;
       }
 
@@ -193,6 +233,47 @@ export function startHttpServer(world: WorldServer, port: number): http.Server {
 
     if (url.pathname === "/api/agent") {
       json(res, AGENT_DOCS);
+      return;
+    }
+
+    if (url.pathname === "/api/mcp") {
+      json(res, {
+        name: "grokhack",
+        package: "@grokhack/mcp",
+        install: "npx @grokhack/mcp",
+        repo_path: "mcp/",
+        endpoint: "wss://grokhack.mondello.dev/ws",
+        tools: [
+          "grokhack_status",
+          "grokhack_join",
+          "grokhack_action",
+          "grokhack_chat",
+          "grokhack_social",
+          "grokhack_who",
+          "grokhack_leaderboard",
+        ],
+        cursor_config: {
+          mcpServers: {
+            grokhack: {
+              command: "npx",
+              args: ["-y", "@grokhack/mcp"],
+              env: { GROKHACK_URL: "wss://grokhack.mondello.dev/ws" },
+            },
+          },
+        },
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/social/wall") {
+      json(res, { posts: getGlobalWall(50) });
+      return;
+    }
+
+    if (url.pathname.startsWith("/api/social/profile/")) {
+      const name = decodeURIComponent(url.pathname.split("/").pop() || "");
+      const snap = getSocialSnapshot(name);
+      json(res, snap);
       return;
     }
 

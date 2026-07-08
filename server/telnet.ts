@@ -19,6 +19,7 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     let playerId: string | null = null;
     let naming = true;
     let nameBuffer = "";
+    let cmdBuffer: string | null = null;
 
     negotiateTelnet(socket);
 
@@ -31,6 +32,22 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
       playerId: null,
       agentMode: false,
       send: (msg: string) => {
+        if (msg.startsWith("RT:")) {
+          try {
+            const payload = JSON.parse(msg.slice(3)) as { type?: string; channel?: string; from?: string; text?: string };
+            if (payload.type === "chat" && playerId) {
+              const p = world.getPlayer(playerId);
+              if (p) {
+                const label = payload.channel === "dm" ? "[dm]" : "[chat]";
+                p.messages.push(`${label} ${payload.from}: ${payload.text}`);
+                if (p.messages.length > 50) p.messages.shift();
+              }
+            }
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
         if (msg === "DEAD") {
           const p = playerId ? world.getPlayer(playerId) : null;
           socket.write(p ? renderDeath(p) : "You died.\r\n");
@@ -55,6 +72,15 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     world.registerConnection(conn);
     socket.write(renderWelcome(world.getOnlineCount(), 500));
 
+    const refresh = () => {
+      if (!playerId) return;
+      const p = world.getPlayer(playerId);
+      if (p && p.connected) {
+        const { floor, others } = world.buildView(p);
+        socket.write(renderTerminalView(p, floor, others));
+      }
+    };
+
     socket.on("data", (data) => {
       const text = stripTelnetCommands(data);
 
@@ -75,21 +101,45 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
 
         playerId = result.id;
         conn.playerId = playerId;
-        const { floor, others } = world.buildView(result);
-        socket.write(renderTerminalView(result, floor, others));
+        refresh();
         return;
       }
 
       for (const ch of text) {
-        if (ch === "\n" || ch === "\r") continue;
-        if (playerId) world.handleInput(playerId, ch);
-        if (playerId) {
-          const p = world.getPlayer(playerId);
-          if (p && p.connected) {
-            const { floor, others } = world.buildView(p);
-            socket.write(renderTerminalView(p, floor, others));
+        if (ch === "\r") continue;
+
+        if (cmdBuffer !== null) {
+          if (ch === "\n") {
+            const line = cmdBuffer.trim();
+            cmdBuffer = null;
+            if (line && playerId) {
+              world.handleInput(playerId, line.startsWith(":") ? line : `:${line}`);
+              refresh();
+            }
+          } else if (ch === "\x7f" || ch === "\b") {
+            cmdBuffer = cmdBuffer.slice(0, -1);
+          } else {
+            cmdBuffer += ch;
           }
+          continue;
         }
+
+        if (ch === ":") {
+          cmdBuffer = ":";
+          socket.write("\r\n: ");
+          continue;
+        }
+
+        if (ch === "?") {
+          if (playerId) world.handleInput(playerId, "?");
+          refresh();
+          continue;
+        }
+
+        if (ch === "\n") continue;
+
+        if (playerId) world.handleInput(playerId, ch);
+        refresh();
       }
     });
 

@@ -18,6 +18,21 @@ import {
 import type { Direction, Entity, GamePhase, PlayerState } from "../src/types.js";
 import { logEvent } from "./audit.js";
 import { recordRun } from "./leaderboard.js";
+import {
+  acceptFriend,
+  getDMThread,
+  getSocialSnapshot,
+  getWallFeed,
+  listFriends,
+  listPending,
+  markDMsRead,
+  postWall,
+  removeFriend,
+  requestFriend,
+  sendDM,
+  setBio,
+  touchProfile,
+} from "./social.js";
 import type { ClientConnection, FloorState, GroundItem, OnlinePlayer, PlayerKind, WorldStats } from "./types.js";
 
 const MAX_DEPTH = 10;
@@ -105,8 +120,8 @@ export class WorldServer {
       explored: this.createExplored(floor.dungeon.width, floor.dungeon.height),
       messages: [
         kind === "agent"
-          ? `Agent ${trimmed} online. JSON state on each action. Keys: hjkl, ., >, i, :say`
-          : `Welcome, ${trimmed}! Type :say <msg> to chat. Shared dungeon — beware other adventurers.`,
+          ? `Agent ${trimmed} online. JSON state on each action. Keys: hjkl, ., >, i, :say, :dm, :friend`
+          : `Welcome, ${trimmed}! :say chat · :friend add <name> · :dm <name> msg · :wall post`,
       ],
       phase: "playing",
       floorDepth: 1,
@@ -147,6 +162,225 @@ export class WorldServer {
     return [...this.players.values()].filter((p) => p.connected).length;
   }
 
+  findPlayerByName(name: string): OnlinePlayer | undefined {
+    const key = name.trim().toLowerCase();
+    return [...this.players.values()].find(
+      (p) => p.connected && p.name.toLowerCase() === key
+    );
+  }
+
+  handleSocialCommand(player: OnlinePlayer, raw: string): boolean {
+    touchProfile(player.name);
+
+    if (raw.startsWith(":friend add ")) {
+      const target = raw.slice(12).trim();
+      const result = requestFriend(player.name, target);
+      this.addMessage(player, result.message);
+      if (result.ok) {
+        const other = this.findPlayerByName(target);
+        if (other) {
+          this.addMessage(other, `${player.name} sent you a friend request. :friend accept ${player.name}`);
+          this.pushRealtime(other, { type: "social", event: "friend_request", from: player.name });
+          this.sendToPlayer(other);
+        }
+      }
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw.startsWith(":friend accept ")) {
+      const target = raw.slice(15).trim();
+      const result = acceptFriend(player.name, target);
+      this.addMessage(player, result.message);
+      if (result.ok) {
+        const other = this.findPlayerByName(target);
+        if (other) {
+          this.addMessage(other, `${player.name} accepted your friend request!`);
+          this.pushRealtime(other, { type: "social", event: "friend_accept", from: player.name });
+          this.sendToPlayer(other);
+        }
+        this.pushRealtime(player, { type: "social", event: "friends_updated", snapshot: getSocialSnapshot(player.name) });
+      }
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw.startsWith(":friend remove ")) {
+      const target = raw.slice(15).trim();
+      const result = removeFriend(player.name, target);
+      this.addMessage(player, result.message);
+      this.pushRealtime(player, { type: "social", event: "friends_updated", snapshot: getSocialSnapshot(player.name) });
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw === ":friends" || raw === ":friend") {
+      const friends = listFriends(player.name);
+      const pending = listPending(player.name);
+      const lines = [
+        friends.length ? `Friends: ${friends.join(", ")}` : "No friends yet. :friend add <name>",
+        pending.in.length ? `Pending in: ${pending.in.join(", ")}` : "",
+        pending.out.length ? `Pending out: ${pending.out.join(", ")}` : "",
+      ].filter(Boolean);
+      this.addMessage(player, lines.join("\n"));
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw.startsWith(":dm ") || raw.startsWith(":tell ") || raw.startsWith(":msg ")) {
+      const rest = raw.slice(raw.indexOf(" ") + 1);
+      const space = rest.indexOf(" ");
+      if (space < 1) {
+        this.addMessage(player, "Usage: :dm <name> <message>");
+        this.sendToPlayer(player);
+        return true;
+      }
+      const target = rest.slice(0, space).trim();
+      const text = rest.slice(space + 1).trim();
+      if (!text) {
+        this.addMessage(player, "Usage: :dm <name> <message>");
+        this.sendToPlayer(player);
+        return true;
+      }
+      const msg = sendDM(player.name, target, text);
+      this.addMessage(player, `[dm→${msg.to}] ${text}`);
+      const other = this.findPlayerByName(target);
+      if (other) {
+        this.addMessage(other, `[dm←${player.name}] ${text}`);
+        this.pushRealtime(other, {
+          type: "chat",
+          channel: "dm",
+          from: player.name,
+          to: other.name,
+          text,
+          at: msg.at,
+        });
+        this.sendToPlayer(other);
+      } else {
+        this.addMessage(player, `${target} is offline — message saved.`);
+      }
+      this.pushRealtime(player, {
+        type: "chat",
+        channel: "dm",
+        from: player.name,
+        to: msg.to,
+        text,
+        at: msg.at,
+      });
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw.startsWith(":wall ")) {
+      const text = raw.slice(6).trim();
+      const post = postWall(player.name, text);
+      this.addMessage(player, `Posted to wall: ${text}`);
+      for (const p of this.players.values()) {
+        if (!p.connected) continue;
+        const friends = listFriends(p.name).map((n) => n.toLowerCase());
+        if (
+          p.id === player.id ||
+          friends.includes(player.name.toLowerCase()) ||
+          p.name.toLowerCase() === player.name.toLowerCase()
+        ) {
+          this.pushRealtime(p, {
+            type: "social",
+            event: "wall_post",
+            post,
+          });
+        }
+      }
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw.startsWith(":bio ")) {
+      const bio = raw.slice(5).trim();
+      setBio(player.name, bio);
+      this.addMessage(player, `Bio updated.`);
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    if (raw === ":social" || raw === ":feed") {
+      const feed = getWallFeed(player.name, 8);
+      const lines = feed.length
+        ? feed.map((p) => `${p.author}: ${p.text}`).join("\n")
+        : "Wall is quiet. :wall <message>";
+      this.addMessage(player, lines);
+      this.sendToPlayer(player);
+      return true;
+    }
+
+    return false;
+  }
+
+  handleSocialApi(
+    playerId: string,
+    action: string,
+    fields: Record<string, string>
+  ): Record<string, unknown> | string {
+    const player = this.players.get(playerId);
+    if (!player) return "Not in game.";
+
+    if (action === "snapshot") {
+      return getSocialSnapshot(player.name);
+    }
+    if (action === "friend_add") {
+      const r = requestFriend(player.name, fields.target || "");
+      if (r.ok) {
+        const other = this.findPlayerByName(fields.target || "");
+        if (other) {
+          this.addMessage(other, `${player.name} sent you a friend request.`);
+          this.pushRealtime(other, { type: "social", event: "friend_request", from: player.name });
+          this.sendToPlayer(other);
+        }
+      }
+      this.pushRealtime(player, { type: "social", event: "friends_updated", snapshot: getSocialSnapshot(player.name) });
+      return r;
+    }
+    if (action === "friend_accept") {
+      const r = acceptFriend(player.name, fields.target || "");
+      this.pushRealtime(player, { type: "social", event: "friends_updated", snapshot: getSocialSnapshot(player.name) });
+      return r;
+    }
+    if (action === "friend_remove") {
+      const r = removeFriend(player.name, fields.target || "");
+      this.pushRealtime(player, { type: "social", event: "friends_updated", snapshot: getSocialSnapshot(player.name) });
+      return r;
+    }
+    if (action === "dm_send") {
+      const target = fields.target || "";
+      const text = fields.text || "";
+      const msg = sendDM(player.name, target, text);
+      const other = this.findPlayerByName(target);
+      if (other) {
+        this.addMessage(other, `[dm←${player.name}] ${text}`);
+        this.pushRealtime(other, { type: "chat", channel: "dm", from: player.name, to: other.name, text, at: msg.at });
+        this.sendToPlayer(other);
+      }
+      return { ok: true, message: msg };
+    }
+    if (action === "dm_thread") {
+      markDMsRead(player.name, fields.target || "");
+      return { thread: getDMThread(player.name, fields.target || "", 40) };
+    }
+    if (action === "wall_post") {
+      const post = postWall(player.name, fields.text || "");
+      for (const p of this.players.values()) {
+        if (!p.connected) continue;
+        this.pushRealtime(p, { type: "social", event: "wall_post", post });
+      }
+      return { ok: true, post };
+    }
+    return "Unknown social action.";
+  }
+
+  private pushRealtime(player: OnlinePlayer, payload: Record<string, unknown>): void {
+    const conn = [...this.connections.values()].find((c) => c.playerId === player.id);
+    if (conn) conn.send(`RT:${JSON.stringify(payload)}`);
+  }
+
   listWho(): string {
     const lines = [...this.players.values()]
       .filter((p) => p.connected && p.state.alive)
@@ -169,16 +403,19 @@ export class WorldServer {
       });
     }
 
-    if (key.startsWith(":say ")) {
-      this.broadcastChat(`${player.name}: ${key.slice(5)}`, player.id);
+    if (key.startsWith(":say ") || key.startsWith(":chat ")) {
+      const text = key.includes(" ") ? key.slice(key.indexOf(" ") + 1) : "";
+      this.broadcastChat(`${player.name}: ${text}`, player.id, "global", player.name, text);
       return;
     }
 
-    if (key === "who") {
+    if (key === "who" || key === ":who" || key === "?") {
       this.addMessage(player, this.listWho());
       this.sendToPlayer(player);
       return;
     }
+
+    if (this.handleSocialCommand(player, key)) return;
 
     if (player.phase === "dead" || player.phase === "won") return;
 
@@ -627,14 +864,39 @@ export class WorldServer {
     if (player.messages.length > 50) player.messages.shift();
   }
 
-  private broadcastChat(msg: string, excludeId?: string): void {
+  private broadcastChat(
+    msg: string,
+    excludeId?: string,
+    channel: "global" | "system" = "global",
+    from?: string,
+    text?: string
+  ): void {
     this.chatLog.push(msg);
     if (this.chatLog.length > 200) this.chatLog.shift();
+    const at = new Date().toISOString();
     for (const p of this.players.values()) {
-      if (!p.connected || p.id === excludeId) continue;
-      this.addMessage(p, `[chat] ${msg}`);
-      this.sendToPlayer(p);
+      if (!p.connected) continue;
+      if (p.id !== excludeId) this.addMessage(p, `[chat] ${msg}`);
+      this.pushRealtime(p, {
+        type: "chat",
+        channel,
+        from: from ?? "system",
+        text: text ?? msg,
+        at,
+      });
+      if (p.id !== excludeId) this.sendToPlayer(p);
     }
+    if (excludeId) {
+      const sender = this.players.get(excludeId);
+      if (sender?.connected) {
+        this.addMessage(sender, `[chat] ${msg}`);
+        this.sendToPlayer(sender);
+      }
+    }
+  }
+
+  getChatLog(limit = 50): string[] {
+    return this.chatLog.slice(-limit);
   }
 
   private broadcastFloor(depth: number, excludeId?: string): void {
