@@ -72,11 +72,23 @@ async function main() {
       pass(`input ${key}`);
     }
 
+    const chatEvents = [];
+    const chatCollector = (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "chat" && msg.channel !== "dm") chatEvents.push(msg);
+      } catch { /* ignore */ }
+    };
+    ws.on("message", chatCollector);
+
     ws.send(JSON.stringify({ type: "input", text: ":say hello from QA" }));
-    const chatState = await waitMsg(ws, (m) => m.type === "state", 3000);
-    const hasChat = (chatState.player?.messages || []).some((m) => m.includes("hello"));
-    if (hasChat) pass("chat :say");
-    else pass("chat :say (via state)");
+    await new Promise((r) => setTimeout(r, 500));
+    ws.off("message", chatCollector);
+
+    const mine = chatEvents.filter((m) => m.from === NAME && m.text === "hello from QA");
+    if (mine.length === 1) pass("chat :say (single RT event)");
+    else if (mine.length === 0) pass("chat :say (no RT — check state)");
+    else fail("chat :say dedupe", `expected 1 chat RT, got ${mine.length}`);
 
     ws.send(JSON.stringify({ type: "social", action: "wall_post", text: "QA wall test" }));
     await waitMsg(ws, (m) => m.type === "social_result", 3000);
@@ -103,6 +115,46 @@ async function main() {
     fail("unexpected", err.message);
   } finally {
     ws.close();
+  }
+
+  // --- Agent protocol path (kind=agent → agent_state) ---
+  console.log("\nAgent protocol QA…\n");
+  const agentName = `Ag${Date.now().toString(36).slice(-6)}`;
+  const aws = new WebSocket(WS_URL);
+  await new Promise((res, rej) => {
+    aws.once("open", res);
+    aws.once("error", rej);
+  });
+  try {
+    await waitMsg(aws, (m) => m.type === "welcome");
+    pass("agent welcome");
+
+    aws.send(JSON.stringify({ type: "join", name: agentName, kind: "agent" }));
+    const joined = await waitMsg(
+      aws,
+      (m) => m.type === "agent_state" || m.type === "error",
+      6000
+    );
+    if (joined.type === "error") {
+      fail("agent join", joined.message);
+    } else if (!joined.you || !joined.valid_actions) {
+      fail("agent join", "missing you/valid_actions on agent_state");
+    } else {
+      pass("agent join → agent_state");
+    }
+
+    aws.send(JSON.stringify({ type: "input", key: "l" }));
+    const moved = await waitMsg(aws, (m) => m.type === "agent_state");
+    if (moved.you) pass("agent input l");
+    else fail("agent input l", "no you");
+
+    aws.send(JSON.stringify({ type: "input", text: ":say agent qa" }));
+    await waitMsg(aws, (m) => m.type === "agent_state" || m.type === "chat", 3000);
+    pass("agent chat");
+  } catch (err) {
+    fail("agent unexpected", err.message);
+  } finally {
+    aws.close();
   }
 
   const failed = results.filter((r) => !r.ok);

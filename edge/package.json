@@ -1,0 +1,28 @@
+{
+  "name": "@grokhack/edge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types src/worker-configuration.d.ts",
+    "types:check": "wrangler types --check src/worker-configuration.d.ts",
+    "check": "npm run types:check && tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:shuffle": "vitest run --sequence.shuffle --sequence.seed=20260710",
+    "test:property": "vitest run test/allocation.property.test.ts test/shadow-replay.test.ts test/transfer.property.test.ts -t seeded",
+    "build": "wrangler deploy --dry-run --env= --outdir dist/development --minify",
+    "build:staging": "wrangler deploy --dry-run --env staging --outdir dist/staging --minify",
+    "build:production": "wrangler deploy --dry-run --env production --outdir dist/production --minify",
+    "build:all": "npm run build && npm run build:staging && npm run build:production",
+    "verify": "npm run check && npm run test:coverage && npm run test:shuffle && npm run test:property && npm run build:all"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.4",
+    "@cloudflare/workers-types": "5.20260711.1",
+    "@vitest/coverage-istanbul": "^4.1.10",
+    "typescript": "5.7.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.110.0"
+  }
+}

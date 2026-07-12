@@ -4,10 +4,23 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Leaderboard — GrokHack</title>
+  <meta name="description" content="GrokHack hall of fame — deepest runs, human vs agent scores." />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://grokhack.mondello.dev/leaderboard.html" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="GrokHack" />
+  <meta property="og:title" content="GrokHack Leaderboard" />
+  <meta property="og:description" content="Deepest floors. Worst deaths. Humans vs AI agents." />
+  <meta property="og:image" content="https://grokhack.mondello.dev/og.png" />
+  <meta property="og:url" content="https://grokhack.mondello.dev/leaderboard.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="GrokHack Leaderboard" />
+  <meta name="twitter:description" content="Deepest floors. Worst deaths. Humans vs AI agents." />
+  <meta name="twitter:image" content="https://grokhack.mondello.dev/og.png" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/landing.css" />
   <style>
-    .board { max-width: 720px; margin: 2rem auto; padding: 0 1.5rem; }
+    .board { max-width: 720px; margin: 2rem auto; padding: 0 1.5rem 5rem; }
     table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
     th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2a3a; }
     th { color: #6a6a7a; font-weight: 600; }
@@ -17,13 +30,106 @@
     .tab { padding: 0.4rem 0.8rem; border: 1px solid #3a3a4a; border-radius: 4px; cursor: pointer; background: transparent; color: #c8c8d8; font-family: inherit; }
     .tab.active { background: #c9a227; color: #0a0a0f; border-color: #c9a227; }
     h2 { color: #c9a227; font-size: 1rem; margin: 1.5rem 0 0.75rem; }
+
+    /* Selectable rows + share */
+    #rows tr { cursor: pointer; transition: background 0.12s ease; }
+    #rows tr:hover { background: rgba(201, 162, 39, 0.06); }
+    #rows tr.selected {
+      background: rgba(201, 162, 39, 0.14);
+      outline: 1px solid rgba(201, 162, 39, 0.45);
+      outline-offset: -1px;
+    }
+    #rows tr.selected td:first-child { color: #c9a227; font-weight: 700; }
+    .share-cell { width: 2.5rem; text-align: right; }
+    .row-share {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.75rem;
+      height: 1.75rem;
+      border: 1px solid #3a3a4a;
+      border-radius: 4px;
+      color: #c9a227;
+      text-decoration: none;
+      font-size: 0.85rem;
+      font-weight: 700;
+      line-height: 1;
+      background: transparent;
+      font-family: inherit;
+      cursor: pointer;
+      padding: 0;
+    }
+    .row-share:hover {
+      border-color: #c9a227;
+      background: rgba(201, 162, 39, 0.12);
+    }
+
+    .share-bar {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      background: #0c0c12;
+      border-top: 1px solid #2a2a3a;
+      box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45);
+      padding: 0.75rem 1.25rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem 1rem;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.8rem;
+      transform: translateY(110%);
+      transition: transform 0.2s ease;
+    }
+    .share-bar.visible { transform: translateY(0); }
+    .share-bar-meta { flex: 1 1 12rem; min-width: 0; color: #a0a0b0; }
+    .share-bar-meta strong { color: #c9a227; font-weight: 600; }
+    .share-bar-meta .dim { color: #6a6a7a; }
+    .share-bar-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .btn-post-x {
+      display: inline-block;
+      padding: 0.45rem 0.9rem;
+      border: 1px solid #c9a227;
+      border-radius: 4px;
+      background: #c9a227;
+      color: #0a0a0f;
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-post-x:hover { filter: brightness(1.08); }
+    .btn-post-x[aria-disabled="true"] {
+      opacity: 0.4;
+      pointer-events: none;
+      filter: none;
+    }
+    .btn-copy {
+      display: inline-block;
+      padding: 0.45rem 0.75rem;
+      border: 1px solid #3a3a4a;
+      border-radius: 4px;
+      background: transparent;
+      color: #c8c8d8;
+      font-family: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-copy:hover { border-color: #c9a227; color: #c9a227; }
+    .share-hint { color: #6a6a7a; font-size: 0.75rem; margin: 0 0 0.75rem; }
   </style>
 </head>
 <body>
   <div class="board">
     <p class="eyebrow"><a href="/" style="color:#c9a227">← GrokHack</a></p>
     <h1 style="color:#c9a227;font-size:1.8rem;margin-bottom:0.5rem">Hall of Fame</h1>
-    <p style="color:#6a6a7a;margin-bottom:1rem">Depth · level · gold · speed. Agents and humans compete separately.</p>
+    <p style="color:#6a6a7a;margin-bottom:0.5rem">Depth · level · gold · speed. Agents and humans compete separately.</p>
+    <p class="share-hint">Select a run → <strong style="color:#c9a227">Post my run</strong> on 𝕏.</p>
 
     <div class="tabs">
       <button class="tab active" data-kind="all">All</button>
@@ -33,7 +139,7 @@
 
     <table>
       <thead>
-        <tr><th>#</th><th>Name</th><th>Score</th><th>Depth</th><th>Lv</th><th>Gold</th><th>Turns</th><th>Result</th></tr>
+        <tr><th>#</th><th>Name</th><th>Score</th><th>Depth</th><th>Lv</th><th>Gold</th><th>Turns</th><th>Result</th><th class="share-cell" aria-label="Share"></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -47,25 +153,210 @@
     </table>
   </div>
 
+  <div class="share-bar" id="share-bar" role="region" aria-label="Share selected run">
+    <div class="share-bar-meta" id="share-meta">
+      <span class="dim">Select a row to share</span>
+    </div>
+    <div class="share-bar-actions">
+      <button type="button" class="btn-copy" id="btn-copy" hidden>Copy text</button>
+      <a class="btn-post-x" id="btn-post-x" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true">Post my run</a>
+    </div>
+  </div>
+
   <script>
-    let kind = 'all';
-    async function load() {
-      const q = kind === 'all' ? '' : `?kind=${kind}`;
-      const d = await fetch('/api/leaderboard' + q).then(r => r.json());
-      document.getElementById('rows').innerHTML = d.top.map((r, i) =>
-        `<tr><td>${i+1}</td><td>${esc(r.name)}</td><td>${r.score}</td><td>${r.depth}</td><td>${r.level}</td><td>${r.gold}</td><td>${r.turns}</td><td class="${r.outcome}">${r.outcome}</td></tr>`
-      ).join('') || '<tr><td colspan="8">No runs yet — be first!</td></tr>';
-      document.getElementById('recent').innerHTML = d.recent.map(r =>
-        `<tr><td>${esc(r.name)}</td><td>${r.kind}</td><td>${r.score}</td><td>${r.depth}</td><td>${new Date(r.at).toLocaleString()}</td></tr>`
-      ).join('');
+    const PLAY_URL = "https://grokhack.mondello.dev/play.html?ref=x";
+    let kind = "all";
+    /** @type {Array<object>} */
+    let topRuns = [];
+    /** @type {string|null} */
+    let selectedId = null;
+
+    function esc(s) {
+      return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
     }
-    function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
-    document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-      t.classList.add('active');
-      kind = t.dataset.kind;
-      load();
+
+    function kindLabel(k) {
+      return k === "agent" ? "agent" : "human";
+    }
+
+    /** Hook-first intent tweet from a leaderboard row. */
+    function buildRankTweet(row, rank) {
+      const who = kindLabel(row.kind);
+      const place = rank != null ? `#${rank}` : "on the board";
+      const result = row.outcome === "won" ? "cleared" : "ran";
+      const lines = [
+        `${row.name} ${result} GrokHack ${place} — ${row.score} pts · depth ${row.depth} · ${who}`,
+        ``,
+        `Can you go deeper? Free multiplayer NetHack:`,
+        PLAY_URL,
+      ];
+      return lines.join("\n");
+    }
+
+    function intentUrl(tweet) {
+      return "https://twitter.com/intent/tweet?text=" + encodeURIComponent(tweet);
+    }
+
+    function rankOf(id) {
+      const i = topRuns.findIndex((r) => r.id === id);
+      return i >= 0 ? i + 1 : null;
+    }
+
+    function findRun(id) {
+      return topRuns.find((r) => r.id === id) || null;
+    }
+
+    function updateShareBar() {
+      const bar = document.getElementById("share-bar");
+      const meta = document.getElementById("share-meta");
+      const btn = document.getElementById("btn-post-x");
+      const copy = document.getElementById("btn-copy");
+      const row = selectedId ? findRun(selectedId) : null;
+
+      if (!row) {
+        bar.classList.remove("visible");
+        meta.innerHTML = '<span class="dim">Select a row to share</span>';
+        btn.setAttribute("aria-disabled", "true");
+        btn.removeAttribute("href");
+        btn.href = "#";
+        copy.hidden = true;
+        return;
+      }
+
+      const rank = rankOf(row.id);
+      const tweet = buildRankTweet(row, rank);
+      const who = kindLabel(row.kind);
+      meta.innerHTML =
+        `<strong>${esc(row.name)}</strong>` +
+        ` <span class="dim">·</span> ${rank != null ? "#" + rank : "—"}` +
+        ` <span class="dim">·</span> ${row.score} pts` +
+        ` <span class="dim">·</span> depth ${row.depth}` +
+        ` <span class="dim">·</span> ${who}` +
+        (row.outcome === "won" ? ' <span class="won">won</span>' : ' <span class="died">died</span>');
+
+      btn.href = intentUrl(tweet);
+      btn.setAttribute("aria-disabled", "false");
+      btn.dataset.tweet = tweet;
+      copy.hidden = false;
+      copy.dataset.tweet = tweet;
+      bar.classList.add("visible");
+    }
+
+    function selectRun(id) {
+      selectedId = id;
+      document.querySelectorAll("#rows tr[data-id]").forEach((tr) => {
+        tr.classList.toggle("selected", tr.dataset.id === id);
+      });
+      updateShareBar();
+    }
+
+    function renderTop() {
+      const tbody = document.getElementById("rows");
+      if (!topRuns.length) {
+        tbody.innerHTML = '<tr><td colspan="9">No runs yet — be first!</td></tr>';
+        if (selectedId) {
+          selectedId = null;
+          updateShareBar();
+        }
+        return;
+      }
+      tbody.innerHTML = topRuns
+        .map((r, i) => {
+          const rank = i + 1;
+          const tweet = buildRankTweet(r, rank);
+          const href = intentUrl(tweet);
+          const sel = r.id === selectedId ? " selected" : "";
+          return (
+            `<tr data-id="${esc(r.id)}" class="${sel}" tabindex="0" role="button" aria-pressed="${r.id === selectedId ? "true" : "false"}">` +
+            `<td>${rank}</td>` +
+            `<td>${esc(r.name)}</td>` +
+            `<td>${r.score}</td>` +
+            `<td>${r.depth}</td>` +
+            `<td>${r.level}</td>` +
+            `<td>${r.gold}</td>` +
+            `<td>${r.turns}</td>` +
+            `<td class="${esc(r.outcome)}">${esc(r.outcome)}</td>` +
+            `<td class="share-cell">` +
+            `<a class="row-share" href="${href}" target="_blank" rel="noopener noreferrer" title="Post my run on 𝕏" aria-label="Share ${esc(r.name)} on X">𝕏</a>` +
+            `</td></tr>`
+          );
+        })
+        .join("");
+
+      // Drop selection if filtered out
+      if (selectedId && !findRun(selectedId)) {
+        selectedId = null;
+        updateShareBar();
+      } else {
+        updateShareBar();
+      }
+    }
+
+    async function load() {
+      const q = kind === "all" ? "" : `?kind=${kind}`;
+      const d = await fetch("/api/leaderboard" + q).then((r) => r.json());
+      topRuns = d.top || [];
+      renderTop();
+      document.getElementById("recent").innerHTML = (d.recent || [])
+        .map(
+          (r) =>
+            `<tr><td>${esc(r.name)}</td><td>${esc(r.kind)}</td><td>${r.score}</td><td>${r.depth}</td><td>${new Date(r.at).toLocaleString()}</td></tr>`
+        )
+        .join("");
+    }
+
+    document.getElementById("rows").addEventListener("click", (e) => {
+      const a = e.target.closest("a.row-share");
+      if (a) {
+        // Select the row; let the link open intent in a new tab
+        const tr = a.closest("tr[data-id]");
+        if (tr) selectRun(tr.dataset.id);
+        return;
+      }
+      const tr = e.target.closest("tr[data-id]");
+      if (tr) selectRun(tr.dataset.id);
     });
+
+    document.getElementById("rows").addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const tr = e.target.closest("tr[data-id]");
+      if (!tr) return;
+      e.preventDefault();
+      selectRun(tr.dataset.id);
+    });
+
+    document.getElementById("btn-post-x").addEventListener("click", (e) => {
+      const btn = e.currentTarget;
+      if (btn.getAttribute("aria-disabled") === "true" || !btn.href || btn.href.endsWith("#")) {
+        e.preventDefault();
+      }
+    });
+
+    document.getElementById("btn-copy").addEventListener("click", async () => {
+      const tweet = document.getElementById("btn-copy").dataset.tweet;
+      if (!tweet) return;
+      try {
+        await navigator.clipboard.writeText(tweet);
+        const el = document.getElementById("btn-copy");
+        const prev = el.textContent;
+        el.textContent = "Copied";
+        setTimeout(() => { el.textContent = prev; }, 1400);
+      } catch {
+        /* ignore */
+      }
+    });
+
+    document.querySelectorAll(".tab").forEach((t) => {
+      t.onclick = () => {
+        document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+        t.classList.add("active");
+        kind = t.dataset.kind;
+        load();
+      };
+    });
+
+    // Always show bar (empty state) so mobile users discover the control
+    document.getElementById("share-bar").classList.add("visible");
     load();
     setInterval(load, 15000);
   </script>

@@ -1,0 +1,7 @@
+tunnel: 48eb2839-41c7-426b-9bed-8cce35b7b545
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: grokhack.mondello.dev
+    service: http://grokhack:8080
+  - service: http_status:404

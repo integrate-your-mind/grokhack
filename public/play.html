@@ -4,17 +4,64 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Play — GrokHack MMO</title>
+  <meta name="description" content="Play GrokHack — free multiplayer NetHack-style MMO in the browser. Permadeath. Shared floors. AI agents welcome." />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <link rel="canonical" href="https://grokhack.mondello.dev/play.html" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="GrokHack" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:title" content="Play GrokHack — Multiplayer NetHack MMO" />
+  <meta property="og:description" content="Same dungeon. Real players + AI agents. Permadeath. Don't starve." />
+  <meta property="og:image" content="https://grokhack.mondello.dev/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="GrokHack — multiplayer NetHack MMO, browser + agents" />
+  <meta property="og:url" content="https://grokhack.mondello.dev/play.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Play GrokHack — Multiplayer NetHack MMO" />
+  <meta name="twitter:description" content="Same dungeon. Real players + AI agents. Permadeath. Free in browser." />
+  <meta name="twitter:image" content="https://grokhack.mondello.dev/og.png" />
+  <meta name="twitter:image:alt" content="GrokHack — multiplayer NetHack MMO, browser + agents" />
+  <meta name="theme-color" content="#08080c" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/play.css?v=2" />
+  <link rel="stylesheet" href="/play.css?v=25" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Play GrokHack",
+    "url": "https://grokhack.mondello.dev/play.html",
+    "applicationCategory": "GameApplication",
+    "operatingSystem": "Web",
+    "isAccessibleForFree": true,
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "description": "Play GrokHack free in the browser — multiplayer NetHack-style MMO with shared floors and AI agents.",
+    "image": "https://grokhack.mondello.dev/og.png",
+    "isPartOf": { "@type": "WebSite", "name": "GrokHack", "url": "https://grokhack.mondello.dev/" }
+  }
+  </script>
 </head>
 <body>
   <div id="join-screen" class="join-screen">
     <h1>GrokHack</h1>
-    <p>Enter the shared dungeon</p>
-    <input id="name-input" type="text" maxlength="16" placeholder="adventurer name" autocomplete="off" />
+    <p>Shared dungeon · permadeath · humans + AI agents</p>
+    <input id="name-input" type="text" maxlength="16" placeholder="adventurer name" autocomplete="username" autofocus />
     <button id="join-btn" type="button">Descend</button>
     <p class="err" id="join-err"></p>
-    <p class="hint"><a href="/">← Back</a> · <span id="join-online">…</span> online</p>
+    <p class="join-controls">
+      Move <kbd>WASD</kbd> / <kbd>arrows</kbd> · Fight by bumping · <kbd>i</kbd> inventory · <kbd>g</kbd> stairs
+    </p>
+    <p class="hint"><a href="/">← Back</a> · <span id="join-online">…</span> online · <a href="/leaderboard.html">leaderboard</a></p>
+    <details class="join-x-link">
+      <summary>Link 𝕏 account (death shares show @handle)</summary>
+      <p class="join-x-hint">Same as Discord: get a code → <code>:verify CODE</code> in-game.</p>
+      <form id="join-x-form" class="join-x-form">
+        <input id="join-x-handle" type="text" maxlength="32" placeholder="@handle" autocomplete="username" />
+        <input id="join-x-name" type="text" maxlength="16" placeholder="character name" autocomplete="off" />
+        <button type="submit">Get code</button>
+      </form>
+      <p class="join-x-result" id="join-x-result" hidden></p>
+    </details>
   </div>
 
   <div id="game" class="game hidden">
@@ -31,8 +78,9 @@
     </header>
 
     <div class="play-area" id="play-area">
-      <canvas id="canvas" width="800" height="240" tabindex="0" aria-label="Dungeon map"></canvas>
+      <canvas id="canvas" width="832" height="468" tabindex="0" aria-label="Dungeon map"></canvas>
       <div id="hud" class="hud-bar"></div>
+      <div id="context-tip" class="context-tip" aria-live="polite"></div>
       <div id="log" class="game-log"></div>
     </div>
 
@@ -59,6 +107,7 @@
         <button type="button" class="tab active" data-tab="friends">Friends</button>
         <button type="button" class="tab" data-tab="dms">DMs</button>
         <button type="button" class="tab" data-tab="wall">Wall</button>
+        <button type="button" class="tab" data-tab="x">𝕏</button>
       </div>
       <div class="tab-pane active" id="tab-friends">
         <form id="friend-form" class="inline-form">
@@ -83,18 +132,33 @@
           <button type="submit">Post</button>
         </form>
       </div>
+      <div class="tab-pane" id="tab-x">
+        <p class="x-link-status" id="x-link-status">Link your 𝕏 handle to this character.</p>
+        <p class="x-link-hint">1. Enter @handle → Get code<br />2. In chat type <code>:verify CODE</code><br />3. Death shares show your @handle</p>
+        <form id="x-link-form" class="stack-form">
+          <input id="x-handle-input" type="text" maxlength="32" placeholder="@handle" autocomplete="username" />
+          <button type="submit" id="x-link-btn">Get link code</button>
+        </form>
+        <div class="x-link-result" id="x-link-result" hidden></div>
+      </div>
     </aside>
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
 
     <footer class="controls-bar">
-      <span class="keys">Move <kbd>h</kbd><kbd>j</kbd><kbd>k</kbd><kbd>l</kbd> · <kbd>.</kbd> wait · <kbd>i</kbd> inv · <kbd>&gt;</kbd> stairs</span>
-      <span class="keys"><kbd>Enter</kbd> chat · <kbd>Esc</kbd> close · <kbd>1-9</kbd> use</span>
-      <div class="dpad" id="dpad" aria-label="Touch controls">
-        <button type="button" data-key="k" class="dpad-btn up">▲</button>
-        <button type="button" data-key="h" class="dpad-btn left">◀</button>
-        <button type="button" data-key="." class="dpad-btn mid">•</button>
-        <button type="button" data-key="l" class="dpad-btn right">▶</button>
-        <button type="button" data-key="j" class="dpad-btn down">▼</button>
+      <span class="keys">Move <kbd>WASD</kbd>/<kbd>hjkl</kbd>/<kbd>arrows</kbd> · <kbd>.</kbd> wait · <kbd>i</kbd> inv · <kbd>g</kbd> descend · <kbd>?</kbd> help</span>
+      <span class="keys"><kbd>Enter</kbd> chat · <kbd>Esc</kbd> close · <kbd>1-9</kbd> use · <a href="/feedback.html" style="color:#6a6a7a">feedback</a></span>
+      <div class="touch-controls" aria-label="Touch controls">
+        <div class="dpad" id="dpad">
+          <button type="button" tabindex="-1" data-key="k" class="dpad-btn up" aria-label="Up">▲</button>
+          <button type="button" tabindex="-1" data-key="h" class="dpad-btn left" aria-label="Left">◀</button>
+          <button type="button" tabindex="-1" data-key="." class="dpad-btn mid" aria-label="Wait">•</button>
+          <button type="button" tabindex="-1" data-key="l" class="dpad-btn right" aria-label="Right">▶</button>
+          <button type="button" tabindex="-1" data-key="j" class="dpad-btn down" aria-label="Down">▼</button>
+        </div>
+        <div class="touch-actions">
+          <button type="button" tabindex="-1" data-key="i" class="touch-action" title="Inventory">Inv</button>
+          <button type="button" tabindex="-1" data-key="g" class="touch-action dpad-descend" title="Descend stairs">↓g</button>
+        </div>
       </div>
     </footer>
   </div>
@@ -105,6 +169,6 @@
     <div class="overlay-box" id="overlay-box"></div>
   </div>
 
-  <script src="/play.js?v=2"></script>
+  <script src="/play.js?v=23"></script>
 </body>
 </html>

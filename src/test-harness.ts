@@ -262,8 +262,8 @@ export function runUnitTests(): TestResult[] {
     entity: createPlayer(0, 0),
     level: 1, xp: 0, xpToLevel: 20,
     hunger: 100, maxHunger: 1000, hungerState: "normal",
-    inventory: [], equippedWeapon: null, equippedArmor: null,
-    gold: 0, turns: 0, depth: 1, alive: true,
+    inventory: [], equippedWeapon: null, equippedArmor: null, equippedRing: null,
+    gold: 0, turns: 0, depth: 1, alive: true, statuses: [],
   };
   updateHungerState(p);
   assert("hunger state updates to weak", p.hungerState === "weak");
@@ -282,7 +282,7 @@ export function runUnitTests(): TestResult[] {
 
   // Dragon is tough
   const dragon = createMonster("dragon", 0, 0, 10);
-  assert("depth-10 dragon has high HP", dragon.hp >= 60);
+  assert("depth-10 dragon has high HP", dragon.hp >= 90);
 
   // Depth 10 dragon spawn position check across seeds
   let dragonInWall = 0;

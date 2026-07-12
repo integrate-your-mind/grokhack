@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grokhack
+  labels:
+    app.kubernetes.io/name: grokhack
+    app.kubernetes.io/part-of: grokhack

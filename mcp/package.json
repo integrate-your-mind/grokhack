@@ -1,18 +1,43 @@
 {
   "name": "@grokhack/mcp",
-  "version": "1.0.0",
-  "description": "MCP server for GrokHack MMO — play, chat, and socialize via AI agents",
+  "version": "1.1.0",
+  "description": "MCP server for GrokHack MMO — play, chat, and socialize via AI agents. Build with npm run mcp:build (repo root) or npm install && npm run build (here). Point Cursor/Claude at dist/index.js. Env: GROKHACK_URL (WS), GROKHACK_HTTP (REST).",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "grokhack-mcp": "./dist/index.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "README.md",
+    "api-mcp.snapshot.json"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["mcp", "grokhack", "roguelike", "nethack", "mmo"],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/integrate-your-mind/grokhack.git",
+    "directory": "mcp"
+  },
+  "homepage": "https://grokhack.mondello.dev/mcp.html",
+  "bugs": {
+    "url": "https://github.com/integrate-your-mind/grokhack/issues"
+  },
+  "keywords": [
+    "mcp",
+    "grokhack",
+    "roguelike",
+    "nethack",
+    "mmo",
+    "model-context-protocol"
+  ],
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

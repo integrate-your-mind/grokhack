@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Feedback — GrokHack</title>
+  <meta name="description" content="Send feedback on GrokHack — bugs, ideas, and roguelike balance notes." />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://grokhack.mondello.dev/feedback.html" />
+  <meta property="og:title" content="Feedback — GrokHack" />
+  <meta property="og:description" content="Send feedback on GrokHack — bugs, ideas, and balance notes." />
+  <meta property="og:image" content="https://grokhack.mondello.dev/og.png" />
+  <meta property="og:url" content="https://grokhack.mondello.dev/feedback.html" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root { --bg:#0a0a0f; --panel:#12121a; --border:#2a2a3a; --text:#c8c8d8; --dim:#6a6a7a; --gold:#c9a227; --err:#c94a4a; }
+    * { box-sizing: border-box; }
+    body { font-family:"IBM Plex Mono",monospace; background:var(--bg); color:var(--text); max-width:560px; margin:2rem auto; padding:0 1rem; line-height:1.6; }
+    h1 { color:var(--gold); font-size:1.4rem; }
+    label { display:block; margin:1rem 0 0.35rem; font-size:0.85rem; color:var(--dim); }
+    select, input, textarea { width:100%; background:var(--panel); border:1px solid var(--border); color:var(--text); padding:0.6rem 0.75rem; border-radius:4px; font:inherit; }
+    textarea { min-height:120px; resize:vertical; }
+    .hp { position:absolute; left:-9999px; opacity:0; height:0; overflow:hidden; }
+    button { margin-top:1.25rem; background:var(--gold); color:#0a0a0f; border:none; padding:0.7rem 1.2rem; font:inherit; font-weight:600; border-radius:4px; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    .msg { margin-top:1rem; padding:0.75rem; border-radius:4px; font-size:0.9rem; }
+    .msg.ok { background:#1a2a1a; color:#8ac98a; }
+    .msg.err { background:#2a1a1a; color:var(--err); }
+    .hint { font-size:0.8rem; color:var(--dim); margin-top:0.5rem; }
+    a { color:var(--gold); }
+  </style>
+</head>
+<body>
+  <h1>Send Feedback</h1>
+  <p>Bug reports, balance ideas, UI pain — helps us ship fixes faster. Rate-limited to prevent spam.</p>
+
+  <form id="form">
+    <label for="category">Category</label>
+    <select id="category" name="category" required>
+      <option value="bug">Bug</option>
+      <option value="gameplay">Gameplay</option>
+      <option value="ui">UI / UX</option>
+      <option value="feature">Feature request</option>
+      <option value="security">Security (private triage)</option>
+      <option value="other">Other</option>
+    </select>
+
+    <label for="message">Message</label>
+    <textarea id="message" name="message" required minlength="10" maxlength="2000" placeholder="What happened? Steps to reproduce?"></textarea>
+    <p class="hint">10–2000 characters. No links required.</p>
+
+    <label for="contact">Contact (optional)</label>
+    <input id="contact" name="contact" type="text" maxlength="120" placeholder="Discord handle or email" autocomplete="off" />
+
+    <div class="hp" aria-hidden="true">
+      <label for="website">Website</label>
+      <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
+    </div>
+
+    <button type="submit" id="submit">Send feedback</button>
+  </form>
+
+  <div id="status" class="msg" hidden></div>
+  <p style="margin-top:2rem"><a href="/">← Home</a> · <a href="/play.html">Play</a></p>
+
+  <script>
+    const loadedAt = Date.now();
+    const params = new URLSearchParams(location.search);
+    const form = document.getElementById("form");
+    const status = document.getElementById("status");
+    const submitBtn = document.getElementById("submit");
+
+    if (params.get("cat")) {
+      const c = params.get("cat");
+      if ([...document.getElementById("category").options].some((o) => o.value === c)) {
+        document.getElementById("category").value = c;
+      }
+    }
+    // Prefill from death/share links (?player=Name&page=death)
+    const playerFromQ = (params.get("player") || "").trim().slice(0, 16);
+    if (playerFromQ) {
+      const contact = document.getElementById("contact");
+      if (contact && !contact.value) contact.placeholder = `in-game: ${playerFromQ}`;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      submitBtn.disabled = true;
+      status.hidden = true;
+
+      const body = {
+        category: document.getElementById("category").value,
+        message: document.getElementById("message").value,
+        contact: document.getElementById("contact").value,
+        website: document.getElementById("website").value,
+        playerName: playerFromQ || undefined,
+        page: params.get("page") ? `feedback?page=${params.get("page")}` : location.pathname,
+        sessionId: sessionStorage.getItem("grokhack-session") || undefined,
+        _ts: loadedAt,
+      };
+
+      try {
+        const res = await fetch("/api/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        status.hidden = false;
+        if (data.ok) {
+          status.className = "msg ok";
+          status.textContent = "Thanks — feedback received.";
+          form.reset();
+        } else {
+          status.className = "msg err";
+          status.textContent = data.message || data.error || "Could not send. Try again later.";
+        }
+      } catch {
+        status.hidden = false;
+        status.className = "msg err";
+        status.textContent = "Network error. Try again.";
+      }
+      submitBtn.disabled = false;
+    });
+  </script>
+</body>
+</html>

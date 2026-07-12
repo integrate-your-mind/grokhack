@@ -1,0 +1,40 @@
+# OPTIONAL — apply only if the CNI enforces NetworkPolicy (Calico/Cilium/etc.).
+# Default path: kubectl apply of 00–50 only. This is defense-in-depth for multi-tenant clusters.
+#
+# Goal: game :8080 not reachable from random namespaces. Telnet is already loopback-only
+# (TELNET_BIND_HOST=127.0.0.1) and is NOT on the Service.
+#
+# Warning: kubelet probes come from the node IP. If readiness/liveness fails after apply,
+# widen `from` for your cluster pod/node CIDRs or remove this file.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grokhack-game-ingress
+  namespace: grokhack
+  labels:
+    app: grokhack
+    tier: game
+  annotations:
+    description: "Optional allow-list for game HTTP; not required on single-tenant laptop k3s"
+spec:
+  podSelector:
+    matchLabels:
+      app: grokhack
+      tier: game
+  policyTypes:
+    - Ingress
+  ingress:
+    # Tunnel connectors
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: tunnel
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Same-namespace (Service, optional static cache, debug)
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080

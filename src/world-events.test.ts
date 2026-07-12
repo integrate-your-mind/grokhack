@@ -24,8 +24,16 @@ import {
   applyPlayerEventEffects,
   roomAt,
   spawnFromSpecs,
+  ambientInterval,
+  eventRng,
+  floorEnterAmbient,
+  discoverSpecialRoomsInFov,
+  detectPackSpotted,
+  rollTimedAmbient,
+  applyAmbientEffects,
+  tickWorldEventsCore,
 } from "./world-events";
-import type { PlayerState, Room } from "./types";
+import type { Entity, PlayerState, Room } from "./types";
 
 function makePlayer(x = 5, y = 5): PlayerState {
   const entity = createPlayer(x, y);
@@ -168,8 +176,10 @@ describe("reinforcement schedule", () => {
 });
 
 describe("environmental events", () => {
-  it("respects env cooldown", () => {
-    expect(envEventCooldown(3)).toBeGreaterThan(envEventCooldown(12));
+  it("respects env cooldown — d1–5 faster than deep", () => {
+    expect(envEventCooldown(2)).toBeLessThan(envEventCooldown(12));
+    expect(envEventCooldown(5)).toBeLessThanOrEqual(envEventCooldown(8));
+    expect(envEventCooldown(1)).toBeLessThanOrEqual(16);
   });
 
   it("fires mechanical events after cooldown (damage or spawns or gold)", () => {
@@ -202,9 +212,14 @@ describe("environmental events", () => {
         (result.goldDelta ?? 0) > 0 ||
         (result.hungerDrain ?? 0) > 0;
       expect(hasTeeth || result.messages.length > 0).toBe(true);
-      expect(["cave_in", "pack_migration", "graveyard_haunt", "shopkeeper_call"]).toContain(
-        result.kind
-      );
+      expect([
+        "cave_in",
+        "pack_migration",
+        "graveyard_haunt",
+        "shopkeeper_call",
+        "gas_pocket",
+        "corridor_ambush",
+      ]).toContain(result.kind);
     }
     expect(hits).toBeGreaterThan(5);
   });
@@ -413,5 +428,323 @@ describe("encounter room specials", () => {
     expect(a.turnCounter).toBe(0);
     a.turnCounter = 9;
     expect(ensureFloorEventState(a).turnCounter).toBe(9);
+  });
+});
+
+describe("ambient variety", () => {
+  it("eventRng is deterministic for seed+depth+turn", () => {
+    const a = eventRng(12345, 3, 10, 1).next();
+    const b = eventRng(12345, 3, 10, 1).next();
+    const c = eventRng(12345, 3, 11, 1).next();
+    expect(a).toBe(b);
+    expect(c).not.toBe(a);
+  });
+
+  it("ambientInterval is shorter on early depths", () => {
+    expect(ambientInterval(1)).toBeLessThan(ambientInterval(12));
+    expect(ambientInterval(2)).toBeLessThanOrEqual(ambientInterval(5));
+  });
+
+  it("floorEnterAmbient fires once with messages", () => {
+    const d = generateDungeon(new RNG(42), 3);
+    const ev = createFloorEventState();
+    const first = floorEnterAmbient(3, d, ev, eventRng(1, 3, 0, 1));
+    expect(first).not.toBeNull();
+    expect(first!.messages.length).toBeGreaterThan(0);
+    const second = floorEnterAmbient(3, d, ev, eventRng(1, 3, 0, 1));
+    expect(second).toBeNull();
+  });
+
+  it("discoverSpecialRoomsInFov announces vault/shrine once", () => {
+    const d = generateDungeon(new RNG(99), 6);
+    const room = d.rooms[1] ?? d.rooms[0];
+    room.special = "vault";
+    const key = `${room.x + 1},${room.y + 1}`;
+    const ev = createFloorEventState();
+    const a = discoverSpecialRoomsInFov({
+      dungeon: d,
+      visibleKeys: [key],
+      eventState: ev,
+      depth: 6,
+      rng: eventRng(9, 6, 1, 1),
+    });
+    expect(a).not.toBeNull();
+    expect(a!.messages.join(" ")).toMatch(/vault/i);
+    const b = discoverSpecialRoomsInFov({
+      dungeon: d,
+      visibleKeys: [key],
+      eventState: ev,
+      depth: 6,
+      rng: eventRng(9, 6, 2, 1),
+    });
+    expect(b).toBeNull();
+  });
+
+  it("detectPackSpotted requires 3+ pack monsters in FOV", () => {
+    const ev = createFloorEventState();
+    const monsters = [
+      { x: 1, y: 1, hp: 5, kind: "rat", traits: ["pack"] },
+      { x: 2, y: 1, hp: 5, kind: "rat", traits: ["pack"] },
+      { x: 3, y: 1, hp: 5, kind: "kobold", traits: ["pack"] },
+    ] as unknown as Entity[];
+    const vis = new Set(["1,1", "2,1", "3,1"]);
+    const hit = detectPackSpotted({
+      monsters,
+      visibleKeys: vis,
+      eventState: ev,
+      rng: eventRng(1, 2, 5, 1),
+    });
+    expect(hit).not.toBeNull();
+    expect(hit!.kind).toBe("pack_spotted");
+    // second time same cluster suppressed
+    expect(
+      detectPackSpotted({
+        monsters,
+        visibleKeys: vis,
+        eventState: ev,
+        rng: eventRng(1, 2, 6, 1),
+      })
+    ).toBeNull();
+  });
+
+  it("rollTimedAmbient respects cooldown and can fire variety", () => {
+    const d = generateDungeon(new RNG(7), 4);
+    const kinds = new Set<string>();
+    for (let turn = 0; turn < 200; turn++) {
+      const ev = createFloorEventState();
+      ev.turnCounter = turn;
+      ev.lastAmbientTurn = turn - ambientInterval(4);
+      const amb = rollTimedAmbient({
+        depth: 4,
+        dungeon: d,
+        eventState: ev,
+        seed: 777,
+        turn,
+      });
+      if (amb) kinds.add(amb.kind);
+    }
+    expect(kinds.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it("rollTimedAmbient does not spam within interval", () => {
+    const d = generateDungeon(new RNG(8), 2);
+    const ev = createFloorEventState();
+    ev.turnCounter = 20;
+    ev.lastAmbientTurn = 18; // within interval for d2 (7)
+    const amb = rollTimedAmbient({
+      depth: 2,
+      dungeon: d,
+      eventState: ev,
+      seed: 3,
+      turn: 20,
+    });
+    expect(amb).toBeNull();
+  });
+
+  it("applyAmbientEffects alerts packs and drains hunger", () => {
+    const p = makePlayer();
+    p.hunger = 100;
+    const m = {
+      hp: 5,
+      kind: "goblin",
+      traits: ["pack"],
+      ai: "wander",
+    } as unknown as Entity;
+    applyAmbientEffects(
+      { kind: "stampede", messages: ["x"], alertPacks: true, hungerDrain: 12 },
+      p,
+      [m]
+    );
+    expect(p.hunger).toBe(88);
+    expect(m.ai).toBe("hunt");
+  });
+});
+
+describe("P0 wire acceptance — reinforce + fountain", () => {
+  it("cleared sparse floor: shouldReinforce + planReinforcement yields 1–3 hostiles", () => {
+    const dungeon = generateDungeon(new RNG(2026), 5);
+    const ev = createFloorEventState();
+    // Simulate many turns elapsed so interval is satisfied
+    ev.turnCounter = 100;
+    ev.lastReinforcementTurn = 0;
+    const alive = 1; // sparse
+    expect(
+      shouldReinforce({
+        depth: 5,
+        aliveMonsters: alive,
+        playersOnFloor: 2,
+        eventState: ev,
+        requirePlayers: true,
+      })
+    ).toBe(true);
+
+    const occupied = new Set<string>([
+      `${dungeon.stairsUp.x},${dungeon.stairsUp.y}`,
+    ]);
+    const plan = planReinforcement(
+      dungeon,
+      5,
+      alive,
+      2,
+      occupied,
+      [{ x: dungeon.stairsUp.x, y: dungeon.stairsUp.y }],
+      new RNG(4242)
+    );
+    expect(plan).not.toBeNull();
+    expect(plan!.positions.length).toBeGreaterThanOrEqual(1);
+    expect(plan!.positions.length).toBeLessThanOrEqual(3);
+    const ents = applyReinforcementPlan(plan!, 5);
+    expect(ents.length).toBe(plan!.positions.length);
+    expect(ents.every((e) => e.hp > 0)).toBe(true);
+    expect(plan!.message.length).toBeGreaterThan(5);
+  });
+
+  it("fountain center step has heal-or-harm mechanical teeth", () => {
+    const dungeon = generateDungeon(new RNG(88), 4);
+    const room = dungeon.rooms[1] ?? dungeon.rooms[0];
+    room.special = "fountain";
+    const cx = room.x + Math.floor(room.w / 2);
+    const cy = room.y + Math.floor(room.h / 2);
+
+    let heal = 0;
+    let harm = 0;
+    for (let seed = 0; seed < 50; seed++) {
+      const p = makePlayer(cx, cy);
+      p.entity.hp = 12;
+      p.entity.maxHp = 20;
+      const fx = applyRoomSpecialOnStep({
+        dungeon,
+        x: cx,
+        y: cy,
+        depth: 4,
+        eventState: createFloorEventState(),
+        occupied: new Set(),
+        rng: new RNG(seed * 97 + 11),
+        player: p,
+      });
+      if (!fx) continue;
+      if ((fx.heal ?? 0) > 0) {
+        heal++;
+        const before = p.entity.hp;
+        applyPlayerEventEffects(p, { heal: fx.heal });
+        expect(p.entity.hp).toBeGreaterThan(before);
+      }
+      if ((fx.damage ?? 0) > 0) {
+        harm++;
+        const before = p.entity.hp;
+        applyPlayerEventEffects(p, { damage: fx.damage });
+        expect(p.entity.hp).toBeLessThan(before);
+      }
+    }
+    expect(heal + harm).toBeGreaterThan(15);
+    expect(heal).toBeGreaterThan(0);
+    expect(harm).toBeGreaterThan(0);
+  });
+
+  it("rollEnvironmentalEvent can fire pack_migration / haunt / shopkeeper", () => {
+    const dungeon = generateDungeon(new RNG(55), 8);
+    if (dungeon.rooms[1]) dungeon.rooms[1].special = "graveyard";
+    const kinds = new Set<string>();
+    for (let seed = 0; seed < 120; seed++) {
+      const ev = createFloorEventState();
+      ev.turnCounter = 200;
+      ev.lastEnvEventTurn = 0;
+      const occupied = new Set<string>([
+        `${dungeon.stairsUp.x},${dungeon.stairsUp.y}`,
+      ]);
+      const r = rollEnvironmentalEvent({
+        depth: 8,
+        dungeon,
+        eventState: ev,
+        occupied,
+        playerPos: { x: dungeon.stairsUp.x, y: dungeon.stairsUp.y },
+        rng: new RNG((seed * 2654435761) >>> 0),
+        hasGraveyard: true,
+      });
+      if (r) kinds.add(r.kind);
+    }
+    // Expect at least 2 of the 3 primary env kinds over many seeds
+    const primary = ["pack_migration", "graveyard_haunt", "shopkeeper_call", "cave_in"];
+    const hit = primary.filter((k) => kinds.has(k));
+    expect(hit.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("new env events with teeth (gas_pocket + corridor_ambush)", () => {
+  it("gas_pocket has heal or damage+hunger", () => {
+    const dungeon = generateDungeon(new RNG(1), 3);
+    let teeth = 0;
+    for (let seed = 0; seed < 80; seed++) {
+      const ev = createFloorEventState();
+      ev.turnCounter = 100;
+      ev.lastEnvEventTurn = 0;
+      // Force kind by many rolls until gas_pocket
+      const r = rollEnvironmentalEvent({
+        depth: 3,
+        dungeon,
+        eventState: { ...createFloorEventState(), turnCounter: 100, lastEnvEventTurn: 0 },
+        occupied: new Set([`${dungeon.stairsUp.x},${dungeon.stairsUp.y}`]),
+        playerPos: { x: dungeon.stairsUp.x, y: dungeon.stairsUp.y },
+        rng: new RNG((seed * 7919 + 13) >>> 0),
+      });
+      if (r?.kind === "gas_pocket") {
+        const has =
+          (r.damageToPlayer ?? 0) > 0 ||
+          (r.healToPlayer ?? 0) > 0 ||
+          (r.hungerDrain ?? 0) > 0;
+        if (has) teeth++;
+      }
+    }
+    expect(teeth).toBeGreaterThan(3);
+  });
+
+  it("corridor_ambush spawns hostiles or alerts packs", () => {
+    const dungeon = generateDungeon(new RNG(2), 4);
+    let hits = 0;
+    for (let seed = 0; seed < 100; seed++) {
+      const occupied = new Set([`${dungeon.stairsUp.x},${dungeon.stairsUp.y}`]);
+      const r = rollEnvironmentalEvent({
+        depth: 4,
+        dungeon,
+        eventState: { ...createFloorEventState(), turnCounter: 80, lastEnvEventTurn: 0 },
+        occupied,
+        playerPos: { x: dungeon.stairsUp.x, y: dungeon.stairsUp.y },
+        rng: new RNG((seed * 2654435761) >>> 0),
+      });
+      if (r?.kind === "corridor_ambush") {
+        hits++;
+        expect(
+          (r.spawns?.length ?? 0) > 0 || r.alertPacks === true || r.messages.length > 0
+        ).toBe(true);
+      }
+    }
+    expect(hits).toBeGreaterThan(2);
+  });
+
+  it("tickWorldEventsCore returns reinforce/env monsters on sparse floor", () => {
+    const dungeon = generateDungeon(new RNG(99), 5);
+    const ev = createFloorEventState();
+    ev.turnCounter = 50;
+    ev.lastReinforcementTurn = 0;
+    const monsters: Entity[] = [];
+    // Run several ticks until something fires
+    let totalSpawned = 0;
+    let msgs = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = tickWorldEventsCore({
+        depth: 5,
+        seed: 99,
+        dungeon,
+        monsters,
+        playerPos: { x: dungeon.stairsUp.x, y: dungeon.stairsUp.y },
+        playersOnFloor: 1,
+        eventState: ev,
+        hasGraveyard: false,
+      });
+      monsters.push(...r.newMonsters);
+      totalSpawned += r.newMonsters.length;
+      msgs += r.floorMessages.length;
+    }
+    expect(totalSpawned + msgs).toBeGreaterThan(0);
   });
 });

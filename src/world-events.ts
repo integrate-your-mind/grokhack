@@ -9,46 +9,59 @@
  * algorithms (dungeon room specials — thin handoffs only).
  */
 import { findSpawnPoint, isWalkable, randomPointInRoom } from "./dungeon";
-import { createMonster, pickMonsterKind } from "./entities";
-import type { RNG } from "./rng";
+import { createMonster, pickBeehiveMonsterKind, pickMonsterKind } from "./entities";
+import { RNG } from "./rng";
 import type {
   Dungeon,
   Entity,
+  FloorEventState,
   MonsterKind,
   PlayerState,
   Room,
   RoomSpecial,
 } from "./types";
 
+export type { FloorEventState };
+
 /** Salt so event RNG streams stay independent of traps/monsters. */
 export const WORLD_EVENT_SEED_SALT = 0x3e3e_7e11;
-
-/** In-memory bookkeeping for a floor (multiplayer or SP). */
-export interface FloorEventState {
-  /** Total player-turns processed on this floor (any player). */
-  turnCounter: number;
-  /** turnCounter at last successful reinforcement. */
-  lastReinforcementTurn: number;
-  /** turnCounter at last environmental event. */
-  lastEnvEventTurn: number;
-  /** Room keys (`x,y`) already delivering first-entry specials this visit. */
-  enteredSpecials: string[];
-}
 
 export function createFloorEventState(): FloorEventState {
   return {
     turnCounter: 0,
     lastReinforcementTurn: 0,
     lastEnvEventTurn: 0,
+    lastAmbientTurn: 0,
     enteredSpecials: [],
+    discoveredSpecials: [],
+    packSpotted: [],
+    floorEnterDone: false,
   };
 }
 
 export function ensureFloorEventState(
   state: FloorEventState | undefined | null
 ): FloorEventState {
-  if (state && typeof state.turnCounter === "number") return state;
-  return createFloorEventState();
+  if (!state || typeof state.turnCounter !== "number") return createFloorEventState();
+  // Backfill fields for floors hydrated mid-session / older saves
+  if (typeof state.lastAmbientTurn !== "number") state.lastAmbientTurn = 0;
+  if (!Array.isArray(state.enteredSpecials)) state.enteredSpecials = [];
+  if (!Array.isArray(state.discoveredSpecials)) state.discoveredSpecials = [];
+  if (!Array.isArray(state.packSpotted)) state.packSpotted = [];
+  if (typeof state.floorEnterDone !== "boolean") state.floorEnterDone = false;
+  return state;
+}
+
+/** Deterministic event stream: seed + depth + turn (+ optional stream salt). */
+export function eventRng(seed: number, depth: number, turn: number, stream = 0): RNG {
+  // Mix without importing crypto — stable across SP and MMO
+  const mixed =
+    ((seed ^ WORLD_EVENT_SEED_SALT) +
+      depth * 7919 +
+      turn * 104729 +
+      stream * 2654435761) >>>
+    0;
+  return new RNG(mixed || 1);
 }
 
 // ——— Reinforcement (wandering monsters / respawn pressure) ———
@@ -157,7 +170,11 @@ export type EnvEventKind =
   | "cave_in"
   | "pack_migration"
   | "graveyard_haunt"
-  | "shopkeeper_call";
+  | "shopkeeper_call"
+  /** Foul gas — damage + hunger (d1–5 common). */
+  | "gas_pocket"
+  /** Close-range ambush spawns (mechanical pressure). */
+  | "corridor_ambush";
 
 export interface EnvEventResult {
   kind: EnvEventKind;
@@ -166,16 +183,20 @@ export interface EnvEventResult {
   damageToPlayer?: number;
   /** Optional hunger tax. */
   hungerDrain?: number;
+  /** Optional heal (rare gas pocket false alarm / clean air). */
+  healToPlayer?: number;
   /** Monsters to spawn. */
   spawns?: { x: number; y: number; monsterKind: MonsterKind }[];
   /** Gold granted (shopkeeper / throne residue). */
   goldDelta?: number;
+  /** Alert pack AI to hunt. */
+  alertPacks?: boolean;
 }
 
 /** Min turns between environmental rolls (not counting reinforcements). */
 export function envEventCooldown(depth: number): number {
-  // CEO: more event variety on early floors
-  return depth <= 2 ? 22 : depth <= 5 ? 28 : depth <= 8 ? 32 : 24;
+  // Density coord: faster d1–5 cadence so something always happens
+  return depth <= 2 ? 12 : depth <= 5 ? 16 : depth <= 8 ? 28 : 24;
 }
 
 /**
@@ -199,15 +220,18 @@ export function rollEnvironmentalEvent(opts: {
   // Higher chance on d1–5 so early game feels eventful
   const fireChance =
     depth <= 5
-      ? 0.28 + Math.min(0.1, depth * 0.015)
+      ? 0.34 + Math.min(0.1, depth * 0.015)
       : 0.18 + Math.min(0.12, depth * 0.01);
   if (!rng.chance(fireChance)) return null;
 
   const weights: { kind: EnvEventKind; w: number }[] = [
-    { kind: "cave_in", w: 3 },
-    { kind: "pack_migration", w: 4 },
+    { kind: "cave_in", w: 2.5 },
+    { kind: "pack_migration", w: 3.5 },
     { kind: "graveyard_haunt", w: opts.hasGraveyard || depth >= 4 ? 3 : 0.5 },
     { kind: "shopkeeper_call", w: depth >= 3 ? 2 : 0.8 },
+    // New: early floors lean gas + ambush so d1–5 never go quiet
+    { kind: "gas_pocket", w: depth <= 5 ? 4 : 2 },
+    { kind: "corridor_ambush", w: depth <= 5 ? 3.5 : 2.5 },
   ];
   const total = weights.reduce((s, x) => s + x.w, 0);
   let roll = rng.next() * total;
@@ -229,6 +253,10 @@ export function rollEnvironmentalEvent(opts: {
       return resolveGraveyardHaunt(depth, dungeon, occupied, playerPos, rng, opts.hasGraveyard);
     case "shopkeeper_call":
       return resolveShopkeeperCall(depth, dungeon, occupied, playerPos, rng);
+    case "gas_pocket":
+      return resolveGasPocket(depth, rng);
+    case "corridor_ambush":
+      return resolveCorridorAmbush(depth, dungeon, occupied, playerPos, rng);
   }
 }
 
@@ -249,6 +277,92 @@ function resolveCaveIn(
     ],
     damageToPlayer: dmg,
     hungerDrain,
+  };
+}
+
+/** Gas pocket — common d1–5 pressure: damage + hunger, rare clean breath heal. */
+function resolveGasPocket(depth: number, rng: RNG): EnvEventResult {
+  if (rng.chance(0.18)) {
+    const heal = rng.int(2, 4 + Math.floor(depth / 4));
+    return {
+      kind: "gas_pocket",
+      messages: [
+        "A pocket of clean air opens — the fog thins.",
+        `You catch your breath and recover ${heal} HP.`,
+      ],
+      healToPlayer: heal,
+    };
+  }
+  const dmg = rng.int(1, 2 + Math.floor(depth / 3));
+  const hungerDrain = rng.int(10, 20 + depth * 2);
+  return {
+    kind: "gas_pocket",
+    messages: [
+      "A foul gas pocket blooms in the corridor!",
+      `You choke for ${dmg} damage as your appetite flees.`,
+    ],
+    damageToPlayer: dmg,
+    hungerDrain,
+  };
+}
+
+/**
+ * Corridor ambush — 1–2 hostiles spawn near the actor (closer than pack migration).
+ * Does not touch monsterCountRange bands — pure event spawns.
+ */
+function resolveCorridorAmbush(
+  depth: number,
+  dungeon: Dungeon,
+  occupied: Set<string>,
+  playerPos: { x: number; y: number },
+  rng: RNG
+): EnvEventResult {
+  const n = rng.int(1, depth <= 3 ? 2 : 3);
+  const spawns: EnvEventResult["spawns"] = [];
+  const kinds: MonsterKind[] =
+    depth <= 3
+      ? ["rat", "kobold", "bat", "goblin"]
+      : depth <= 7
+        ? ["kobold", "goblin", "snake", "orc"]
+        : ["orc", "goblin", "snake", "skeleton"];
+
+  for (let i = 0; i < n; i++) {
+    // Prefer near player but not on them — ambush range 2–5
+    const pos = findSpawnPoint(dungeon, occupied, rng, {
+      minDistanceFrom: playerPos,
+      minDistance: 2,
+    });
+    if (!pos) break;
+    // Reject if too far (want teeth near the actor)
+    const cheb = Math.max(
+      Math.abs(pos.x - playerPos.x),
+      Math.abs(pos.y - playerPos.y)
+    );
+    if (cheb > 6) {
+      // still accept occasionally so floors aren't starved of spawns
+      if (!rng.chance(0.35)) continue;
+    }
+    occupied.add(`${pos.x},${pos.y}`);
+    spawns.push({ x: pos.x, y: pos.y, monsterKind: rng.pick(kinds) });
+  }
+
+  if (!spawns.length) {
+    return {
+      kind: "corridor_ambush",
+      messages: ["You sense an ambush forming — then it slips away."],
+      alertPacks: true,
+    };
+  }
+
+  return {
+    kind: "corridor_ambush",
+    messages: [
+      spawns.length === 1
+        ? "Ambush! Something drops from a side corridor!"
+        : `Ambush! ${spawns.length} hostiles close in from the dark!`,
+    ],
+    spawns,
+    alertPacks: true,
   };
 }
 
@@ -623,6 +737,9 @@ export function pickDenMonsterKind(
         depth >= 8 ? ["orc", "ogre", "troll"] : depth >= 5 ? ["orc", "goblin", "ogre"] : ["goblin", "orc"];
       return rng.pick(pool);
     }
+    // P0-8 / bestiary handoff — dens always killer_bee pack (see entities.beehiveDenMonsterPool)
+    case "beehive":
+      return pickBeehiveMonsterKind(depth, rng.next());
     default:
       return pickMonsterKind(depth, rng.next());
   }
@@ -818,4 +935,626 @@ export function spawnFromSpecs(
   depth: number
 ): Entity[] {
   return specs.map((s) => createMonster(s.monsterKind, s.x, s.y, depth));
+}
+
+// ——— Ambient flavor (alive floors beyond static spawns) ———
+
+export type AmbientKind =
+  | "whisper"
+  | "stampede"
+  | "shrine_omen"
+  | "barracks_drill"
+  | "vault_alarm"
+  | "depth_beat"
+  | "pack_spotted"
+  | "floor_enter"
+  | "rare_floor";
+
+export interface AmbientEvent {
+  kind: AmbientKind;
+  messages: string[];
+  /** Soft teeth: set nearby pack monsters to hunt. */
+  alertPacks?: boolean;
+  /** Soft teeth: tiny hunger tax (dungeon nerves). */
+  hungerDrain?: number;
+}
+
+/** Min turns between ambient lines (richer early, still no spam). */
+export function ambientInterval(depth: number): number {
+  const d = Math.max(1, depth);
+  if (d <= 2) return 7;
+  if (d <= 5) return 9;
+  if (d <= 10) return 12;
+  return 14;
+}
+
+const WHISPERS_EARLY = [
+  "You hear something moving in the dark...",
+  "A drip of water counts the seconds between heartbeats.",
+  "Claws tick stone just past the torch glow.",
+  "A squeak answers another squeak — then silence.",
+  "Dust sifts from the ceiling as something heavy shifts.",
+  "Your torch gutters; the dark presses closer.",
+  "A soft chittering circles the edge of hearing.",
+  "Stone scrapes stone. Not wind. Not you.",
+  "You smell wet fur and old blood.",
+  "Something sniffs along a corridor you have not mapped.",
+  "A low mutter of voices — or rats arguing over bones.",
+  "The dark behind you feels occupied.",
+];
+
+const WHISPERS_DEEP = [
+  "A growl rolls through the rock like distant thunder.",
+  "You sense weight moving on floors above — or below.",
+  "Something large shifts in the shadows.",
+  "Footsteps scrape stone just out of sight.",
+  "The air tastes of iron and old magic.",
+  "A roar too far to place still makes your teeth ache.",
+  "Your torchlight seems thinner here.",
+];
+
+const STAMPEDE = [
+  "A rumble of many feet — a stampede is coming!",
+  "Dust rises in the corridor: something runs as a pack.",
+  "You hear the drum of claws — a swarm is on the move.",
+  "Squeals and scrapes braiding into one charge.",
+  "The floor vibrates. Small feet. Too many.",
+];
+
+const SHRINE_OMENS = [
+  "A warm draft smells of incense — a shrine is near.",
+  "Faint chanting threads the stone, then dies.",
+  "Your skin prickles: old blessings still cling here.",
+  "A soft light winks at the edge of vision, then is gone.",
+  "You feel watched by something that is not hungry — only curious.",
+];
+
+const BARRACKS_DRILLS = [
+  "You hear the clatter of weapons from a nearby barracks.",
+  "Boots stamp in unison — drills, not a march past.",
+  "A barked order echoes; something answers with a snarl.",
+  "Shield rims knock wood. Someone is training for you.",
+  "Armor jingles in cadence down an unseen hall.",
+];
+
+const VAULT_ALARMS = [
+  "You sense a treasure vault nearby...",
+  "A thin chime rings once — like a vault testing its locks.",
+  "Gold-scented air; greed and danger share a room.",
+  "Something mechanical clicks twice behind sealed stone.",
+  "Your torch finds a glint that is not a puddle.",
+];
+
+const DEPTH_BEATS_EARLY = [
+  "The dungeon settles around you, alive and uncaring.",
+  "Corridors branch like questions you have not answered.",
+  "Somewhere, a door closes that you did not open.",
+  "Moss drinks the torchlight. The stone drinks sound.",
+  "You are not the first on this floor — only the latest.",
+  "A draft from deeper levels carries a colder story.",
+];
+
+const DEPTH_BEATS_MID = [
+  "The stone here remembers violence.",
+  "Your footsteps sound too loud for the company you keep.",
+  "Depth has a weight; you feel it on your shoulders.",
+  "Even the rats seem scarred and serious now.",
+];
+
+const DEPTH_BEATS_ABYSS = [
+  "The abyss does not echo. It swallows.",
+  "Geometry feels optional. Keep your eyes on the floor.",
+  "Something older than dragons wrote these halls.",
+  "Your torch burns blue for a heartbeat, then normal.",
+];
+
+const PACK_SPOTTED = [
+  "A pack has your scent! Multiple beasts begin to hunt.",
+  "You spot a knot of creatures moving as one.",
+  "Eyes catch the torch — many pairs, not one.",
+  "The corridor ahead is crowded with hostile life.",
+  "Pack tactics: they fan out as you watch.",
+];
+
+const FLOOR_ENTER_EARLY = [
+  "The floor is restless tonight.",
+  "Something already knew you would arrive.",
+  "You hear life in three directions at once.",
+  "Fresh tracks cut the dust near the stairs.",
+];
+
+const FLOOR_ENTER_MID = [
+  "The welcome mat is bloodstains and broken spears.",
+  "This depth does not pretend to be empty.",
+  "You step into a working ecosystem of teeth.",
+];
+
+const FLOOR_ENTER_DEEP = [
+  "The air refuses to be friendly.",
+  "You have descended past the dungeon's patience.",
+  "Only the stubborn and the dead stay this deep.",
+];
+
+const RARE_FLOOR = [
+  "A chill wind races the halls — the floor itself is uneasy.",
+  "All the torches you do not carry seem to lean toward you.",
+  "For a moment every distant sound stops. Then resumes, closer.",
+  "You feel a floor-wide attention settle on your back.",
+];
+
+function pickLine(pool: string[], rng: RNG): string {
+  return rng.pick(pool);
+}
+
+/**
+ * Floor-enter ambient (once per visit). Complements depthFlavor — not a replacement.
+ */
+export function floorEnterAmbient(
+  depth: number,
+  dungeon: Dungeon,
+  eventState: FloorEventState,
+  rng: RNG
+): AmbientEvent | null {
+  if (eventState.floorEnterDone) return null;
+  eventState.floorEnterDone = true;
+
+  const messages: string[] = [];
+  if (depth <= 5) messages.push(pickLine(FLOOR_ENTER_EARLY, rng));
+  else if (depth <= 10) messages.push(pickLine(FLOOR_ENTER_MID, rng));
+  else messages.push(pickLine(FLOOR_ENTER_DEEP, rng));
+
+  // Hint specials without spoiling exact rooms
+  const specials = new Set(
+    dungeon.rooms.map((r) => r.special).filter((s): s is Exclude<RoomSpecial, null> => !!s)
+  );
+  if (specials.has("vault") && rng.chance(0.55)) {
+    messages.push(pickLine(VAULT_ALARMS, rng));
+  } else if (specials.has("barracks") && rng.chance(0.5)) {
+    messages.push(pickLine(BARRACKS_DRILLS, rng));
+  } else if (specials.has("shrine") && rng.chance(0.5)) {
+    messages.push(pickLine(SHRINE_OMENS, rng));
+  } else if (specials.has("zoo") && rng.chance(0.45)) {
+    messages.push(pickLine(STAMPEDE, rng));
+  } else if (rng.chance(depth <= 5 ? 0.4 : 0.25)) {
+    messages.push(
+      depth <= 5
+        ? pickLine(DEPTH_BEATS_EARLY, rng)
+        : depth <= 10
+          ? pickLine(DEPTH_BEATS_MID, rng)
+          : pickLine(DEPTH_BEATS_ABYSS, rng)
+    );
+  }
+
+  return { kind: "floor_enter", messages };
+}
+
+/**
+ * FOV discovery: first time any tile of a special room is seen.
+ * Returns at most one discovery per call (caller can loop).
+ */
+export function discoverSpecialRoomsInFov(opts: {
+  dungeon: Dungeon;
+  visibleKeys: Iterable<string>;
+  eventState: FloorEventState;
+  depth: number;
+  rng: RNG;
+}): AmbientEvent | null {
+  const { dungeon, eventState, rng } = opts;
+  for (const key of opts.visibleKeys) {
+    const [xs, ys] = key.split(",");
+    const x = Number(xs);
+    const y = Number(ys);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const room = roomAt(dungeon, x, y);
+    if (!room?.special || room.special === "alcove") continue;
+    const rk = roomKey(room);
+    if (eventState.discoveredSpecials.includes(rk)) continue;
+    eventState.discoveredSpecials.push(rk);
+
+    const special = room.special;
+    let messages: string[];
+    let kind: AmbientKind = "depth_beat";
+    switch (special) {
+      case "vault":
+        kind = "vault_alarm";
+        messages = [
+          room.locked
+            ? "You spot a locked treasure vault nearby..."
+            : "You spot a treasure vault nearby...",
+          pickLine(VAULT_ALARMS, rng),
+        ];
+        break;
+      case "shrine":
+        kind = "shrine_omen";
+        messages = ["You discover a forgotten shrine.", pickLine(SHRINE_OMENS, rng)];
+        break;
+      case "barracks":
+        kind = "barracks_drill";
+        messages = ["You have found barracks.", pickLine(BARRACKS_DRILLS, rng)];
+        break;
+      case "zoo":
+        kind = "stampede";
+        messages = [
+          "You discover a monster zoo — cages hang open.",
+          pickLine(STAMPEDE, rng),
+        ];
+        break;
+      case "graveyard":
+        kind = "whisper";
+        messages = [
+          "Gravestones lean into view. The air cools.",
+          "Something watches from between the markers.",
+        ];
+        break;
+      case "fountain":
+        kind = "whisper";
+        messages = ["You spot a stone fountain, water still moving."];
+        break;
+      case "throne":
+        kind = "vault_alarm";
+        messages = ["A cracked throne commands the chamber ahead."];
+        break;
+      default:
+        messages = ["You notice a chamber that feels important."];
+    }
+    return { kind, messages };
+  }
+  return null;
+}
+
+/**
+ * Pack spotted: 3+ living pack/swarm monsters in FOV → one warning.
+ */
+export function detectPackSpotted(opts: {
+  monsters: Entity[];
+  visibleKeys: Set<string>;
+  eventState: FloorEventState;
+  rng: RNG;
+}): AmbientEvent | null {
+  const packers: Entity[] = [];
+  for (const m of opts.monsters) {
+    if (m.hp <= 0) continue;
+    if (!opts.visibleKeys.has(`${m.x},${m.y}`)) continue;
+    const isPack =
+      m.traits?.includes("pack") ||
+      m.kind === "rat" ||
+      m.kind === "kobold" ||
+      m.kind === "goblin" ||
+      m.kind === "bat";
+    if (isPack) packers.push(m);
+  }
+  if (packers.length < 3) return null;
+
+  // Cluster key: rough cell of centroid so different packs can each warn once
+  const cx = Math.floor(packers.reduce((s, m) => s + m.x, 0) / packers.length / 5);
+  const cy = Math.floor(packers.reduce((s, m) => s + m.y, 0) / packers.length / 5);
+  const pk = `pack:${cx},${cy}:${packers.length >= 5 ? "swarm" : "pack"}`;
+  if (opts.eventState.packSpotted.includes(pk)) return null;
+  opts.eventState.packSpotted.push(pk);
+
+  return {
+    kind: "pack_spotted",
+    messages: [pickLine(PACK_SPOTTED, opts.rng)],
+    alertPacks: true,
+  };
+}
+
+/**
+ * Peripheral whisper when a hunter lurks just outside FOV (deterministic).
+ */
+export function peripheralWhisper(opts: {
+  monsters: Entity[];
+  playerPos: { x: number; y: number };
+  fovRadius: number;
+  depth: number;
+  seed: number;
+  turn: number;
+  eventState: FloorEventState;
+}): AmbientEvent | null {
+  const { monsters, playerPos, fovRadius, depth, seed, turn, eventState } = opts;
+  // Share ambient cooldown so whispers don't stack with timed ambience
+  if (eventState.turnCounter - eventState.lastAmbientTurn < Math.max(4, ambientInterval(depth) - 3)) {
+    return null;
+  }
+  const rng = eventRng(seed, depth, turn, 0x77);
+  // ~8% after gap on early floors, lower deeper (AI still stress-tests)
+  if (!rng.chance(depth <= 5 ? 0.1 : 0.06)) return null;
+
+  for (const monster of monsters) {
+    if (monster.hp <= 0) continue;
+    if (monster.ai !== "hunt" && !monster.traits?.includes("pack")) continue;
+    const cheb = Math.max(
+      Math.abs(monster.x - playerPos.x),
+      Math.abs(monster.y - playerPos.y)
+    );
+    if (cheb > fovRadius && cheb <= fovRadius + 4) {
+      const pool = depth <= 5 ? WHISPERS_EARLY : WHISPERS_DEEP;
+      const line =
+        rng.chance(0.35) && monster.name
+          ? `You sense a ${monster.name} nearby.`
+          : pickLine(pool, rng);
+      eventState.lastAmbientTurn = eventState.turnCounter;
+      return { kind: "whisper", messages: [line] };
+    }
+  }
+  return null;
+}
+
+/**
+ * Timed ambient beat every N turns — flavor pools by depth + floor specials.
+ * No spam: respects lastAmbientTurn. Prefer mechanical env/reinforce first.
+ */
+export function rollTimedAmbient(opts: {
+  depth: number;
+  dungeon: Dungeon;
+  eventState: FloorEventState;
+  seed: number;
+  turn: number;
+  /** Skip if a mechanical event already fired this turn. */
+  skipIfBusy?: boolean;
+}): AmbientEvent | null {
+  if (opts.skipIfBusy) return null;
+  const { depth, dungeon, eventState, seed, turn } = opts;
+  const gap = eventState.turnCounter - eventState.lastAmbientTurn;
+  if (gap < ambientInterval(depth)) return null;
+
+  const rng = eventRng(seed, depth, turn, 0xa1);
+  // Chance after gap — higher d1–5
+  const chance = depth <= 2 ? 0.55 : depth <= 5 ? 0.42 : depth <= 10 ? 0.32 : 0.28;
+  if (!rng.chance(chance)) return null;
+
+  const specials = dungeon.rooms.map((r) => r.special).filter(Boolean) as RoomSpecial[];
+  const has = (s: RoomSpecial) => specials.includes(s);
+
+  type Cand = { kind: AmbientKind; w: number; lines: string[]; alert?: boolean; hunger?: number };
+  const cands: Cand[] = [
+    {
+      kind: "whisper",
+      w: depth <= 5 ? 5 : 3,
+      lines: depth <= 5 ? WHISPERS_EARLY : WHISPERS_DEEP,
+    },
+    {
+      kind: "depth_beat",
+      w: depth <= 5 ? 4 : 3,
+      lines:
+        depth <= 5
+          ? DEPTH_BEATS_EARLY
+          : depth <= 10
+            ? DEPTH_BEATS_MID
+            : DEPTH_BEATS_ABYSS,
+    },
+    {
+      kind: "stampede",
+      w: has("zoo") || depth <= 5 ? 3 : 1.2,
+      lines: STAMPEDE,
+      alert: true,
+    },
+    {
+      kind: "shrine_omen",
+      w: has("shrine") ? 3.5 : 0.6,
+      lines: SHRINE_OMENS,
+    },
+    {
+      kind: "barracks_drill",
+      w: has("barracks") ? 3.5 : 0.7,
+      lines: BARRACKS_DRILLS,
+      alert: true,
+    },
+    {
+      kind: "vault_alarm",
+      w: has("vault") ? 3 : 0.5,
+      lines: VAULT_ALARMS,
+    },
+    {
+      kind: "rare_floor",
+      w: depth <= 5 ? 1.2 : 0.8,
+      lines: RARE_FLOOR,
+      hunger: rng.int(4, 10),
+    },
+  ];
+
+  const total = cands.reduce((s, c) => s + c.w, 0);
+  let roll = rng.next() * total;
+  let pick = cands[0];
+  for (const c of cands) {
+    roll -= c.w;
+    if (roll <= 0) {
+      pick = c;
+      break;
+    }
+  }
+
+  eventState.lastAmbientTurn = eventState.turnCounter;
+  return {
+    kind: pick.kind,
+    messages: [pickLine(pick.lines, rng)],
+    alertPacks: pick.alert,
+    hungerDrain: pick.hunger,
+  };
+}
+
+/** Apply soft ambient side-effects (pack alert + hunger). */
+export function applyAmbientEffects(
+  ambient: AmbientEvent,
+  player: PlayerState,
+  monsters: Entity[]
+): void {
+  if (ambient.hungerDrain && ambient.hungerDrain > 0) {
+    player.hunger = Math.max(0, player.hunger - ambient.hungerDrain);
+  }
+  if (ambient.alertPacks) {
+    for (const m of monsters) {
+      if (m.hp <= 0) continue;
+      if (
+        m.traits?.includes("pack") ||
+        m.kind === "rat" ||
+        m.kind === "kobold" ||
+        m.kind === "goblin"
+      ) {
+        m.ai = "hunt";
+      }
+    }
+  }
+}
+
+// ——— Shared tick (SP game.ts + MMO world.ts must stay identical) ———
+
+export interface WorldEventTickInput {
+  depth: number;
+  seed: number;
+  dungeon: Dungeon;
+  /** Living monsters array (mutated: new spawns appended by caller from result). */
+  monsters: Entity[];
+  playerPos: { x: number; y: number };
+  playersOnFloor: number;
+  eventState: FloorEventState;
+  hasGraveyard: boolean;
+  /** FOV radius for peripheral whispers. */
+  fovRadius?: number;
+}
+
+export interface WorldEventTickResult {
+  /** Broadcast to every player on the floor. */
+  floorMessages: string[];
+  /** Actor-only lines (damage/heal flavor already in messages usually). */
+  actorMessages: string[];
+  newMonsters: Entity[];
+  damageToActor?: number;
+  healToActor?: number;
+  hungerDrainActor?: number;
+  goldDeltaActor?: number;
+  alertPacks?: boolean;
+  busy: boolean;
+}
+
+/**
+ * One shared event tick: reinforce → env (incl. gas/ambush) → ambient.
+ * Callers apply actor HP/gold and append newMonsters. Does not rewrite spawn bands.
+ */
+export function tickWorldEventsCore(input: WorldEventTickInput): WorldEventTickResult {
+  const ev = ensureFloorEventState(input.eventState);
+  ev.turnCounter += 1;
+
+  const depth = input.depth;
+  const alive = input.monsters.filter((m) => m.hp > 0).length;
+  const rng = eventRng(input.seed, depth, ev.turnCounter, 0x11);
+  const floorMessages: string[] = [];
+  const actorMessages: string[] = [];
+  const newMonsters: Entity[] = [];
+  let busy = false;
+  let damageToActor: number | undefined;
+  let healToActor: number | undefined;
+  let hungerDrainActor: number | undefined;
+  let goldDeltaActor: number | undefined;
+  let alertPacks = false;
+
+  // 1) Reinforcements
+  if (
+    shouldReinforce({
+      depth,
+      aliveMonsters: alive,
+      playersOnFloor: input.playersOnFloor,
+      eventState: ev,
+      requirePlayers: true,
+    })
+  ) {
+    const occupied = new Set<string>();
+    occupied.add(`${input.playerPos.x},${input.playerPos.y}`);
+    for (const m of input.monsters) {
+      if (m.hp > 0) occupied.add(`${m.x},${m.y}`);
+    }
+    for (const m of newMonsters) occupied.add(`${m.x},${m.y}`);
+
+    const plan = planReinforcement(
+      input.dungeon,
+      depth,
+      alive,
+      input.playersOnFloor,
+      occupied,
+      [input.playerPos],
+      rng
+    );
+    if (plan) {
+      const spawned = applyReinforcementPlan(plan, depth);
+      newMonsters.push(...spawned);
+      floorMessages.push(plan.message);
+      ev.lastReinforcementTurn = ev.turnCounter;
+      busy = true;
+    }
+  }
+
+  // 2) Environmental events (gas_pocket, corridor_ambush, migration, haunt, …)
+  {
+    const occupied = new Set<string>();
+    occupied.add(`${input.playerPos.x},${input.playerPos.y}`);
+    for (const m of input.monsters) {
+      if (m.hp > 0) occupied.add(`${m.x},${m.y}`);
+    }
+    for (const m of newMonsters) occupied.add(`${m.x},${m.y}`);
+
+    const env = rollEnvironmentalEvent({
+      depth,
+      dungeon: input.dungeon,
+      eventState: ev,
+      occupied,
+      playerPos: input.playerPos,
+      rng: eventRng(input.seed, depth, ev.turnCounter, 0x22),
+      hasGraveyard: input.hasGraveyard,
+    });
+    if (env) {
+      floorMessages.push(...env.messages);
+      if (env.spawns?.length) {
+        newMonsters.push(...spawnFromSpecs(env.spawns, depth));
+      }
+      if (env.damageToPlayer) damageToActor = (damageToActor ?? 0) + env.damageToPlayer;
+      if (env.healToPlayer) healToActor = (healToActor ?? 0) + env.healToPlayer;
+      if (env.hungerDrain) hungerDrainActor = (hungerDrainActor ?? 0) + env.hungerDrain;
+      if (env.goldDelta) goldDeltaActor = (goldDeltaActor ?? 0) + env.goldDelta;
+      if (env.alertPacks) alertPacks = true;
+      ev.lastEnvEventTurn = ev.turnCounter;
+      busy = true;
+    }
+  }
+
+  // 3) Ambient flavor when not busy
+  if (!busy) {
+    const ambient = rollTimedAmbient({
+      depth,
+      dungeon: input.dungeon,
+      eventState: ev,
+      seed: input.seed,
+      turn: ev.turnCounter,
+      skipIfBusy: false,
+    });
+    if (ambient) {
+      floorMessages.push(...ambient.messages);
+      if (ambient.alertPacks) alertPacks = true;
+      if (ambient.hungerDrain) hungerDrainActor = (hungerDrainActor ?? 0) + ambient.hungerDrain;
+    } else {
+      const whisper = peripheralWhisper({
+        monsters: input.monsters,
+        playerPos: input.playerPos,
+        fovRadius: input.fovRadius ?? 8,
+        depth,
+        seed: input.seed,
+        turn: ev.turnCounter,
+        eventState: ev,
+      });
+      if (whisper) {
+        actorMessages.push(...whisper.messages);
+      }
+    }
+  }
+
+  return {
+    floorMessages,
+    actorMessages,
+    newMonsters,
+    damageToActor,
+    healToActor,
+    hungerDrainActor,
+    goldDeltaActor,
+    alertPacks,
+    busy,
+  };
 }

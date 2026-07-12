@@ -16,11 +16,11 @@
     <div id="app">
       <header class="title-bar">
         <h1>GrokHack</h1>
-        <span class="subtitle">descend into the depths</span>
+        <span class="subtitle">descend into the depths · single-player</span>
       </header>
       <main class="game-layout">
         <div class="dungeon-panel">
-          <canvas id="dungeon" width="800" height="480"></canvas>
+          <canvas id="dungeon" width="800" height="480" aria-label="Dungeon map"></canvas>
         </div>
         <aside class="sidebar">
           <section class="panel hud-panel">
@@ -28,7 +28,7 @@
             <div id="hud"></div>
           </section>
           <section class="panel inventory-panel">
-            <h2>Inventory <span class="hint">[i]</span></h2>
+            <h2>Inventory <span class="hint">[<kbd>i</kbd>]</span></h2>
             <div id="inventory"></div>
           </section>
           <section class="panel log-panel">
@@ -38,14 +38,41 @@
         </aside>
       </main>
       <footer class="controls-bar">
-        <span>Move: arrows / hjkl</span>
-        <span>Wait: .</span>
-        <span>Inventory: i</span>
-        <span>Descend: &gt;</span>
-        <span>Quit: Q</span>
+        <span>Move: arrows / hjkl / yubn</span>
+        <span>Wait: <kbd>.</kbd></span>
+        <span>Inv: <kbd>i</kbd></span>
+        <span>Descend: <kbd>&gt;</kbd> / <kbd>g</kbd></span>
+        <span>Quit: <kbd>Q</kbd></span>
+        <span class="keys-help">Help: <kbd>?</kbd></span>
       </footer>
       <div id="overlay" class="overlay hidden">
         <div class="overlay-content" id="overlay-content"></div>
+      </div>
+      <div id="help-panel" class="hidden" role="dialog" aria-label="Keyboard controls">
+        <div class="help-box">
+          <h2>Controls</h2>
+          <dl>
+            <dt><kbd>←↑↓→</kbd> / <kbd>hjkl</kbd></dt>
+            <dd>Move (bump to fight)</dd>
+            <dt><kbd>y</kbd> <kbd>u</kbd> <kbd>b</kbd> <kbd>n</kbd></dt>
+            <dd>Diagonal move</dd>
+            <dt><kbd>.</kbd> / <kbd>s</kbd></dt>
+            <dd>Wait a turn</dd>
+            <dt><kbd>i</kbd></dt>
+            <dd>Inventory · <kbd>1</kbd>–<kbd>9</kbd> use item</dd>
+            <dt><kbd>&gt;</kbd> / <kbd>g</kbd></dt>
+            <dd>Descend stairs</dd>
+            <dt><kbd>Q</kbd></dt>
+            <dd>Quit run</dd>
+            <dt><kbd>?</kbd></dt>
+            <dd>Toggle this help</dd>
+            <dt><kbd>Esc</kbd></dt>
+            <dd>Close help / inventory</dd>
+          </dl>
+          <p class="help-foot">
+            Goal: reach depth 10 and slay the dragon. Eat when hungry. Identify potions carefully.
+          </p>
+        </div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

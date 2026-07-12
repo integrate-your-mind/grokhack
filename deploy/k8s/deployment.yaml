@@ -1,0 +1,70 @@
+# DEPRECATED — do not apply for production.
+# Multi-replica game Deployment + DuckDB file = split-brain durable state.
+# Use instead: 40-game-statefulset.yaml (replicas: 1) + 50-tunnel-deployment.yaml
+# Kept only as a minimal sketch for external-tunnel experiments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grokhack
+  labels:
+    app: grokhack
+  annotations:
+    grokhack.mondello.dev/deprecated: "true"
+    grokhack.mondello.dev/use: "deploy/k8s/40-game-statefulset.yaml"
+spec:
+  # DuckDB single-writer: NEVER scale >1 without shared multi-writer DB.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grokhack
+  template:
+    metadata:
+      labels:
+        app: grokhack
+    spec:
+      containers:
+        - name: grokhack
+          image: grokhack:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BIND_HOST
+              value: "0.0.0.0"
+            - name: TELNET_BIND_HOST
+              value: "127.0.0.1"
+          envFrom:
+            - secretRef:
+                name: grokhack-env
+                optional: true
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grokhack
+spec:
+  selector:
+    app: grokhack
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

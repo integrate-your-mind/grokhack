@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Store — GrokHack</title>
+  <meta name="description" content="Support GrokHack with x402 USDC tips and cosmetic death frames. Never pay-to-win." />
+  <link rel="canonical" href="https://grokhack.mondello.dev/store.html" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root { --bg:#0a0a0f; --panel:#12121a; --border:#2a2a3a; --text:#c8c8d8; --dim:#6a6a7a; --gold:#c9a227; --ok:#5a9a5a; --err:#c94a4a; }
+    body { font-family:"IBM Plex Mono",monospace; background:var(--bg); color:var(--text); max-width:720px; margin:2rem auto; padding:0 1rem; line-height:1.55; }
+    h1 { color:var(--gold); margin-bottom:0.35rem; }
+    .sub { color:var(--dim); font-size:0.85rem; margin-bottom:1.5rem; }
+    a { color:var(--gold); }
+    .badge { display:inline-block; font-size:0.7rem; border:1px solid var(--border); padding:0.15rem 0.45rem; border-radius:999px; color:var(--dim); margin-left:0.35rem; }
+    .badge.ok { border-color:var(--ok); color:var(--ok); }
+    .badge.warn { border-color:var(--gold); color:var(--gold); }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:1rem; margin-bottom:0.75rem; }
+    .card h2 { font-size:1rem; margin:0 0 0.35rem; color:var(--text); }
+    .price { color:var(--gold); font-weight:600; }
+    .row { display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center; margin-top:0.75rem; }
+    input { background:#0a0a12; border:1px solid var(--border); color:var(--text); padding:0.5rem 0.65rem; border-radius:6px; font-family:inherit; }
+    button { background:var(--gold); color:#0a0a0f; border:none; padding:0.55rem 0.9rem; border-radius:6px; font-family:inherit; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    pre { background:#08080c; border:1px solid var(--border); padding:0.75rem; border-radius:6px; font-size:0.72rem; overflow-x:auto; color:var(--dim); }
+    .msg { min-height:1.2rem; font-size:0.8rem; margin-top:0.75rem; }
+    .msg.err { color:var(--err); }
+    .msg.ok { color:var(--ok); }
+  </style>
+</head>
+<body>
+  <h1>GrokHack Store <span id="cfg" class="badge">…</span></h1>
+  <p class="sub">Tips &amp; cosmetics only — <strong>never pay-to-win</strong>. Payments via <strong>x402 USDC on Base</strong> (agent-native). Core game stays free.</p>
+
+  <div class="row">
+    <label>Character name <input id="player" maxlength="16" placeholder="YourName" autocomplete="username" /></label>
+    <button type="button" id="load-ent">Load entitlements</button>
+  </div>
+  <pre id="ent">Entitlements will show here.</pre>
+
+  <div id="products"></div>
+
+  <p class="msg" id="msg"></p>
+
+  <h2 style="font-size:0.95rem;margin-top:1.5rem;color:var(--dim)">Compute credits (earn free)</h2>
+  <p class="sub">1 validated compute job = 1 credit. Spend on cosmetics only — <strong>no token yet</strong>, no pay-to-win. Tips stay USDC.</p>
+  <pre id="credits-box">Load character to see credits…</pre>
+  <div class="row">
+    <button type="button" id="btn-credits">Refresh credits</button>
+    <button type="button" id="btn-redeem-frames">Redeem Death Frames Pro (100 cr)</button>
+    <button type="button" id="btn-redeem-cup">Redeem Cup entry (50 cr)</button>
+  </div>
+
+  <h2 style="font-size:0.95rem;margin-top:1.5rem;color:var(--dim)">Agent unlock (x402 USDC)</h2>
+  <pre id="agent-howto">POST /api/store/unlock
+{"sku":"tip_3","playerName":"YourAgent"}
+→ HTTP 402 + accepts[] (USDC Base → hardware wallet)
+→ Pay → retry with header PAYMENT-SIGNATURE
+
+POST /api/credits/redeem {"playerName":"YourAgent","sku":"death_frames_pro","resumeToken":"from join ack"}
+Leaderboard: GET /api/credits/leaderboard</pre>
+
+  <p style="margin-top:1.5rem;font-size:0.8rem;color:var(--dim)">
+    <a href="/">Home</a> · <a href="/play.html">Play</a> · <a href="/skill">Agent skill gate</a> · <a href="/api/store">/api/store</a>
+  </p>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let catalog = [];
+
+    function setMsg(t, ok) {
+      const el = $("msg");
+      el.textContent = t || "";
+      el.className = "msg " + (ok ? "ok" : t ? "err" : "");
+    }
+
+    async function loadStore() {
+      const r = await fetch("/api/store");
+      const d = await r.json();
+      catalog = d.products || [];
+      const cfg = $("cfg");
+      if (d.configured) {
+        cfg.textContent = "x402 ready · " + (d.revenue?.payTo || "treasury");
+        cfg.className = "badge ok";
+      } else {
+        cfg.textContent = "set X402_PAY_TO to enable live payments";
+        cfg.className = "badge warn";
+      }
+      const root = $("products");
+      root.innerHTML = "";
+      for (const p of catalog) {
+        const div = document.createElement("div");
+        div.className = "card";
+        div.innerHTML = `<h2>${p.name}</h2>
+          <p style="color:var(--dim);font-size:0.85rem;margin:0">${p.description}</p>
+          <div class="row">
+            <span class="price">$${p.priceUsd} USDC</span>
+            <span class="badge">${p.kind}</span>
+            <button type="button" data-sku="${p.sku}">Unlock</button>
+          </div>`;
+        div.querySelector("button").onclick = () => unlock(p.sku);
+        root.appendChild(div);
+      }
+    }
+
+    async function loadEnt() {
+      const player = $("player").value.trim();
+      if (!player) return setMsg("Enter character name", false);
+      const r = await fetch("/api/store/entitlements?player=" + encodeURIComponent(player));
+      const d = await r.json();
+      $("ent").textContent = JSON.stringify(d.entitlements || { grants: [], note: "none yet" }, null, 2);
+      try { localStorage.setItem("grokhack-name", player); } catch {}
+    }
+
+    async function unlock(sku) {
+      const playerName = $("player").value.trim();
+      if (!playerName) return setMsg("Enter your in-game character name first", false);
+      setMsg("Requesting unlock…", true);
+      const r = await fetch("/api/store/unlock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sku, playerName }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.status === 402) {
+        $("ent").textContent = JSON.stringify(d, null, 2);
+        setMsg("402 Payment Required — pay USDC on Base per accepts[], then retry with PAYMENT-SIGNATURE (agents). Humans: connect an x402 wallet client.", false);
+        return;
+      }
+      if (!r.ok) {
+        setMsg(d.error || d.reason || "Unlock failed", false);
+        $("ent").textContent = JSON.stringify(d, null, 2);
+        return;
+      }
+      setMsg(d.message || "Unlocked!", true);
+      $("ent").textContent = JSON.stringify(d.entitlements, null, 2);
+    }
+
+    async function loadCredits() {
+      const player = $("player").value.trim();
+      if (!player) return setMsg("Enter character name", false);
+      const r = await fetch("/api/credits?player=" + encodeURIComponent(player));
+      const d = await r.json();
+      $("credits-box").textContent = JSON.stringify(d.account || { balance: 0, note: "earn via compute_offer jobs" }, null, 2);
+    }
+
+    function getResumeToken(name) {
+      if (!name) return undefined;
+      try {
+        const raw = localStorage.getItem("grokhack-resume");
+        const map = raw ? JSON.parse(raw) : {};
+        return map && typeof map === "object"
+          ? map[String(name).toLowerCase()] || undefined
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    async function redeem(sku) {
+      const playerName = $("player").value.trim();
+      if (!playerName) return setMsg("Enter character name", false);
+      const resumeToken = getResumeToken(playerName);
+      if (!resumeToken) return setMsg("Play or reconnect this character first to authorize redemption", false);
+      const r = await fetch("/api/credits/redeem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerName, sku, resumeToken }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        setMsg(d.error || "Redeem failed", false);
+        $("credits-box").textContent = JSON.stringify(d, null, 2);
+        return;
+      }
+      setMsg(d.message || "Redeemed!", true);
+      $("credits-box").textContent = JSON.stringify(d.account, null, 2);
+      loadEnt();
+    }
+
+    $("load-ent").onclick = loadEnt;
+    $("btn-credits").onclick = loadCredits;
+    $("btn-redeem-frames").onclick = () => redeem("death_frames_pro");
+    $("btn-redeem-cup").onclick = () => redeem("agent_cup_entry");
+    try {
+      const n = localStorage.getItem("grokhack-name");
+      if (n) $("player").value = n;
+    } catch {}
+    loadStore().catch((e) => setMsg(String(e), false));
+  </script>
+</body>
+</html>
