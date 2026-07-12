@@ -303,6 +303,7 @@ describe("ShadowReplay catch-up", () => {
     const stub = stubFor(streamId);
     const legacy = trace(streamId, 1)[0]!;
     await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM _shadow_schema_migrations WHERE version > 1");
       state.storage.sql.exec("DROP TABLE shadow_checkpoint");
       state.storage.sql.exec(`CREATE TABLE shadow_checkpoint (
         stream_id TEXT PRIMARY KEY,
