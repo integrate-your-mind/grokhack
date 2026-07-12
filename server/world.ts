@@ -159,6 +159,15 @@ const MAX_PLAYERS = 500;
 const MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER = 64;
 export const SHUTDOWN_RETRY_MESSAGE = "Server is restarting. Retry shortly.";
 
+export function shouldRecordMovementNoopEvidence(
+  evidence: ReadonlyMap<string, true>,
+  fingerprint: string,
+  limit = MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+): boolean {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("invalid movement evidence limit");
+  return !evidence.has(fingerprint) && evidence.size < limit;
+}
+
 export interface WorldServerOptions {
   /** Override only for deterministic admission tests; production uses durable persistence. */
   loadResumablePlayer?: (name: string) => Promise<OnlinePlayer | null>;
@@ -1475,7 +1484,9 @@ export class WorldServer {
     const noopFingerprint = movement.turnCost === "none"
       ? [movementStateHash(movementState), command.dx, command.dy, movementEventHash(movement)].join("|")
       : null;
-    const sampledNoop = noopFingerprint !== null && this.movementNoopEvidence.get(player.id)?.has(noopFingerprint);
+    const existingNoopEvidence = this.movementNoopEvidence.get(player.id) ?? new Map<string, true>();
+    const sampledNoop = noopFingerprint !== null &&
+      !shouldRecordMovementNoopEvidence(existingNoopEvidence, noopFingerprint);
     if (!sampledNoop) {
       try {
         this.originJournal?.appendTransition({
@@ -1494,14 +1505,8 @@ export class WorldServer {
         return;
       }
       if (noopFingerprint !== null) {
-        const evidence = this.movementNoopEvidence.get(player.id) ?? new Map<string, true>();
-        evidence.set(noopFingerprint, true);
-        while (evidence.size > MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER) {
-          const oldest = evidence.keys().next().value;
-          if (oldest === undefined) break;
-          evidence.delete(oldest);
-        }
-        this.movementNoopEvidence.set(player.id, evidence);
+        existingNoopEvidence.set(noopFingerprint, true);
+        this.movementNoopEvidence.set(player.id, existingNoopEvidence);
       }
     }
 

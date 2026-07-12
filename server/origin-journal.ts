@@ -38,16 +38,21 @@ export type OriginTransitionInput =
 export interface OriginGameplayJournalOptions {
   /** Fault-injection seam used to prove pre/post-rename fsync recovery. */
   fsyncSync?: (descriptor: number) => void;
+  /** Fault-injection seam used to prove short writes cannot truncate a segment. */
+  writeSync?: (descriptor: number, buffer: Uint8Array, offset: number, length: number) => number;
 }
 
 export class OriginGameplayJournal {
   private readonly directory: string;
   private readonly heads = new Map<string, StreamHead>();
   private readonly fsyncSync: (descriptor: number) => void;
+  private readonly writeSync: (descriptor: number, buffer: Uint8Array, offset: number, length: number) => number;
 
   constructor(directory = dataPath("shadow-journal"), options: OriginGameplayJournalOptions = {}) {
     this.directory = directory;
     this.fsyncSync = options.fsyncSync ?? fs.fsyncSync;
+    this.writeSync = options.writeSync ?? ((descriptor, buffer, offset, length) =>
+      fs.writeSync(descriptor, buffer, offset, length));
   }
 
   appendTransition(input: OriginTransitionInput): JournalAppendResult {
@@ -86,7 +91,15 @@ export class OriginGameplayJournal {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(descriptor, `${previous}${JSON.stringify(validated)}\n`);
+      const payload = Buffer.from(`${previous}${JSON.stringify(validated)}\n`, "utf8");
+      let written = 0;
+      while (written < payload.byteLength) {
+        const count = this.writeSync(descriptor, payload, written, payload.byteLength - written);
+        if (!Number.isSafeInteger(count) || count < 1 || count > payload.byteLength - written) {
+          throw new Error("journal_short_write");
+        }
+        written += count;
+      }
       this.fsyncSync(descriptor);
       fs.closeSync(descriptor);
       descriptor = undefined;
@@ -98,8 +111,10 @@ export class OriginGameplayJournal {
         fs.closeSync(directoryDescriptor);
       }
     } catch (error) {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
-      fs.rmSync(temporary, { force: true });
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch { /* preserve the original write/sync error */ }
+      }
+      try { fs.rmSync(temporary, { force: true }); } catch { /* preserve the original write/sync error */ }
       // Rename may have committed even when the directory fsync response was
       // lost. Re-read canonical state on retry instead of trusting stale memory.
       this.heads.delete(validated.streamId);

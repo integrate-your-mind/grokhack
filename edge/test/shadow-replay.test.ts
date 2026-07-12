@@ -17,13 +17,13 @@ import type { Env } from "../src/env";
 import { floorObjectName } from "../src/protocol";
 
 const SECRET = "local-shadow-ingest-test-key-2026-07-11";
-const route: ShadowRoute = { realmId: "shadow-test", floorInstanceId: "primary", depth: 1, floorEpoch: 1 };
+const route: ShadowRoute = { realmId: "shadow-test", floorInstanceId: "primary", depth: 1, floorEpoch: 1, rulesetVersion: 1 };
 const initial = (overrides: Partial<GameplayState> = {}): GameplayState => ({
   turns: 0, depth: 1, hunger: 800, maxHunger: 1000,
   hungerState: "normal", hp: 20, alive: true, ...overrides,
 });
 const movementState = (overrides: Partial<MovementState> = {}): MovementState => ({
-  authority: { ...route, rulesetVersion: 1 },
+  authority: { ...route },
   x: 12,
   y: 8,
   phase: "playing",
@@ -166,6 +166,24 @@ describe("ShadowReplay catch-up", () => {
     });
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ code: "movement_authority_mismatch", checkpoint: 0 });
+
+    const futureRuleset = createShadowJournalEntry({
+      streamId: "movement-ruleset-fence",
+      cursor: 1,
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState({ authority: { ...route, rulesetVersion: 2 } }),
+    });
+    const mismatched = await ingest([futureRuleset]);
+    expect(mismatched.status).toBe(409);
+    await expect(mismatched.json()).resolves.toMatchObject({ code: "movement_authority_mismatch", checkpoint: 0 });
+
+    const unsupportedRoute = await SELF.fetch("https://edge.test/internal/shadow/catch-up", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${SECRET}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ v: 1, route: { ...route, rulesetVersion: 2 }, entries: [futureRuleset] }),
+    });
+    expect(unsupportedRoute.status).toBe(400);
+    await expect(unsupportedRoute.json()).resolves.toMatchObject({ code: "invalid_route" });
   });
 
   it("handles exact duplicate retry and rejects conflict, reorder, and gap without advancing", async () => {
@@ -285,6 +303,19 @@ describe("ShadowReplay catch-up", () => {
     const stub = stubFor(streamId);
     const legacy = trace(streamId, 1)[0]!;
     await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE shadow_checkpoint");
+      state.storage.sql.exec(`CREATE TABLE shadow_checkpoint (
+        stream_id TEXT PRIMARY KEY,
+        checkpoint INTEGER NOT NULL,
+        last_entry_hash TEXT,
+        state_hash TEXT,
+        terminal INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      ) WITHOUT ROWID`);
+      state.storage.sql.exec(
+        "INSERT INTO shadow_checkpoint (stream_id, checkpoint, last_entry_hash, state_hash, terminal, updated_at) VALUES (?, 1, ?, ?, 0, unixepoch())",
+        streamId, legacy.entryHash, legacy.afterStateHash,
+      );
       state.storage.sql.exec("DROP TABLE shadow_entries");
       state.storage.sql.exec(`CREATE TABLE shadow_entries (
         stream_id TEXT NOT NULL,
@@ -299,14 +330,6 @@ describe("ShadowReplay catch-up", () => {
       state.storage.sql.exec(
         "INSERT INTO shadow_entries (stream_id, cursor, entry_hash, before_state_hash, after_state_hash, terminal, ingested_at) VALUES (?, 1, ?, ?, ?, 0, unixepoch())",
         streamId, legacy.entryHash, legacy.beforeStateHash, legacy.afterStateHash,
-      );
-      state.storage.sql.exec(`INSERT INTO shadow_checkpoint
-        (stream_id, checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain, updated_at)
-        VALUES (?, 1, ?, ?, 0, 1, 'vitals', unixepoch())
-        ON CONFLICT(stream_id) DO UPDATE SET checkpoint = 1, last_entry_hash = excluded.last_entry_hash,
-          state_hash = excluded.state_hash, terminal = 0, entry_version = 1,
-          state_domain = 'vitals', updated_at = excluded.updated_at`,
-        streamId, legacy.entryHash, legacy.afterStateHash,
       );
     });
     await evictDurableObject(stub);

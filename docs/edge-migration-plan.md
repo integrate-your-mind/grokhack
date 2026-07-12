@@ -92,7 +92,8 @@ edge result is discarded; it must not serve player state or mutate legacy data.
 
 The first production-shaped slices now journal the shared turn/vitals reducer
 and movement decisions into fsynced, mode-0600, hash-chained 64-entry segments.
-Each bounded segment is rewritten through a mode-0600 temporary file, file
+Each bounded segment is written completely (including short-write retries)
+through a mode-0600 temporary file, file
 fsync, atomic rename, and directory fsync. A pre-rename fsync failure leaves the
 canonical segment unchanged; a lost post-rename acknowledgement is reconciled
 from the canonical file on retry.
@@ -103,9 +104,11 @@ The movement decision is recorded before origin mutation so a failed first
 append cannot partially move or pick up an item. Turn-consuming paths retain the
 existing V1 vitals follow-up. These two fsynced records are not yet one atomic
 transaction; the transactional outbox remains required before authority transfer.
-Free wall/player rejections are evidence-sampled by a bounded per-player
-fingerprint set; repeated identical no-ops do not perform another synchronous
-fsync on the origin command hot path. Turn-consuming commands remain unsampled.
+Free wall/player rejections are evidence-sampled with a permanent 64-fingerprint
+budget per player for the origin process lifetime. Repeats and fingerprints
+beyond that cap do not perform another synchronous fsync, so cycling inputs
+cannot turn the sample cache into unbounded writes. Turn-consuming commands
+remain unsampled.
 The bounded copier sends
 at most 64 entries per page through an authenticated internal Worker route to a
 dedicated `ShadowReplay` SQLite Durable Object namespace. Checkpoint, immutable
@@ -122,8 +125,9 @@ zero-divergence authority-transfer gate.
 
 Movement evidence is partitioned into a floor-scoped origin stream and binds
 realm, floor instance, depth, floor epoch, and ruleset version into its state
-hash. The Worker rejects an entry whose authority tuple differs from the routed
-shadow object. Checkpoints expose both entry version and state domain so a
+hash. The Worker rejects an entry whose complete authority tuple differs from
+the routed shadow object and rejects unsupported ruleset versions. Checkpoints
+expose both entry version and state domain so a
 movement fingerprint cannot be mistaken for a vitals fingerprint.
 
 Exit gate:

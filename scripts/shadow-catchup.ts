@@ -1,5 +1,6 @@
 import { OriginGameplayJournal } from "../server/origin-journal.js";
 import { catchUpOriginJournal } from "../server/shadow-catchup.js";
+import { MOVEMENT_RULESET_VERSION } from "../src/shadow-journal.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -11,6 +12,12 @@ function positive(name: string): number {
   const value = Number(required(name));
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
   return value;
+}
+
+function rulesetVersion(): typeof MOVEMENT_RULESET_VERSION {
+  const version = positive("SHADOW_RULESET_VERSION");
+  if (version !== MOVEMENT_RULESET_VERSION) throw new Error("unsupported SHADOW_RULESET_VERSION");
+  return version;
 }
 
 const endpoint = required("SHADOW_EDGE_ENDPOINT");
@@ -27,6 +34,7 @@ const result = await catchUpOriginJournal({
     floorInstanceId: required("SHADOW_FLOOR_INSTANCE_ID"),
     depth: positive("SHADOW_DEPTH"),
     floorEpoch: positive("SHADOW_FLOOR_EPOCH"),
+    rulesetVersion: rulesetVersion(),
   },
   endpoint,
   secret: required("SHADOW_INGEST_SECRET"),

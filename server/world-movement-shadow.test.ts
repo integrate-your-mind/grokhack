@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { isWalkable } from "../src/dungeon.js";
 import { movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
 import type { ClientConnection } from "./types.js";
-import { WorldServer } from "./world.js";
+import { shouldRecordMovementNoopEvidence, WorldServer } from "./world.js";
 
 const directories: string[] = [];
 
@@ -91,6 +91,22 @@ function createJournal(): OriginGameplayJournal {
 }
 
 describe("WorldServer movement shadow journal", () => {
+  it("caps unique no-op evidence for the process lifetime without eviction cycling", () => {
+    const evidence = new Map<string, true>();
+    let recorded = 0;
+    for (let index = 0; index < 65; index++) {
+      const fingerprint = `fingerprint-${index}`;
+      if (shouldRecordMovementNoopEvidence(evidence, fingerprint, 64)) {
+        evidence.set(fingerprint, true);
+        recorded++;
+      }
+    }
+    expect(recorded).toBe(64);
+    expect(evidence.size).toBe(64);
+    expect(shouldRecordMovementNoopEvidence(evidence, "fingerprint-0", 64)).toBe(false);
+    expect(shouldRecordMovementNoopEvidence(evidence, "fingerprint-65", 64)).toBe(false);
+  });
+
   it("records the movement decision before its existing turn/vitals transition", async () => {
     const journal = createJournal();
     const world = new WorldServer({ originJournal: journal });

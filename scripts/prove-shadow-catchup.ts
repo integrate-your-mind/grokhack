@@ -10,7 +10,7 @@ import { OriginGameplayJournal } from "../server/origin-journal.js";
 import { catchUpOriginJournal, ShadowCatchupError } from "../server/shadow-catchup.js";
 
 const secret = "local-shadow-e2e-secret-2026-07-11-proof";
-const route = { realmId: "local-proof", floorInstanceId: "primary", depth: 1, floorEpoch: 1 };
+const route = { realmId: "local-proof", floorInstanceId: "primary", depth: 1, floorEpoch: 1, rulesetVersion: 1 } as const;
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-shadow-e2e-"));
 const harness = createTestHarness({
   root: process.cwd(),
@@ -34,7 +34,7 @@ try {
     state = reduceGameplay(state, command).state;
   }
   let movementState: MovementState = {
-    authority: { ...route, rulesetVersion: 1 },
+    authority: { ...route },
     x: 10,
     y: 10,
     phase: "playing",
@@ -140,7 +140,7 @@ try {
     streamId: "origin_event_divergence",
     command: { type: "move", dx: 1, dy: 0 },
     beforeState: {
-      authority: { ...route, rulesetVersion: 1 },
+      authority: { ...route },
       x: 2,
       y: 3,
       phase: "playing",

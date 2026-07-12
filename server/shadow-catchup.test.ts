@@ -6,7 +6,7 @@ import { catchUpOriginJournal } from "./shadow-catchup.js";
 
 const state: GameplayState = { turns: 0, depth: 1, hunger: 800, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true };
 const entry = createShadowJournalEntry({ streamId: "copy", cursor: 1, command: { type: "advance_turn", action: "wait" }, beforeState: state });
-const route = { realmId: "copy-test", floorInstanceId: "primary", depth: 1, floorEpoch: 1 };
+const route = { realmId: "copy-test", floorInstanceId: "primary", depth: 1, floorEpoch: 1, rulesetVersion: 1 } as const;
 const secret = "shadow-copy-test-secret-at-least-32-bytes";
 
 function source(entries: readonly ShadowJournalEntry[]) {

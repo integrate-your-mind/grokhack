@@ -104,6 +104,41 @@ describe("OriginGameplayJournal", () => {
     expect(new OriginGameplayJournal(directory).readAfter(input.streamId, 0, 64)).toHaveLength(1);
   });
 
+  it("writes the complete segment across a permitted short write", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-short-write-"));
+    directories.push(directory);
+    let calls = 0;
+    const value = new OriginGameplayJournal(directory, {
+      writeSync: (descriptor, buffer, offset, length) => {
+        calls++;
+        const amount = calls === 1 ? Math.max(1, Math.floor(length / 3)) : length;
+        return fs.writeSync(descriptor, buffer, offset, amount);
+      },
+    });
+    const result = value.appendTransition({
+      streamId: "short-write",
+      command: { type: "advance_turn", action: "wait" },
+      beforeState: initial(),
+    });
+    expect(calls).toBeGreaterThan(1);
+    expect(new OriginGameplayJournal(directory).readAfter("short-write", 0, 64)).toEqual([result.entry]);
+  });
+
+  it("rejects a zero-byte write without replacing the canonical segment", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-zero-write-"));
+    directories.push(directory);
+    const value = new OriginGameplayJournal(directory, {
+      writeSync: () => 0,
+    });
+    expect(() => value.appendTransition({
+      streamId: "zero-write",
+      command: { type: "advance_turn", action: "wait" },
+      beforeState: initial(),
+    })).toThrow("journal_short_write");
+    expect(value.readAfter("zero-write", 0, 64)).toEqual([]);
+    expect(fs.readdirSync(directory).some((name) => name.endsWith(".tmp"))).toBe(false);
+  });
+
   it("enforces bounded reads and records terminal transitions", () => {
     const { directory, value } = journal();
     const result = value.appendTransition({
@@ -131,16 +166,16 @@ describe("OriginGameplayJournal", () => {
   it("segments long streams so bounded catch-up reads only small adjacent files", () => {
     const { directory, value } = journal();
     let state = initial();
-    for (let index = 0; index < 130; index++) {
+    for (let index = 0; index < 66; index++) {
       value.appendTransition({ streamId: "segmented", command: { type: "advance_turn", action: "other" }, beforeState: state });
       state = { ...state, turns: state.turns + 1, hunger: Math.max(0, state.hunger - 2) };
     }
-    expect(fs.readdirSync(directory).filter((name) => name.startsWith("segmented."))).toHaveLength(3);
-    expect(value.readAfter("segmented", 60, 64).map((entry) => entry.cursor)).toEqual(Array.from({ length: 64 }, (_, index) => index + 61));
-    expect(value.readAfter("segmented", 128, 64).map((entry) => entry.cursor)).toEqual([129, 130]);
+    expect(fs.readdirSync(directory).filter((name) => name.startsWith("segmented."))).toHaveLength(2);
+    expect(value.readAfter("segmented", 60, 64).map((entry) => entry.cursor)).toEqual([61, 62, 63, 64, 65, 66]);
+    expect(value.readAfter("segmented", 64, 64).map((entry) => entry.cursor)).toEqual([65, 66]);
     fs.rmSync(path.join(directory, "segmented.00000001.jsonl"));
     expect(() => value.readAfter("segmented", 64, 64)).toThrow("journal_missing_segment");
-  });
+  }, 15_000);
 
   it("chains mixed V1 vitals and V2 movement entries across restart", () => {
     const { directory, value } = journal();

@@ -123,6 +123,11 @@ export class ShadowReplay extends DurableObject<Env> {
     for (const [name, definition] of entryExpansions) {
       if (!entryColumns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE shadow_entries ADD COLUMN ${name} ${definition}`);
     }
+    // Every nonzero checkpoint created before V2 represents a V1 vitals row.
+    // Backfill its domain so duplicate-only catch-up remains interpretable.
+    this.ctx.storage.sql.exec(`UPDATE shadow_checkpoint
+      SET entry_version = 1, state_domain = 'vitals'
+      WHERE checkpoint > 0 AND entry_version IS NULL AND state_domain IS NULL`);
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch())");
   }
 
@@ -151,7 +156,8 @@ export class ShadowReplay extends DurableObject<Env> {
       entry.beforeState.authority.realmId !== route.realmId ||
       entry.beforeState.authority.floorInstanceId !== route.floorInstanceId ||
       entry.beforeState.authority.depth !== route.depth ||
-      entry.beforeState.authority.floorEpoch !== route.floorEpoch
+      entry.beforeState.authority.floorEpoch !== route.floorEpoch ||
+      entry.beforeState.authority.rulesetVersion !== route.rulesetVersion
     ))) {
       return json({ code: "movement_authority_mismatch", checkpoint: this.checkpoint(streamId).checkpoint }, 409);
     }

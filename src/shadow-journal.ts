@@ -15,6 +15,7 @@ import {
 
 export const SHADOW_JOURNAL_VERSION = 1 as const;
 export const MOVEMENT_SHADOW_JOURNAL_VERSION = 2 as const;
+export const MOVEMENT_RULESET_VERSION = 1 as const;
 export const MAX_SHADOW_BATCH_ENTRIES = 64;
 export const MAX_SHADOW_BATCH_BYTES = 256 * 1024;
 
@@ -23,6 +24,7 @@ export interface ShadowRoute {
   floorInstanceId: string;
   depth: number;
   floorEpoch: number;
+  rulesetVersion: typeof MOVEMENT_RULESET_VERSION;
 }
 
 export interface GameplayShadowJournalEntry {
@@ -221,7 +223,8 @@ export function validateShadowRoute(value: unknown): ShadowRoute {
   if (typeof route.realmId !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/u.test(route.realmId) ||
       typeof route.floorInstanceId !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/u.test(route.floorInstanceId) ||
       !Number.isSafeInteger(route.depth) || Number(route.depth) < 1 || Number(route.depth) > 64 ||
-      !Number.isSafeInteger(route.floorEpoch) || Number(route.floorEpoch) < 1) {
+      !Number.isSafeInteger(route.floorEpoch) || Number(route.floorEpoch) < 1 ||
+      route.rulesetVersion !== MOVEMENT_RULESET_VERSION) {
     throw new Error("invalid_route");
   }
   return route as ShadowRoute;
