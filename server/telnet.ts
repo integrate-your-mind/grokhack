@@ -12,11 +12,32 @@ import {
 } from "./terminal.js";
 import { logEvent } from "./audit.js";
 import { initSession, finalizeSession } from "./session-metrics.js";
-import { BIND_HOST } from "./security.js";
+import { TELNET_BIND_HOST } from "./security.js";
 import type { ClientConnection } from "./types.js";
+import { getComputePool } from "./compute.js";
+import type { DrainHandle } from "./http.js";
 
-export function startTelnetServer(world: WorldServer, port: number): net.Server {
+interface TelnetDrainState {
+  draining: boolean;
+  sockets: Set<net.Socket>;
+  handle?: DrainHandle;
+}
+
+const telnetDrainStates = new WeakMap<net.Server, TelnetDrainState>();
+
+export function startTelnetServer(world: WorldServer, port: number): net.Server | null {
+  if (!Number.isFinite(port) || port <= 0) {
+    console.log("[telnet] disabled (TELNET_PORT<=0)");
+    return null;
+  }
+
+  const state: TelnetDrainState = { draining: false, sockets: new Set() };
   const server = net.createServer((socket) => {
+    if (state.draining || world.isDraining()) {
+      socket.end("Server restarting. Retry shortly.\r\n");
+      return;
+    }
+    state.sockets.add(socket);
     const connId = randomUUID();
     const sessionId = randomUUID();
     let playerId: string | null = null;
@@ -25,6 +46,61 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     let cmdBuffer: string | null = null;
     /** When true, next non-control key dismisses help and redraws the map. */
     let helpOpen = false;
+    /** JSON-lines compute contribution mode (:compute on). */
+    let computeMode = false;
+    let jsonLineBuffer = "";
+
+    const computeSend = (m: Record<string, unknown>) => {
+      try {
+        socket.write(JSON.stringify(m) + "\r\n");
+      } catch {
+        /* closed */
+      }
+    };
+
+    const handleComputeJson = (line: string) => {
+      let msg: {
+        type?: string;
+        capacity?: number;
+        job_types?: string[];
+        name?: string;
+        job_id?: string;
+        ok?: boolean;
+        result?: unknown;
+        error?: string;
+        ms?: number;
+      };
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        computeSend({ type: "compute_ack", accepted: false, reason: "invalid_json" });
+        return;
+      }
+      if (msg.type === "compute_offer") {
+        const label =
+          msg.name ||
+          (playerId ? world.getPlayer(playerId)?.name : undefined) ||
+          `telnet-${connId.slice(0, 6)}`;
+        getComputePool().handleOffer(
+          connId,
+          { capacity: msg.capacity, job_types: msg.job_types, name: label },
+          computeSend,
+          "telnet"
+        );
+        return;
+      }
+      if (msg.type === "compute_result") {
+        getComputePool().handleResult(connId, {
+          job_id: msg.job_id,
+          ok: msg.ok,
+          result: msg.result,
+          error: msg.error,
+          ms: msg.ms,
+        });
+        return;
+      }
+      computeSend({ type: "error", message: "compute mode: send compute_offer or compute_result JSON" });
+    };
 
     negotiateTelnet(socket);
 
@@ -75,7 +151,12 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
       close: () => socket.end(),
     };
 
-    world.registerConnection(conn);
+    if (!world.registerConnection(conn)) {
+      state.sockets.delete(socket);
+      finalizeSession(sessionId);
+      socket.end("Server restarting. Retry shortly.\r\n");
+      return;
+    }
     socket.write(renderWelcome(world.getOnlineCount(), 500));
 
     const refresh = () => {
@@ -99,28 +180,76 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     };
 
     socket.on("data", (data) => {
+      if (state.draining || world.isDraining()) {
+        conn.disconnectReason = "restart";
+        socket.end("Server restarting. Retry shortly.\r\n");
+        return;
+      }
       const text = stripTelnetCommands(data);
 
       if (naming) {
         nameBuffer += text;
         if (!nameBuffer.includes("\n") && !nameBuffer.includes("\r")) return;
 
-        const name = nameBuffer.replace(/[\r\n]/g, "");
+        // Accept "Name" or "Name:resumeToken" (sec-app resume binder)
+        const rawName = nameBuffer.replace(/[\r\n]/g, "").trim();
         nameBuffer = "";
         naming = false;
+        const colon = rawName.indexOf(":");
+        const name = colon > 0 ? rawName.slice(0, colon) : rawName;
+        const resumeToken = colon > 0 ? rawName.slice(colon + 1).trim() : undefined;
 
         void (async () => {
-          const result = await world.joinPlayer(connId, name);
+          const result = await world.joinPlayer(connId, name, "human", resumeToken);
           if (typeof result === "string") {
-            socket.write(`\r\n${result}\r\nEnter thy name, adventurer: `);
+            socket.write(
+              `\r\n${result}\r\nEnter name or name:resumeToken: `
+            );
             naming = true;
             return;
           }
 
           playerId = result.id;
           conn.playerId = playerId;
+          if (result.resumeToken) {
+            socket.write(
+              `\r\n[resume] Save this token to reconnect: ${result.name}:${result.resumeToken}\r\n`
+            );
+          }
           refresh();
         })();
+        return;
+      }
+
+      // Compute mode: accumulate JSON lines (also accept bare JSON offer anytime)
+      if (computeMode && playerId) {
+        jsonLineBuffer += text;
+        let nl: number;
+        while ((nl = jsonLineBuffer.search(/\r?\n/)) >= 0) {
+          const line = jsonLineBuffer.slice(0, nl).replace(/\r$/, "").trim();
+          jsonLineBuffer = jsonLineBuffer.slice(nl).replace(/^\r?\n/, "");
+          if (!line) continue;
+          if (line.toLowerCase() === ":compute off" || line.toLowerCase() === "compute off") {
+            computeMode = false;
+            getComputePool().unregisterWorker(connId);
+            socket.write("\r\n[compute] OFF\r\n");
+            refresh();
+            continue;
+          }
+          handleComputeJson(line);
+        }
+        return;
+      }
+
+      // Allow one-shot JSON compute_offer without entering mode
+      const trimmedPeek = text.trim();
+      if (trimmedPeek.startsWith("{") && trimmedPeek.includes("compute_")) {
+        jsonLineBuffer += text;
+        if (jsonLineBuffer.includes("\n") || jsonLineBuffer.includes("\r")) {
+          const line = jsonLineBuffer.replace(/[\r\n]/g, "").trim();
+          jsonLineBuffer = "";
+          handleComputeJson(line);
+        }
         return;
       }
 
@@ -134,6 +263,34 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
             if (line && playerId) {
               if (isHelpCommand(line)) {
                 showHelp();
+              } else if (/^:compute\b/i.test(line) || /^compute\b/i.test(line.replace(/^:/, ""))) {
+                const rest = line.replace(/^:/, "").trim().toLowerCase();
+                if (rest === "compute on" || rest === "compute") {
+                  computeMode = true;
+                  jsonLineBuffer = "";
+                  socket.write(
+                    "\r\n[compute] ON — send JSON-lines (compute_offer / compute_result). :compute off to exit.\r\n"
+                  );
+                  const label = world.getPlayer(playerId)?.name || `telnet-${connId.slice(0, 6)}`;
+                  getComputePool().handleOffer(
+                    connId,
+                    { capacity: 1, name: label },
+                    computeSend,
+                    "telnet"
+                  );
+                } else if (rest === "compute off") {
+                  computeMode = false;
+                  getComputePool().unregisterWorker(connId);
+                  socket.write("\r\n[compute] OFF\r\n");
+                  refresh();
+                } else if (rest === "compute status") {
+                  const m = getComputePool().getMetrics();
+                  socket.write(
+                    `\r\n[compute] workers=${m.workers} queue=${m.queueDepth} done=${m.completed} rej=${m.rejected} scoreboard=${m.topContributors.map((c) => `${c.name}:${c.score}`).join(",") || "—"}\r\n`
+                  );
+                } else {
+                  socket.write("\r\n[compute] usage: :compute on|off|status\r\n");
+                }
               } else {
                 world.handleInput(playerId, line.startsWith(":") ? line : `:${line}`);
                 refresh();
@@ -180,16 +337,56 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
     });
 
     socket.on("close", () => {
-      logEvent("session_disconnect", sessionId, { transport: "telnet", playerId: playerId ?? undefined });
+      state.sockets.delete(socket);
+      logEvent("session_disconnect", sessionId, {
+        transport: "telnet",
+        playerId: playerId ?? undefined,
+        detail: { reason: "client" },
+      });
       finalizeSession(sessionId, playerId ?? undefined);
-      world.removeConnection(connId);
+      getComputePool().unregisterWorker(connId);
+      world.removeConnection(connId, "client");
     });
-    socket.on("error", () => world.removeConnection(connId));
+    socket.on("error", () => {
+      state.sockets.delete(socket);
+      getComputePool().unregisterWorker(connId);
+      world.removeConnection(connId, "client");
+    });
   });
 
-  server.listen(port, BIND_HOST, () => {
-    console.log(`[telnet] ${BIND_HOST}:${port} (localhost only — not exposed via tunnel)`);
+  server.listen(port, TELNET_BIND_HOST, () => {
+    console.log(
+      `[telnet] ${TELNET_BIND_HOST}:${port} (not via CF tunnel; independent of BIND_HOST)`
+    );
   });
+
+  telnetDrainStates.set(server, state);
 
   return server;
+}
+
+export function beginTelnetDrain(server: net.Server): DrainHandle {
+  const state = telnetDrainStates.get(server);
+  if (!state) throw new Error("Telnet server is not managed by startTelnetServer");
+  if (state.handle) return state.handle;
+
+  state.draining = true;
+  for (const socket of state.sockets) {
+    socket.end("Server restarting. Retry shortly.\r\n");
+  }
+  const drained = new Promise<void>((resolve, reject) => {
+    try {
+      server.close((error) => (error ? reject(error) : resolve()));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolve();
+      else reject(error);
+    }
+  });
+  state.handle = {
+    drained,
+    forceClose(): void {
+      for (const socket of state.sockets) socket.destroy();
+    },
+  };
+  return state.handle;
 }

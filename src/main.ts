@@ -4,13 +4,15 @@ import {
   renderHUD,
   renderInventory,
   renderMessages,
-  showOverlay,
+  showEndOverlay,
   hideOverlay,
+  hideHelp,
 } from "./render";
 import { setupInput } from "./input";
 import type { GameState } from "./types";
 
 let state: GameState;
+let endShown = false;
 
 function refresh(): void {
   renderer.render(state);
@@ -18,29 +20,14 @@ function refresh(): void {
   renderInventory(state);
   renderMessages(state);
 
-  if (state.phase === "dead") {
-    const p = state.player;
-    showOverlay(
-      "You Died",
-      `The dungeon claims another soul.<br><br>
-       Depth reached: ${p.depth}<br>
-       Level: ${p.level}<br>
-       Gold: ${p.gold}<br>
-       Turns: ${p.turns}<br>
-       Seed: ${state.seed}`,
-      startGame
-    );
-  } else if (state.phase === "won") {
-    const p = state.player;
-    showOverlay(
-      "Victory!",
-      `You have conquered the depths!<br><br>
-       Level: ${p.level}<br>
-       Gold: ${p.gold}<br>
-       Turns: ${p.turns}<br>
-       Seed: ${state.seed}`,
-      startGame
-    );
+  if (state.phase === "dead" || state.phase === "won") {
+    if (!endShown) {
+      endShown = true;
+      hideHelp();
+      showEndOverlay(state, state.phase === "won" ? "won" : "dead", startGame);
+    }
+  } else {
+    endShown = false;
   }
 }
 
@@ -49,9 +36,25 @@ const renderer = new Renderer(canvas);
 
 function startGame(): void {
   hideOverlay();
+  hideHelp();
+  endShown = false;
   state = newGame();
   refresh();
 }
 
 setupInput(refresh, () => state);
 startGame();
+
+// Click backdrop / outside help box closes help
+document.getElementById("help-panel")?.addEventListener("click", (e) => {
+  if ((e.target as HTMLElement).id === "help-panel") hideHelp();
+});
+
+// Responsive canvas: re-fit tiles when the panel size changes
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+window.addEventListener("resize", () => {
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (state) renderer.render(state);
+  }, 80);
+});

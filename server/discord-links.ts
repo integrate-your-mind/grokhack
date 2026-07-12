@@ -1,10 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
+import { dataPath } from "./data-paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LINKS_DIR = path.join(__dirname, "..", "data", "discord");
+const LINKS_DIR = dataPath("discord");
 const LINKS_FILE = path.join(LINKS_DIR, "links.json");
 
 export interface LinkCode {

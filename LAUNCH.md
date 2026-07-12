@@ -1,35 +1,44 @@
 # GrokHack Launch Kit — X / Open Source
 
-## X post (copy-paste)
+## X post (copy-paste) — always attach media
+
+**Canonical pin / cold opens:** `POST_NOW.md` · `POSTS_READY.md` · `X_LAUNCH.md`
+**Brand one-liner:** Free multiplayer NetHack in the browser. Humans and AI agents. Same dungeon. Same deaths.
 
 ```
-I built GrokHack — a free, open-source multiplayer NetHack-style roguelike.
+I put humans and AI agents in the same NetHack dungeon.
 
-🎮 Play in browser (no install)
-🌐 Shared dungeon floors with other players
-☠️ Permadeath, hunger, unidentified potions
-🐉 10 depths. Dragon at the bottom.
+Shared floors. Permadeath. Global chat. MCP for bots.
 
-Play: https://grokhack.mondello.dev/play.html
-Code: https://github.com/integrate-your-mind/grokhack
+No install → https://grokhack.mondello.dev/play.html?ref=x
 
-#roguelike #nethack #indiedev #opensource #gamedev
+First death screenshot gets a reply from me.
 ```
+
+**Attach:** `https://grokhack.mondello.dev/promo-banner.jpg` or `og.png` (never post text-only).
 
 ## Thread follow-ups
 
-1. **How it works** — Server-authoritative Node.js MMO. Telnet + WebSocket. Cloudflare Tunnel for HTTPS/WSS.
-2. **Why** — Wanted NetHack energy with other humans on the map. Starve together.
-3. **Contribute** — `npm test`, pick an issue, PR welcome. MIT licensed.
+1. **Media** — death card or multiplayer screenshot
+2. **Why** — NetHack energy with other minds on the map. Starve together.
+3. **Agents** — MCP → https://grokhack.mondello.dev/mcp.html
+4. **Contribute** — MIT · `npm test` · https://github.com/integrate-your-mind/grokhack
 
 ## Launch checklist
 
-- [ ] Server running (`npm run server`)
-- [ ] Tunnel live (`npm run tunnel`)
-- [ ] Pages deployed (`npm run deploy:pages`)
-- [ ] GitHub repo public
+- [ ] Production supervisor + tunnel (`npm run prod:install` then `npm run prod:status`)
+- [x] Public health green (`https://grokhack.mondello.dev/api/status`) — verified 2026-07-08 Marketing
+- [ ] Local health green (`http://127.0.0.1:8080/api/status`)
+- [x] Static assets live (`og.png`, play, leaderboard 200) — verified 2026-07-08
+- [x] GitHub repo public — `integrate-your-mind/grokhack`
 - [ ] Play link works on phone
-- [ ] Post at peak hours (US evening / EU morning)
+- [ ] Post at peak hours (US evening / EU morning) — copy: `POST_NOW.md` / `POSTS_READY.md`
+
+**Marketing outbound:** brand, press kit, campaign calendar → `data/fleet/marketing/`
+**Full status log:** `data/fleet/marketing/LAUNCH_STATUS.md`
+**X playbook:** `X_LAUNCH.md` (content-x / growth; media-first)
+
+See `data/fleet/PLATFORM_RUNBOOK.md` for restarts (prefer `npm run prod:reload` / `deploy:soft`).
 
 ## Screenshots for X
 

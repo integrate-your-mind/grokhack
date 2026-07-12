@@ -1,11 +1,9 @@
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { dataPath } from "./data-paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, "..", "data");
-const SCORES_FILE = path.join(DATA_DIR, "scores.json");
+const DATA_DIR = dataPath();
+const SCORES_FILE = dataPath("scores.json");
 
 export type PlayerKind = "human" | "agent";
 export type RunOutcome = "won" | "died";

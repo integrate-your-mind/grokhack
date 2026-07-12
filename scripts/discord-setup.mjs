@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /**
- * GrokHack Discord bot setup — run once to get invite URL and validate token.
- * Usage: DISCORD_BOT_TOKEN=xxx npm run discord:setup
+ * GrokHack Discord — validate token, save .env, print invite URL.
+ * Usage: npm run discord:setup
+ *        DISCORD_BOT_TOKEN=xxx npm run discord:setup
  */
 import { execSync } from "node:child_process";
+import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,8 +13,12 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const envPath = join(root, ".env");
+const CLIENT_ID = "1524680780741644449";
+const PERMS = "1099780198434";
 
-const PERMS = "1099780198434"; // manage roles/channels, moderate, messages
+const PORTAL_BOT = `https://discord.com/developers/applications/${CLIENT_ID}/bot`;
+const PORTAL_OAUTH = `https://discord.com/developers/applications/${CLIENT_ID}/oauth2`;
+const INVITE = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&permissions=${PERMS}&scope=bot%20applications.commands`;
 
 function loadEnv() {
   if (!existsSync(envPath)) return {};
@@ -24,51 +30,58 @@ function loadEnv() {
   return out;
 }
 
-const envFile = loadEnv();
-const token = process.env.DISCORD_BOT_TOKEN || envFile.DISCORD_BOT_TOKEN || "";
+function upsertEnv(key, value) {
+  let content = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
+  const re = new RegExp(`^${key}=.*$`, "m");
+  const line = `${key}=${value}`;
+  content = re.test(content) ? content.replace(re, line) : content + (content.endsWith("\n") ? "" : "\n") + line + "\n";
+  writeFileSync(envPath, content);
+}
+
+function open(url) {
+  try {
+    execSync(`open "${url}"`, { stdio: "ignore" });
+  } catch { /* headless */ }
+}
+
+async function promptToken() {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question("\nPaste DISCORD_BOT_TOKEN (from Developer Portal → Bot → Reset Token): ", (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
 
 console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║           GrokHack Discord — secure onboarding           ║
+║        GrokHack Discord — grokhack app (${CLIENT_ID})   ║
 ╚══════════════════════════════════════════════════════════╝
 `);
 
+let token = process.env.DISCORD_BOT_TOKEN || loadEnv().DISCORD_BOT_TOKEN || "";
+
 if (!token) {
-  console.log(`No DISCORD_BOT_TOKEN yet. Do this once (~10 min):
+  console.log(`Quick setup (~5 min):
 
-1. CREATE SERVER (Discord app)
-   • Discord → + → Create My Own → "GrokHack"
-   • Enable Server Settings → Safety → Verification Level: **Medium**
+  1. Discord app → + → Create Server → name it "GrokHack"
+  2. Opening Developer Portal → Bot tab…
+     • Reset Token → copy it
+     • Enable: Server Members Intent + Message Content Intent
+  3. Paste token below (or re-run with DISCORD_BOT_TOKEN=...)
+  4. Opening bot invite → select your GrokHack server
+  5. Restart game server: npm run server
 
-2. CREATE BOT (Developer Portal)
-   • https://discord.com/developers/applications → New Application → "GrokHack Bot"
-   • Bot → Reset Token → copy token
-   • Bot → Privileged Gateway Intents → enable **Server Members Intent** + **Message Content Intent**
-   • OAuth2 → URL Generator:
-     - Scopes: bot, applications.commands
-     - Permissions: Manage Roles, Manage Channels, Moderate Members, Send Messages, Manage Messages
-   • Copy generated URL → open in browser → select your GrokHack server
-
-3. SAVE TOKEN (never commit)
-   echo 'DISCORD_BOT_TOKEN=YOUR_TOKEN' >> .env
-   # Optional: DISCORD_GUILD_ID=your_server_id (right-click server → Copy Server ID)
-
-4. START SERVER
-   npm run server
-
-The bot auto-creates channels, roles, verify button, and slash commands (/play /link /status).
+Bot auto-creates: @Unverified/@Player roles, #rules-and-verify, #in-game-chat, /play /link /status
 `);
-  try {
-    execSync("open https://discord.com/developers/applications", { stdio: "ignore" });
-  } catch { /* headless */ }
-  process.exit(1);
-}
-
-let clientId = process.env.DISCORD_CLIENT_ID || envFile.DISCORD_CLIENT_ID;
-if (!clientId && token.includes(".")) {
-  try {
-    clientId = Buffer.from(token.split(".")[0], "base64").toString("utf8");
-  } catch { /* ignore */ }
+  open("https://discord.com/channels/@me");
+  open(PORTAL_BOT);
+  token = await promptToken();
+  if (!token) {
+    console.error("\nNo token provided. Exiting.");
+    process.exit(1);
+  }
 }
 
 const me = await fetch("https://discord.com/api/v10/users/@me", {
@@ -80,18 +93,27 @@ if (me.code) {
   process.exit(1);
 }
 
-console.log(`✓ Bot: ${me.username}#${me.discriminator || "0"} (${me.id})`);
+console.log(`\n✓ Bot: ${me.username} (${me.id})`);
 
-const invite = `https://discord.com/api/oauth2/authorize?client_id=${clientId || me.id}&permissions=${PERMS}&scope=bot%20applications.commands`;
-console.log(`\nInvite URL (if not yet added to server):\n${invite}\n`);
+const guilds = await fetch("https://discord.com/api/v10/users/@me/guilds", {
+  headers: { Authorization: `Bot ${token}` },
+}).then((r) => r.json());
 
-if (!existsSync(envPath) || !envFile.DISCORD_BOT_TOKEN) {
-  const line = `DISCORD_BOT_TOKEN=${token}\n`;
-  writeFileSync(envPath, (existsSync(envPath) ? readFileSync(envPath, "utf8") : "") + line, { flag: "a" });
-  console.log("✓ Appended DISCORD_BOT_TOKEN to .env (gitignored)");
+if (Array.isArray(guilds) && guilds.length) {
+  console.log(`✓ In ${guilds.length} server(s): ${guilds.map((g) => g.name).join(", ")}`);
+  if (!loadEnv().DISCORD_GUILD_ID && guilds.length === 1) {
+    upsertEnv("DISCORD_GUILD_ID", guilds[0].id);
+    console.log(`✓ Saved DISCORD_GUILD_ID=${guilds[0].id}`);
+  }
+} else {
+  console.log(`\n⚠ Bot not in a server yet. Opening invite URL…`);
+  open(INVITE);
 }
 
-console.log(`Next: npm run server — bot will auto-setup #rules-and-verify, roles, and onboarding.`);
-try {
-  execSync(`open "${invite}"`, { stdio: "ignore" });
-} catch { /* ignore */ }
+upsertEnv("DISCORD_CLIENT_ID", CLIENT_ID);
+upsertEnv("DISCORD_BOT_TOKEN", token);
+console.log("✓ Saved DISCORD_BOT_TOKEN + DISCORD_CLIENT_ID to .env");
+
+console.log(`\nInvite URL:\n${INVITE}\n`);
+console.log("Next: restart server → npm run server");
+console.log("Community page: https://grokhack.mondello.dev/discord.html");

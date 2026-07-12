@@ -1,0 +1,39 @@
+# Edge/security: never bake secrets, local state, or host credentials into images.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Local runtime / durable world (mount as volume instead)
+data/
+*.duckdb
+*.duckdb.wal
+
+# Cloudflare host credentials (mount secret; never COPY)
+**/*credentials*.json
+**/.cloudflared/
+cloudflare/*.json
+
+# K8s secrets (example only is tracked)
+deploy/k8s/30-secret.yaml
+**/30-secret.yaml
+
+# Dev / VCS / noise
+.git
+.gitignore
+.github
+node_modules
+dist
+dist-server
+dist-test
+.wrangler
+.agent-tools
+**/*.log
+**/.DS_Store
+coverage
+*.md
+!README.md
+
+# Fleet / agent scratch (not runtime)
+data/fleet
+mcp/node_modules

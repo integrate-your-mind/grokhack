@@ -19,7 +19,8 @@ import {
   rulesEmbed,
   verifyRow,
 } from "./discord-onboard.js";
-import { createLinkCode } from "./discord-links.js";
+import { createLinkCode, getLinkedGameName } from "./discord-links.js";
+import { checkExternalChat } from "./external-chat.js";
 
 export interface DiscordBridgeHooks {
   onExternalChat: (from: string, text: string) => void;
@@ -31,21 +32,44 @@ let ready = false;
 let gameChatChannelId: string | null = null;
 let modLogChannelId: string | null = null;
 
-const rateBuckets = new Map<string, number[]>();
-const RATE_MAX = 5;
-const RATE_WINDOW_MS = 10_000;
-
-function rateLimited(userId: string): boolean {
-  const now = Date.now();
-  const hits = (rateBuckets.get(userId) || []).filter((t) => now - t < RATE_WINDOW_MS);
-  hits.push(now);
-  rateBuckets.set(userId, hits);
-  return hits.length > RATE_MAX;
-}
+const rateHintAt = new Map<string, number>();
+const RATE_HINT_COOLDOWN_MS = 60_000;
 
 function hasPlayerRole(member: import("discord.js").GuildMember | null): boolean {
   if (!member) return false;
   return member.roles.cache.some((r) => r.name === ROLES.player || r.name === ROLES.moderator);
+}
+
+async function resolveMember(message: Message) {
+  if (message.member) return message.member;
+  if (!message.guild) return null;
+  return message.guild.members.fetch(message.author.id).catch(() => null);
+}
+
+async function handleGameChatBridge(message: Message): Promise<void> {
+  const text = message.content.trim();
+  if (!text) return;
+
+  const linkedName = getLinkedGameName(message.author.id);
+  const tier = linkedName ? "discord_linked" : "discord_unlinked";
+  const from = linkedName || message.member?.displayName || message.author.username;
+  const sourceKey = `discord:${message.author.id}`;
+
+  const decision = checkExternalChat(tier, sourceKey, text);
+  if (!decision.ok) {
+    const now = Date.now();
+    const lastHint = rateHintAt.get(message.author.id) || 0;
+    if (decision.reason === "rate_limit" && now - lastHint > RATE_HINT_COOLDOWN_MS) {
+      rateHintAt.set(message.author.id, now);
+      const hint = linkedName
+        ? "Slow down — in-game bridge rate limit."
+        : "Slow down — use `/link YourGameName` + `:verify` in-game for higher limits.";
+      await message.reply(hint).catch(() => {});
+    }
+    return;
+  }
+
+  hooks?.onExternalChat(from, text);
 }
 
 export function startDiscordBot(h: DiscordBridgeHooks): void {
@@ -169,24 +193,19 @@ export function startDiscordBot(h: DiscordBridgeHooks): void {
   client.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot || !message.guild) return;
 
-    const member = message.member;
-    const isGameChat = message.channel.id === gameChatChannelId;
+    const isGameChat = gameChatChannelId && message.channel.id === gameChatChannelId;
 
+    if (isGameChat) {
+      await handleGameChatBridge(message);
+      return;
+    }
+
+    const member = await resolveMember(message);
     if (!hasPlayerRole(member)) {
       if (message.content.includes("discord.gg") || /https?:\/\//i.test(message.content)) {
         await message.delete().catch(() => {});
         await message.author.send("Links are blocked until you verify. Use #rules-and-verify.").catch(() => {});
       }
-      return;
-    }
-
-    if (isGameChat) {
-      if (rateLimited(message.author.id)) {
-        await message.delete().catch(() => {});
-        return;
-      }
-      const from = message.member?.displayName || message.author.username;
-      hooks?.onExternalChat(from, message.content);
     }
   });
 
@@ -233,8 +252,14 @@ export function getDiscordBotStatus() {
     ready,
     guildId: process.env.DISCORD_GUILD_ID || null,
     gameChatChannelId,
+    serverInviteUrl: process.env.DISCORD_INVITE_URL || null,
     invitePermissions: "1099780198434",
     setup: "npm run discord:setup",
+    chatBridge: {
+      policy: "tiered",
+      unlinked: "2 msgs / 60s, Discord display name",
+      linked: "5 msgs / 30s, linked game name via /link + :verify",
+    },
   };
 }
 
@@ -247,4 +272,22 @@ export async function repostRules(): Promise<boolean> {
   if (!rules) return false;
   await rules.send({ embeds: [rulesEmbed()], components: [verifyRow()] });
   return true;
+}
+
+export async function retryDiscordSetup(): Promise<Record<string, unknown>> {
+  if (!client || !ready) return { ok: false, message: "Bot not ready" };
+  const guildId = process.env.DISCORD_GUILD_ID || client.guilds.cache.first()?.id;
+  if (!guildId) return { ok: false, message: "No guild" };
+  try {
+    const guild = await client.guilds.fetch(guildId);
+    const ids = await autoSetupGuild(guild);
+    gameChatChannelId = ids.channelGameChat || null;
+    modLogChannelId = ids.channelModLog || null;
+    console.log("[discord] auto-setup complete for", guild.name);
+    return { ok: true, ids };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[discord] auto-setup failed:", err);
+    return { ok: false, message };
+  }
 }

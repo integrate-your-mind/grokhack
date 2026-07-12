@@ -1,11 +1,9 @@
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { dataPath } from "./data-paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SOCIAL_DIR = path.join(__dirname, "..", "data", "social");
-const STORE_FILE = path.join(SOCIAL_DIR, "graph.json");
+const SOCIAL_DIR = dataPath("social");
+const STORE_FILE = dataPath("social", "graph.json");
 
 export interface WallPost {
   id: string;
@@ -42,6 +40,14 @@ interface SocialStore {
 const MAX_WALL = 500;
 const MAX_DMS = 5000;
 
+function emptyProfiles(): Record<string, PlayerProfile> {
+  return Object.create(null) as Record<string, PlayerProfile>;
+}
+
+function emptyStore(): SocialStore {
+  return { profiles: emptyProfiles(), wall: [], dms: [] };
+}
+
 function defaultProfile(name: string): PlayerProfile {
   const now = new Date().toISOString();
   return {
@@ -58,12 +64,21 @@ function defaultProfile(name: string): PlayerProfile {
 function loadStore(): SocialStore {
   if (!fs.existsSync(SOCIAL_DIR)) fs.mkdirSync(SOCIAL_DIR, { recursive: true });
   if (!fs.existsSync(STORE_FILE)) {
-    return { profiles: {}, wall: [], dms: [] };
+    return emptyStore();
   }
   try {
-    return JSON.parse(fs.readFileSync(STORE_FILE, "utf8")) as SocialStore;
+    const parsed = JSON.parse(fs.readFileSync(STORE_FILE, "utf8")) as Partial<SocialStore>;
+    const profiles = emptyProfiles();
+    if (parsed.profiles && typeof parsed.profiles === "object" && !Array.isArray(parsed.profiles)) {
+      for (const [key, profile] of Object.entries(parsed.profiles)) profiles[key] = profile;
+    }
+    return {
+      profiles,
+      wall: Array.isArray(parsed.wall) ? parsed.wall : [],
+      dms: Array.isArray(parsed.dms) ? parsed.dms : [],
+    };
   } catch {
-    return { profiles: {}, wall: [], dms: [] };
+    return emptyStore();
   }
 }
 
@@ -108,6 +123,7 @@ export function requestFriend(from: string, to: string): { ok: boolean; message:
   const a = norm(from);
   const b = norm(to);
   if (a === b) return { ok: false, message: "You cannot friend yourself." };
+  if (!b) return { ok: false, message: "Usage: :friend add <name>" };
   if (!store.profiles[b]) touchProfile(to);
 
   const fromP = touchProfile(from);
@@ -119,10 +135,13 @@ export function requestFriend(from: string, to: string): { ok: boolean; message:
   if (fromP.pendingOut.map(norm).includes(b)) {
     return { ok: false, message: `Friend request to ${toP.name} already pending.` };
   }
-  if (toP.pendingIn.map(norm).includes(a)) {
-    fromP.friends.push(toP.name);
-    toP.friends.push(fromP.name);
+  // They already requested us → auto-accept (mutual)
+  if (fromP.pendingIn.map(norm).includes(b)) {
+    if (!fromP.friends.map(norm).includes(b)) fromP.friends.push(toP.name);
+    if (!toP.friends.map(norm).includes(a)) toP.friends.push(fromP.name);
     fromP.pendingIn = fromP.pendingIn.filter((n) => norm(n) !== b);
+    toP.pendingOut = toP.pendingOut.filter((n) => norm(n) !== a);
+    fromP.pendingOut = fromP.pendingOut.filter((n) => norm(n) !== b);
     toP.pendingIn = toP.pendingIn.filter((n) => norm(n) !== a);
     saveStore(store);
     return { ok: true, message: `You are now friends with ${toP.name}!` };
@@ -168,12 +187,47 @@ export function removeFriend(name: string, friend: string): { ok: boolean; messa
   return { ok: true, message: `Removed ${displayName(friend)} from friends.` };
 }
 
+/** Decline an inbound friend request. */
+export function declineFriend(name: string, friend: string): { ok: boolean; message: string } {
+  const p = touchProfile(name);
+  const fKey = norm(friend);
+  const friendP = store.profiles[fKey];
+  if (!friendP) return { ok: false, message: `No profile for ${friend}.` };
+
+  if (!p.pendingIn.map(norm).includes(fKey)) {
+    return { ok: false, message: `No pending request from ${friendP.name}.` };
+  }
+
+  p.pendingIn = p.pendingIn.filter((n) => norm(n) !== fKey);
+  friendP.pendingOut = friendP.pendingOut.filter((n) => norm(n) !== norm(name));
+  saveStore(store);
+  return { ok: true, message: `Declined friend request from ${friendP.name}.` };
+}
+
+/** Cancel an outbound friend request you sent. */
+export function cancelFriendRequest(name: string, friend: string): { ok: boolean; message: string } {
+  const p = touchProfile(name);
+  const fKey = norm(friend);
+  const friendP = store.profiles[fKey];
+  if (!friendP) return { ok: false, message: `No profile for ${friend}.` };
+
+  if (!p.pendingOut.map(norm).includes(fKey)) {
+    return { ok: false, message: `No pending request to ${friendP.name}.` };
+  }
+
+  p.pendingOut = p.pendingOut.filter((n) => norm(n) !== fKey);
+  friendP.pendingIn = friendP.pendingIn.filter((n) => norm(n) !== norm(name));
+  saveStore(store);
+  return { ok: true, message: `Cancelled friend request to ${friendP.name}.` };
+}
+
 export function listFriends(name: string): string[] {
-  return touchProfile(name).friends;
+  return getProfile(name)?.friends ?? [];
 }
 
 export function listPending(name: string): { in: string[]; out: string[] } {
-  const p = touchProfile(name);
+  const p = getProfile(name);
+  if (!p) return { in: [], out: [] };
   return { in: p.pendingIn, out: p.pendingOut };
 }
 
@@ -247,7 +301,7 @@ export function getGlobalWall(limit = 40): WallPost[] {
 }
 
 export function getSocialSnapshot(name: string) {
-  const p = touchProfile(name);
+  const p = getProfile(name) ?? defaultProfile(name.trim());
   return {
     profile: { name: p.name, bio: p.bio, lastSeen: p.lastSeen },
     friends: p.friends,
@@ -258,8 +312,23 @@ export function getSocialSnapshot(name: string) {
   };
 }
 
+/** Public profile projection: read-only and intentionally excludes private inbox/request state. */
+export function getPublicSocialProfile(name: string) {
+  const p = getProfile(name);
+  if (!p) return null;
+  const key = norm(p.name);
+  return {
+    profile: { name: p.name, bio: p.bio, lastSeen: p.lastSeen },
+    friends: [...p.friends],
+    wall: store.wall
+      .filter((post) => norm(post.author) === key)
+      .slice(-15)
+      .reverse(),
+  };
+}
+
 /** Test helper */
 export function _resetSocialForTests(): void {
-  store = { profiles: {}, wall: [], dms: [] };
+  store = emptyStore();
   saveStore(store);
 }

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grokhack-config
+  namespace: grokhack
+data:
+  # HTTP only — ClusterIP + tunnel. Never expose NodePort/LB without review.
+  BIND_HOST: "0.0.0.0"
+  PORT: "8080"
+  # Telnet is local debug only; always loopback even when BIND_HOST is 0.0.0.0
+  TELNET_BIND_HOST: "127.0.0.1"
+  TELNET_PORT: "4000"
+  # Public hostname (docs / MCP env)
+  GROKHACK_PUBLIC_URL: "https://grokhack.mondello.dev"
+  NODE_ENV: "production"

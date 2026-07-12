@@ -1,0 +1,14 @@
+# Single-writer DuckDB world state. Do NOT scale game StatefulSet > 1
+# without externalizing persistence (Postgres/etc).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grokhack-data
+  namespace: grokhack
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: standard   # set for your cluster

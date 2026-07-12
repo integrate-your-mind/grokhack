@@ -227,7 +227,7 @@ export function renderHelp(): string {
     L(":wall <msg>", "post to friend wall"),
     L(":social", "read wall feed"),
     L(":bio <text>", "set profile bio"),
-    L(":verify <code>", "link Discord"),
+    L(":verify <code>", "link Discord or X"),
     L(":help", "this help"),
     "",
     `${ANSI.dim}Tip: combat is bump-to-attack. Don't starve. Descend deeper.${ANSI.reset}`,

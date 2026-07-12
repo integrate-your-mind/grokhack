@@ -1,0 +1,110 @@
+# Dual cloudflared connectors → Cloudflare edge redundancy (zero single-connector SPOF)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grokhack-tunnel
+  namespace: grokhack
+  labels:
+    app: grokhack
+    tier: tunnel
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: grokhack
+      tier: tunnel
+  template:
+    metadata:
+      labels:
+        app: grokhack
+        tier: tunnel
+    spec:
+      # Spread across nodes when available
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    tier: tunnel
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          args:
+            - tunnel
+            - --config
+            - /etc/cloudflared/config.yml
+            - --no-autoupdate
+            - run
+            - $(TUNNEL_ID)
+          env:
+            - name: TUNNEL_ID
+              value: "48eb2839-41c7-426b-9bed-8cce35b7b545"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cloudflared/config.yml
+              subPath: config.yml
+              readOnly: true
+            - name: creds
+              mountPath: /etc/cloudflared/credentials.json
+              subPath: credentials.json
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            exec:
+              command:
+                - cloudflared
+                - --version
+            initialDelaySeconds: 10
+            periodSeconds: 60
+      volumes:
+        - name: config
+          configMap:
+            name: grokhack-tunnel-config
+        - name: creds
+          secret:
+            secretName: grokhack-tunnel-creds
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grokhack-tunnel-config
+  namespace: grokhack
+data:
+  config.yml: |
+    tunnel: 48eb2839-41c7-426b-9bed-8cce35b7b545
+    credentials-file: /etc/cloudflared/credentials.json
+    ingress:
+      - hostname: grokhack.mondello.dev
+        service: http://grokhack.grokhack.svc.cluster.local:8080
+        originRequest:
+          noTLSVerify: true
+          connectTimeout: 10s
+          # WebSocket friendly
+          http2Origin: false
+      - service: http_status:404
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: grokhack-tunnel-pdb
+  namespace: grokhack
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: grokhack
+      tier: tunnel

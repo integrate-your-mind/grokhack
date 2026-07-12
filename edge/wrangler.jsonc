@@ -1,0 +1,168 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "grokhack-edge-game",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-11",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FLOOR_INSTANCES",
+        "class_name": "FloorInstance"
+      },
+      {
+        "name": "PLAYER_SESSIONS",
+        "class_name": "PlayerSession"
+      },
+      {
+        "name": "REALM_DIRECTORIES",
+        "class_name": "RealmDirectory"
+      },
+      {
+        "name": "SHADOW_REPLAYS",
+        "class_name": "ShadowReplay"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FloorInstance"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["PlayerSession"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ShadowReplay"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["RealmDirectory"]
+    }
+  ],
+  "vars": {
+    "EDGE_ENVIRONMENT": "development",
+    "FLOOR_SOCKET_CAP": "100",
+    "FLOOR_MESSAGES_PER_MINUTE": "120",
+    "FLOOR_MESSAGE_BURST": "24",
+    "FLOOR_EVENTS_PER_SECOND": "250",
+    "FLOOR_EVENT_BURST": "400",
+    "FLOOR_SESSION_TOMBSTONE_CAP": "10000",
+    "FLOOR_REPLAY_GRACE_SECONDS": "600",
+    "REALM_DIRECTORY_BUCKETS": "64",
+    "REALM_DIRECTORY_SUPPORTED_BUCKET_COUNTS": "64",
+    "REALM_DIRECTORY_FLOOR_LIMIT": "256",
+    "REALM_DIRECTORY_RESERVATION_SECONDS": "65",
+    "REALM_DIRECTORY_RECEIPT_LIMIT": "32768",
+    "ROUTE_TICKET_TTL_SECONDS": "60",
+    "ROUTE_TICKET_AUDIENCE": "grokhack-edge-game",
+    "ROUTE_TICKET_ISSUER": "grokhack-session-control",
+    "ROUTE_TICKET_KEY_ID": "development-v1",
+    "ROUTE_TICKET_PREVIOUS_KEY_ID": "development-v0",
+    "ALLOWED_BROWSER_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173"
+  },
+  "secrets": {
+    "required": ["ROUTE_TICKET_SECRET", "ROUTE_TICKET_PREVIOUS_SECRET", "SHADOW_INGEST_SECRET"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.01
+  },
+  "env": {
+    "staging": {
+      "name": "grokhack-edge-game-staging",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "FLOOR_INSTANCES",
+            "class_name": "FloorInstance"
+          },
+          {
+            "name": "PLAYER_SESSIONS",
+            "class_name": "PlayerSession"
+          },
+          {
+            "name": "REALM_DIRECTORIES",
+            "class_name": "RealmDirectory"
+          },
+          {
+            "name": "SHADOW_REPLAYS",
+            "class_name": "ShadowReplay"
+          }
+        ]
+      },
+      "vars": {
+        "EDGE_ENVIRONMENT": "staging",
+        "FLOOR_SOCKET_CAP": "100",
+        "FLOOR_MESSAGES_PER_MINUTE": "120",
+        "FLOOR_MESSAGE_BURST": "24",
+        "FLOOR_EVENTS_PER_SECOND": "250",
+        "FLOOR_EVENT_BURST": "400",
+        "FLOOR_SESSION_TOMBSTONE_CAP": "10000",
+        "FLOOR_REPLAY_GRACE_SECONDS": "600",
+        "REALM_DIRECTORY_BUCKETS": "64",
+        "REALM_DIRECTORY_SUPPORTED_BUCKET_COUNTS": "64",
+        "REALM_DIRECTORY_FLOOR_LIMIT": "256",
+        "REALM_DIRECTORY_RESERVATION_SECONDS": "65",
+        "REALM_DIRECTORY_RECEIPT_LIMIT": "32768",
+        "ROUTE_TICKET_TTL_SECONDS": "60",
+        "ROUTE_TICKET_AUDIENCE": "grokhack-edge-game",
+        "ROUTE_TICKET_ISSUER": "grokhack-session-control",
+        "ROUTE_TICKET_KEY_ID": "staging-v1",
+        "ROUTE_TICKET_PREVIOUS_KEY_ID": "staging-v0",
+        "ALLOWED_BROWSER_ORIGINS": "https://staging.grokhack.mondello.dev"
+      },
+      "secrets": {
+        "required": ["ROUTE_TICKET_SECRET", "ROUTE_TICKET_PREVIOUS_SECRET", "SHADOW_INGEST_SECRET"]
+      }
+    },
+    "production": {
+      "name": "grokhack-edge-game-production",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "FLOOR_INSTANCES",
+            "class_name": "FloorInstance"
+          },
+          {
+            "name": "PLAYER_SESSIONS",
+            "class_name": "PlayerSession"
+          },
+          {
+            "name": "REALM_DIRECTORIES",
+            "class_name": "RealmDirectory"
+          },
+          {
+            "name": "SHADOW_REPLAYS",
+            "class_name": "ShadowReplay"
+          }
+        ]
+      },
+      "vars": {
+        "EDGE_ENVIRONMENT": "production",
+        "FLOOR_SOCKET_CAP": "100",
+        "FLOOR_MESSAGES_PER_MINUTE": "120",
+        "FLOOR_MESSAGE_BURST": "24",
+        "FLOOR_EVENTS_PER_SECOND": "250",
+        "FLOOR_EVENT_BURST": "400",
+        "FLOOR_SESSION_TOMBSTONE_CAP": "10000",
+        "FLOOR_REPLAY_GRACE_SECONDS": "600",
+        "REALM_DIRECTORY_BUCKETS": "64",
+        "REALM_DIRECTORY_SUPPORTED_BUCKET_COUNTS": "64",
+        "REALM_DIRECTORY_FLOOR_LIMIT": "256",
+        "REALM_DIRECTORY_RESERVATION_SECONDS": "65",
+        "REALM_DIRECTORY_RECEIPT_LIMIT": "32768",
+        "ROUTE_TICKET_TTL_SECONDS": "60",
+        "ROUTE_TICKET_AUDIENCE": "grokhack-edge-game",
+        "ROUTE_TICKET_ISSUER": "grokhack-session-control",
+        "ROUTE_TICKET_KEY_ID": "production-v1",
+        "ROUTE_TICKET_PREVIOUS_KEY_ID": "production-v0",
+        "ALLOWED_BROWSER_ORIGINS": "https://grokhack.mondello.dev"
+      },
+      "secrets": {
+        "required": ["ROUTE_TICKET_SECRET", "ROUTE_TICKET_PREVIOUS_SECRET", "SHADOW_INGEST_SECRET"]
+      }
+    }
+  }
+}

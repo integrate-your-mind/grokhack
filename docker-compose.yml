@@ -1,0 +1,31 @@
+services:
+  grokhack:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      # Override host .env BIND_HOST=127.0.0.1 so container HTTP is reachable by tunnel service.
+      BIND_HOST: "0.0.0.0"
+      TELNET_BIND_HOST: "127.0.0.1"
+    # Publish HTTP only on loopback — never :4000/telnet.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/status"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    # Origin must be healthy first (depends_on) — avoids publishing empty edge.
+    command: tunnel --config /etc/cloudflared/config.yml run 48eb2839-41c7-426b-9bed-8cce35b7b545
+    volumes:
+      - ./cloudflare/grokhack-tunnel.docker.yml:/etc/cloudflared/config.yml:ro
+      - ${HOME}/.cloudflared/48eb2839-41c7-426b-9bed-8cce35b7b545.json:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      grokhack:
+        condition: service_healthy

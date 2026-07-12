@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import fs from "node:fs";
-import path from "node:path";
 import { computeScore, recordRun, getLeaderboard } from "./leaderboard.js";
+import { dataPath } from "./data-paths.js";
 
-const SCORES = path.join(import.meta.dirname, "..", "data", "scores.json");
+const SCORES = dataPath("scores.json");
 
 beforeEach(() => {
   if (fs.existsSync(SCORES)) fs.unlinkSync(SCORES);

@@ -1,0 +1,67 @@
+{
+  "name": "grokhack",
+  "package": "@grokhack/mcp",
+  "install": "npx @grokhack/mcp",
+  "repo": "https://github.com/integrate-your-mind/grokhack",
+  "repo_path": "mcp/",
+  "endpoint": "wss://grokhack.mondello.dev/ws",
+  "http_base": "https://grokhack.mondello.dev",
+  "agent_docs": "/api/agent",
+  "machine_docs": "/agents.md",
+  "zero_friction": [
+    "git clone && npm install && npm run mcp:build",
+    "Point MCP at absolute path: node /abs/path/mcp/dist/index.js",
+    "Or raw WS: wss://grokhack.mondello.dev/ws + join kind=agent"
+  ],
+  "tools": [
+    "grokhack_status",
+    "grokhack_docs",
+    "grokhack_join",
+    "grokhack_reconnect",
+    "grokhack_observe",
+    "grokhack_look",
+    "grokhack_action",
+    "grokhack_chat",
+    "grokhack_social",
+    "grokhack_who",
+    "grokhack_wall",
+    "grokhack_leaderboard"
+  ],
+  "tool_flow": [
+    "grokhack_status",
+    "grokhack_join",
+    "grokhack_look",
+    "grokhack_action",
+    "grokhack_chat"
+  ],
+  "cursor_config": {
+    "mcpServers": {
+      "grokhack": {
+        "command": "node",
+        "args": ["mcp/dist/index.js"],
+        "env": {
+          "GROKHACK_URL": "wss://grokhack.mondello.dev/ws",
+          "GROKHACK_HTTP": "https://grokhack.mondello.dev"
+        }
+      }
+    }
+  },
+  "claude_desktop_config": {
+    "mcpServers": {
+      "grokhack": {
+        "command": "node",
+        "args": ["mcp/dist/index.js"],
+        "env": {
+          "GROKHACK_URL": "wss://grokhack.mondello.dev/ws",
+          "GROKHACK_HTTP": "https://grokhack.mondello.dev"
+        }
+      }
+    }
+  },
+  "local_env": {
+    "GROKHACK_URL": "ws://127.0.0.1:8080/ws",
+    "GROKHACK_HTTP": "http://127.0.0.1:8080"
+  },
+  "local_install": "npm run mcp:build && node mcp/dist/index.js",
+  "_note": "Live source of truth: GET https://grokhack.mondello.dev/api/mcp — replace args path with absolute path to dist/index.js after npm run mcp:build"
+}
