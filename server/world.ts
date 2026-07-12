@@ -83,10 +83,16 @@ import {
 } from "../src/world-events.js";
 // TICKET-WE-01 pollution (kills fuel blood_moon)
 import { ensureFloorEventBook, notePollution } from "../src/events.js";
-import type { Direction, Entity, GamePhase, PlayerState } from "../src/types.js";
+import type { Direction, Entity, GamePhase, PlayerState, Tile } from "../src/types.js";
 import { reduceGameplay } from "../src/gameplay-reducer.js";
 import type { GameplayState } from "../src/gameplay-reducer.js";
-import { OriginGameplayJournal } from "./origin-journal.js";
+import {
+  movementEventHash,
+  movementStateHash,
+  reduceMovement,
+  type MovementState,
+} from "../src/movement-reducer.js";
+import { movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
 import { logEvent } from "./audit.js";
 import {
   attachPlayer,
@@ -150,6 +156,7 @@ const LAIR_DEPTH = 10;
 const MAX_DEPTH = 15;
 const FOV_RADIUS = 8;
 const MAX_PLAYERS = 500;
+const MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER = 64;
 export const SHUTDOWN_RETRY_MESSAGE = "Server is restarting. Retry shortly.";
 
 export interface WorldServerOptions {
@@ -240,6 +247,8 @@ export class WorldServer {
   private chatLog: string[] = [];
   /** playerId → timestamps of recent social/chat posts (spam guard) */
   private chatHits = new Map<string, number[]>();
+  /** Bounded sampler: repeated free/no-op collisions must not fsync on the hot path. */
+  private movementNoopEvidence = new Map<string, Map<string, true>>();
   private startedAt = Date.now();
   private totalTurns = 0;
   private worldSeed = Date.now();
@@ -1426,31 +1435,92 @@ export class WorldServer {
 
   private tryMove(player: OnlinePlayer, dir: Direction): void {
     if (player.phase !== "playing") return;
-    const floor = this.getOrCreateFloor(player.floorDepth);
-
-    // trap-pressure handoff — bear trap hold
-    if ((player.state.immobilizedTurns ?? 0) > 0) {
-      this.addMessage(player, "You struggle against the trap!");
-      this.endPlayerTurn(player);
+    const floor = this.floors.get(player.floorDepth);
+    if (!floor) {
+      this.addMessage(player, "Floor unavailable — retry shortly.");
       return;
     }
 
     const nx = player.state.entity.x + dir.dx;
     const ny = player.state.entity.y + dir.dy;
+    const other = this.getPlayerAt(floor.depth, nx, ny, player.id);
+    const monster = floor.monsters.find((m) => m.hp > 0 && m.x === nx && m.y === ny);
+    // Build the authoritative cell snapshot without mutating floor state. Older
+    // loaded floors may not yet have a trap array; materialize it only after the
+    // immutable command record succeeds.
+    const plannedTraps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
+    const tile = (floor.dungeon.tiles[ny]?.[nx] ?? null) as Tile | null;
+    const movementState: MovementState = {
+      authority: {
+        realmId: "legacy-1",
+        floorInstanceId: `legacy-depth-${floor.depth}`,
+        depth: floor.depth,
+        floorEpoch: 1,
+        rulesetVersion: 1,
+      },
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      phase: player.phase,
+      alive: player.state.alive,
+      immobilizedTurns: player.state.immobilizedTurns ?? 0,
+      destination: {
+        tile,
+        occupant: other ? "player" : monster ? "monster" : "none",
+        trap: plannedTraps.some((trap) => !trap.sprung && trap.x === nx && trap.y === ny),
+        stairsDown: floor.dungeon.stairsDown.x === nx && floor.dungeon.stairsDown.y === ny,
+      },
+    };
+    const command = { type: "move", dx: dir.dx, dy: dir.dy } as const;
+    const movement = reduceMovement(movementState, command);
+    const noopFingerprint = movement.turnCost === "none"
+      ? [movementStateHash(movementState), command.dx, command.dy, movementEventHash(movement)].join("|")
+      : null;
+    const sampledNoop = noopFingerprint !== null && this.movementNoopEvidence.get(player.id)?.has(noopFingerprint);
+    if (!sampledNoop) {
+      try {
+        this.originJournal?.appendTransition({
+          streamId: movementJournalStreamId(player.id, floor.depth),
+          command,
+          beforeState: movementState,
+        });
+      } catch (error) {
+        const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
+        logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
+          playerId: player.id,
+          playerName: player.name,
+          detail: { component: "origin_movement_journal", message: error instanceof Error ? error.message : String(error) },
+        });
+        this.addMessage(player, "Turn journal unavailable — retry shortly.");
+        return;
+      }
+      if (noopFingerprint !== null) {
+        const evidence = this.movementNoopEvidence.get(player.id) ?? new Map<string, true>();
+        evidence.set(noopFingerprint, true);
+        while (evidence.size > MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER) {
+          const oldest = evidence.keys().next().value;
+          if (oldest === undefined) break;
+          evidence.delete(oldest);
+        }
+        this.movementNoopEvidence.set(player.id, evidence);
+      }
+    }
 
-    if (!isWalkable(floor.dungeon.tiles, nx, ny)) {
+    if (movement.outcome === "ignored") return;
+    if (movement.outcome === "struggle") {
+      this.addMessage(player, "You struggle against the trap!");
+      this.endPlayerTurn(player);
+      return;
+    }
+    if (movement.outcome === "blocked_terrain") {
       this.addMessage(player, "You bump into a wall.");
       return;
     }
-
-    const other = this.getPlayerAt(floor.depth, nx, ny, player.id);
-    if (other) {
-      this.addMessage(player, `${other.name} is in the way.`);
+    if (movement.outcome === "blocked_player") {
+      this.addMessage(player, `${other?.name ?? "Another player"} is in the way.`);
       return;
     }
-
-    const monster = floor.monsters.find((m) => m.hp > 0 && m.x === nx && m.y === ny);
-    if (monster) {
+    if (movement.outcome === "combat_intent") {
+      if (!monster) throw new Error("movement occupant changed before combat");
       const result = meleeAttack(effectivePlayerEntity(player.state), monster, {
         weaponName: player.state.equippedWeapon?.name,
         hitPenalty: playerHitPenalty(player.state),
@@ -1466,12 +1536,12 @@ export class WorldServer {
       return;
     }
 
-    player.state.entity.x = nx;
-    player.state.entity.y = ny;
+    player.state.entity.x = movement.state.x;
+    player.state.entity.y = movement.state.y;
     this.tryPickup(player, floor);
 
     // trap-pressure handoff — step-on traps
-    floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
+    floor.traps = plannedTraps;
     if (floor.traps.length) {
       const occupied = new Set<string>();
       for (const m of floor.monsters) {

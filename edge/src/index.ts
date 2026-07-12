@@ -224,7 +224,7 @@ async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig
   return replay.fetch("https://shadow.internal/catch-up", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ entries }),
+    body: JSON.stringify({ route, entries }),
   });
 }
 

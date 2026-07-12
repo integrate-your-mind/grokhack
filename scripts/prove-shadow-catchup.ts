@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { createTestHarness } from "../edge/node_modules/wrangler/wrangler-dist/cli.js";
 import { reduceGameplay, type GameplayState } from "../src/gameplay-reducer.js";
+import { reduceMovement, type MovementState } from "../src/movement-reducer.js";
 import { shadowEntryHash } from "../src/shadow-journal.js";
 import { OriginGameplayJournal } from "../server/origin-journal.js";
 import { catchUpOriginJournal, ShadowCatchupError } from "../server/shadow-catchup.js";
@@ -32,6 +33,31 @@ try {
     journal.appendTransition({ streamId: "origin_parity", command, beforeState: state });
     state = reduceGameplay(state, command).state;
   }
+  let movementState: MovementState = {
+    authority: { ...route, rulesetVersion: 1 },
+    x: 10,
+    y: 10,
+    phase: "playing",
+    alive: true,
+    immobilizedTurns: 0,
+    destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+  };
+  const movementDestinations = [
+    { tile: ".", occupant: "none", trap: false, stairsDown: false },
+    { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    { tile: ".", occupant: "player", trap: false, stairsDown: false },
+    { tile: ".", occupant: "monster", trap: false, stairsDown: false },
+    { tile: ">", occupant: "none", trap: true, stairsDown: true },
+    { tile: "+", occupant: "none", trap: false, stairsDown: false },
+  ] as const;
+  const movementDirections = [[1, 0], [0, 1], [-1, 0], [0, -1]] as const;
+  for (let index = 0; index < 96; index++) {
+    movementState = { ...movementState, destination: { ...movementDestinations[index % movementDestinations.length]! } };
+    const [dx, dy] = movementDirections[index % movementDirections.length]!;
+    const command = { type: "move", dx, dy } as const;
+    journal.appendTransition({ streamId: "origin_parity", command, beforeState: movementState });
+    movementState = reduceMovement(movementState, command).state;
+  }
   let responseLossObserved = false;
   try {
     await catchUpOriginJournal({
@@ -56,10 +82,10 @@ try {
     route,
     endpoint: "http://worker.local/internal/shadow/catch-up",
     secret,
-    maxBatches: 5,
+    maxBatches: 7,
     fetchImpl: (input, init) => harness.fetch(input, init),
   });
-  if (!parity.caughtUp || parity.checkpoint !== 300 || parity.duplicates !== 64 || parity.accepted !== 236 || parity.stateHash !== journal.readAfter("origin_parity", 299, 1)[0]!.afterStateHash || state.hungerState !== "weak") {
+  if (!parity.caughtUp || parity.checkpoint !== 396 || parity.duplicates !== 64 || parity.accepted !== 332 || parity.stateHash !== journal.readAfter("origin_parity", 395, 1)[0]!.afterStateHash || state.hungerState !== "weak") {
     throw new Error(`parity proof failed: ${JSON.stringify(parity)}`);
   }
 
@@ -108,7 +134,44 @@ try {
   if (!divergence || divergence.code !== "state_hash_divergence" || divergence.checkpoint !== 0 || divergence.status !== 422) {
     throw new Error(`divergence proof failed: ${JSON.stringify(divergence)}`);
   }
-  process.stdout.write(`${JSON.stringify({ ok: true, responseLossObserved, parity, terminalParity, divergence })}\n`);
+
+  const eventDivergenceJournal = new OriginGameplayJournal(path.join(directory, "event-divergent"));
+  const correctMovement = eventDivergenceJournal.appendTransition({
+    streamId: "origin_event_divergence",
+    command: { type: "move", dx: 1, dy: 0 },
+    beforeState: {
+      authority: { ...route, rulesetVersion: 1 },
+      x: 2,
+      y: 3,
+      phase: "playing",
+      alive: true,
+      immobilizedTurns: 0,
+      destination: { tile: ".", occupant: "player", trap: false, stairsDown: false },
+    },
+  }).entry;
+  if (correctMovement.v !== 2) throw new Error("movement journal did not produce V2 evidence");
+  fs.rmSync(path.join(directory, "event-divergent"), { recursive: true, force: true });
+  const eventUnsigned = { ...correctMovement, eventHash: "0000000000000000" };
+  const eventDivergent = { ...eventUnsigned, entryHash: shadowEntryHash(eventUnsigned) };
+  const eventSource = { readAfter: (_streamId: string, cursor: number) => cursor < 1 ? [eventDivergent] : [] };
+  let eventDivergence: { code: string; checkpoint: number; status: number } | null = null;
+  try {
+    await catchUpOriginJournal({
+      journal: eventSource,
+      streamId: "origin_event_divergence",
+      route,
+      endpoint: "http://worker.local/internal/shadow/catch-up",
+      secret,
+      fetchImpl: (input, init) => harness.fetch(input, init),
+    });
+  } catch (error) {
+    if (!(error instanceof ShadowCatchupError)) throw error;
+    eventDivergence = { code: error.code, checkpoint: error.checkpoint, status: error.status };
+  }
+  if (!eventDivergence || eventDivergence.code !== "event_hash_divergence" || eventDivergence.checkpoint !== 0 || eventDivergence.status !== 422) {
+    throw new Error(`event divergence proof failed: ${JSON.stringify(eventDivergence)}`);
+  }
+  process.stdout.write(`${JSON.stringify({ ok: true, responseLossObserved, parity, terminalParity, divergence, eventDivergence })}\n`);
 } finally {
   await harness.close();
   fs.rmSync(directory, { recursive: true, force: true });

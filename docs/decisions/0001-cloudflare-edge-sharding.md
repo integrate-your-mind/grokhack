@@ -252,11 +252,16 @@ data-plane shape rather than proxying the origin:
   expiry, allocator response loss, duplicate/party concurrency, tombstone and
   transfer-blocked retirement, stale signed epochs, persisted reconstruction,
   and live hibernation;
+- a frozen-V1/mixed-V2 shadow replay path for shared movement decisions with
+  independent state and behavioral-event divergence evidence, exact duplicate
+  replay, eviction, and adjacent `shadow_entries` schema expansion;
 - Wrangler dry-run bundling only; no deploy or resource creation.
 
 ## Not proven
 
-- The deterministic gameplay reducer is not running at the edge.
+- The deterministic turn/vitals reducer runs in the undeployed Floor object and
+  movement decisions run only in isolated shadow replay; full gameplay reducers
+  and authoritative edge position are not implemented.
 - Existing browser/agent/social/resume protocol parity is not complete.
 - Cross-floor/shared-vitals transfer and same-floor takeover are locally proven,
   but complete avatar/inventory parity and a production issuer/control plane are

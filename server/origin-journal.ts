@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { dataPath } from "./data-paths.js";
 import {
   createShadowJournalEntry,
   validateShadowJournalEntry,
+  type GameplayJournalInput,
+  type MovementJournalInput,
   type ShadowJournalEntry,
+  type ShadowJournalInput,
 } from "../src/shadow-journal.js";
-import type { GameplayCommand, GameplayState } from "../src/gameplay-reducer.js";
 
 export type JournalAppendResult =
   | { status: "appended"; entry: ShadowJournalEntry }
@@ -21,26 +24,48 @@ interface StreamHead {
 
 const SEGMENT_ENTRIES = 64;
 
+export function movementJournalStreamId(playerId: string, depth: number): string {
+  if (!/^[A-Za-z0-9_-]{1,96}$/u.test(playerId) || !Number.isSafeInteger(depth) || depth < 1 || depth > 64) {
+    throw new Error("invalid_movement_stream");
+  }
+  return `${playerId}_movement_d${depth}`;
+}
+
+export type OriginTransitionInput =
+  | Omit<GameplayJournalInput, "cursor" | "previousEntryHash">
+  | Omit<MovementJournalInput, "cursor" | "previousEntryHash">;
+
+export interface OriginGameplayJournalOptions {
+  /** Fault-injection seam used to prove pre/post-rename fsync recovery. */
+  fsyncSync?: (descriptor: number) => void;
+}
+
 export class OriginGameplayJournal {
   private readonly directory: string;
   private readonly heads = new Map<string, StreamHead>();
+  private readonly fsyncSync: (descriptor: number) => void;
 
-  constructor(directory = dataPath("shadow-journal")) {
+  constructor(directory = dataPath("shadow-journal"), options: OriginGameplayJournalOptions = {}) {
     this.directory = directory;
+    this.fsyncSync = options.fsyncSync ?? fs.fsyncSync;
   }
 
-  appendTransition(input: {
-    streamId: string;
-    command: GameplayCommand;
-    beforeState: GameplayState;
-  }): JournalAppendResult {
+  appendTransition(input: OriginTransitionInput): JournalAppendResult {
     const head = this.head(input.streamId);
     if (head.cursor > 0) {
       const last = this.entryAt(input.streamId, head.cursor);
-      const retry = createShadowJournalEntry({ ...input, cursor: head.cursor, previousEntryHash: last?.previousEntryHash ?? null });
+      const retry = createShadowJournalEntry({
+        ...input,
+        cursor: head.cursor,
+        previousEntryHash: last?.previousEntryHash ?? null,
+      } as ShadowJournalInput);
       if (last?.entryHash === retry.entryHash) return { status: "duplicate", entry: last };
     }
-    return this.append(createShadowJournalEntry({ ...input, cursor: head.cursor + 1, previousEntryHash: head.cursor === 0 ? null : head.entryHash }));
+    return this.append(createShadowJournalEntry({
+      ...input,
+      cursor: head.cursor + 1,
+      previousEntryHash: head.cursor === 0 ? null : head.entryHash,
+    } as ShadowJournalInput));
   }
 
   append(entry: ShadowJournalEntry): JournalAppendResult {
@@ -56,12 +81,29 @@ export class OriginGameplayJournal {
     if (validated.previousEntryHash !== (head.cursor === 0 ? null : head.entryHash)) throw new Error("journal_hash_chain_mismatch");
     fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     const file = this.fileFor(validated.streamId, this.segmentFor(validated.cursor));
-    const descriptor = fs.openSync(file, fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_WRONLY, 0o600);
+    const previous = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    let descriptor: number | undefined;
     try {
-      fs.writeSync(descriptor, `${JSON.stringify(validated)}\n`);
-      fs.fsyncSync(descriptor);
-    } finally {
+      descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.writeSync(descriptor, `${previous}${JSON.stringify(validated)}\n`);
+      this.fsyncSync(descriptor);
       fs.closeSync(descriptor);
+      descriptor = undefined;
+      fs.renameSync(temporary, file);
+      const directoryDescriptor = fs.openSync(this.directory, fs.constants.O_RDONLY);
+      try {
+        this.fsyncSync(directoryDescriptor);
+      } finally {
+        fs.closeSync(directoryDescriptor);
+      }
+    } catch (error) {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+      fs.rmSync(temporary, { force: true });
+      // Rename may have committed even when the directory fsync response was
+      // lost. Re-read canonical state on retry instead of trusting stale memory.
+      this.heads.delete(validated.streamId);
+      throw error;
     }
     this.heads.set(validated.streamId, { cursor: validated.cursor, entryHash: validated.entryHash, terminal: validated.terminal });
     return { status: "appended", entry: validated };

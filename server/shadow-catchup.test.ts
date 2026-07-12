@@ -51,6 +51,19 @@ describe("catchUpOriginJournal", () => {
       journal: source([entry]), streamId: "copy", route, endpoint: "https://edge.test", secret,
       fetchImpl: async () => Response.json({ streamId: "copy", checkpoint: 2, accepted: 1, duplicates: 0, terminal: false, stateHash: entry.afterStateHash }),
     })).rejects.toThrow("invalid shadow checkpoint advance");
+    await expect(catchUpOriginJournal({
+      journal: source([entry]), streamId: "copy", route, endpoint: "https://edge.test", secret,
+      fetchImpl: async () => Response.json({
+        streamId: "copy",
+        checkpoint: 1,
+        accepted: 1,
+        duplicates: 0,
+        terminal: false,
+        stateHash: entry.afterStateHash,
+        entryVersion: 1,
+        stateDomain: "movement",
+      }),
+    })).rejects.toThrow("invalid shadow response");
   });
 
   it("bounds entries and batches per invocation", async () => {

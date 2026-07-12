@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createShadowJournalEntry } from "../src/shadow-journal.js";
 import type { GameplayState } from "../src/gameplay-reducer.js";
-import { OriginGameplayJournal } from "./origin-journal.js";
+import type { MovementState } from "../src/movement-reducer.js";
+import { movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
 
 const directories: string[] = [];
 const initial = (overrides: Partial<GameplayState> = {}): GameplayState => ({
@@ -24,6 +25,12 @@ afterEach(() => {
 });
 
 describe("OriginGameplayJournal", () => {
+  it("creates a bounded floor-fenced movement stream identity", () => {
+    expect(movementJournalStreamId("player-1", 7)).toBe("player-1_movement_d7");
+    expect(() => movementJournalStreamId("../escape", 1)).toThrow("invalid_movement_stream");
+    expect(() => movementJournalStreamId("player-1", 0)).toThrow("invalid_movement_stream");
+  });
+
   it("appends immutable ordered entries and resumes its cursor after restart", () => {
     const { directory, value } = journal();
     const one = value.appendTransition({ streamId: "player_1", command: { type: "advance_turn", action: "wait" }, beforeState: initial() });
@@ -50,6 +57,51 @@ describe("OriginGameplayJournal", () => {
     expect(() => value.readAfter("../escape", 0, 1)).toThrow("invalid_stream_id");
     fs.appendFileSync(path.join(directory, "safe.00000000.jsonl"), "not-json\n");
     expect(() => new OriginGameplayJournal(directory).readAfter("safe", 0, 64)).toThrow();
+  });
+
+  it("keeps the canonical segment unchanged when file fsync fails after writing", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-fsync-"));
+    directories.push(directory);
+    let fsyncCalls = 0;
+    const value = new OriginGameplayJournal(directory, {
+      fsyncSync: (descriptor) => {
+        fsyncCalls++;
+        if (fsyncCalls === 1) throw new Error("injected file fsync failure");
+        fs.fsyncSync(descriptor);
+      },
+    });
+    const input = {
+      streamId: "fsync-before-rename",
+      command: { type: "advance_turn", action: "wait" } as const,
+      beforeState: initial(),
+    };
+    expect(() => value.appendTransition(input)).toThrow("injected file fsync failure");
+    expect(value.readAfter(input.streamId, 0, 64)).toEqual([]);
+    expect(fs.readdirSync(directory).some((name) => name.endsWith(".tmp"))).toBe(false);
+    expect(value.appendTransition(input).status).toBe("appended");
+    expect(new OriginGameplayJournal(directory).readAfter(input.streamId, 0, 64)).toHaveLength(1);
+  });
+
+  it("reconciles a committed rename when directory fsync acknowledgement is lost", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-dir-fsync-"));
+    directories.push(directory);
+    let fsyncCalls = 0;
+    const value = new OriginGameplayJournal(directory, {
+      fsyncSync: (descriptor) => {
+        fsyncCalls++;
+        if (fsyncCalls === 2) throw new Error("injected directory fsync failure");
+        fs.fsyncSync(descriptor);
+      },
+    });
+    const input = {
+      streamId: "fsync-after-rename",
+      command: { type: "advance_turn", action: "wait" } as const,
+      beforeState: initial(),
+    };
+    expect(() => value.appendTransition(input)).toThrow("injected directory fsync failure");
+    expect(new OriginGameplayJournal(directory).readAfter(input.streamId, 0, 64)).toHaveLength(1);
+    expect(value.appendTransition(input).status).toBe("duplicate");
+    expect(new OriginGameplayJournal(directory).readAfter(input.streamId, 0, 64)).toHaveLength(1);
   });
 
   it("enforces bounded reads and records terminal transitions", () => {
@@ -88,5 +140,31 @@ describe("OriginGameplayJournal", () => {
     expect(value.readAfter("segmented", 128, 64).map((entry) => entry.cursor)).toEqual([129, 130]);
     fs.rmSync(path.join(directory, "segmented.00000001.jsonl"));
     expect(() => value.readAfter("segmented", 64, 64)).toThrow("journal_missing_segment");
+  });
+
+  it("chains mixed V1 vitals and V2 movement entries across restart", () => {
+    const { directory, value } = journal();
+    const vitals = value.appendTransition({
+      streamId: "mixed",
+      command: { type: "advance_turn", action: "wait" },
+      beforeState: initial(),
+    }).entry;
+    const beforeState: MovementState = {
+      authority: { realmId: "legacy-1", floorInstanceId: "legacy-depth-1", depth: 1, floorEpoch: 1, rulesetVersion: 1 },
+      x: 8,
+      y: 4,
+      phase: "playing",
+      alive: true,
+      immobilizedTurns: 0,
+      destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+    };
+    const movement = value.appendTransition({
+      streamId: "mixed",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState,
+    }).entry;
+    expect([vitals.v, movement.v]).toEqual([1, 2]);
+    expect(movement.previousEntryHash).toBe(vitals.entryHash);
+    expect(new OriginGameplayJournal(directory).readAfter("mixed", 0, 64)).toEqual([vitals, movement]);
   });
 });

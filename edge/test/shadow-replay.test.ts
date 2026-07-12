@@ -3,10 +3,13 @@ import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 import { reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
+import { reduceMovement, type MovementState } from "../../src/movement-reducer";
 import {
   MAX_SHADOW_BATCH_BYTES,
   createShadowJournalEntry,
   shadowEntryHash,
+  type GameplayShadowJournalEntry,
+  type MovementShadowJournalEntry,
   type ShadowJournalEntry,
   type ShadowRoute,
 } from "../../src/shadow-journal";
@@ -19,16 +22,56 @@ const initial = (overrides: Partial<GameplayState> = {}): GameplayState => ({
   turns: 0, depth: 1, hunger: 800, maxHunger: 1000,
   hungerState: "normal", hp: 20, alive: true, ...overrides,
 });
+const movementState = (overrides: Partial<MovementState> = {}): MovementState => ({
+  authority: { ...route, rulesetVersion: 1 },
+  x: 12,
+  y: 8,
+  phase: "playing",
+  alive: true,
+  immobilizedTurns: 0,
+  destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+  ...overrides,
+});
 
-function trace(streamId: string, count: number, start = initial()): ShadowJournalEntry[] {
-  const entries: ShadowJournalEntry[] = [];
+function trace(streamId: string, count: number, start = initial()): GameplayShadowJournalEntry[] {
+  const entries: GameplayShadowJournalEntry[] = [];
   let state = start;
   let previousEntryHash: string | null = null;
   for (let cursor = 1; cursor <= count; cursor++) {
     const command = { type: "advance_turn", action: cursor % 2 ? "wait" : "other" } as const;
-    const entry = createShadowJournalEntry({ streamId, cursor, command, beforeState: state, previousEntryHash });
+    const entry: GameplayShadowJournalEntry = createShadowJournalEntry({ streamId, cursor, command, beforeState: state, previousEntryHash });
     entries.push(entry);
     state = reduceGameplay(state, command).state;
+    previousEntryHash = entry.entryHash;
+  }
+  return entries;
+}
+
+function movementTrace(streamId: string, count: number): MovementShadowJournalEntry[] {
+  const entries: MovementShadowJournalEntry[] = [];
+  let beforeState = movementState();
+  let previousEntryHash: string | null = null;
+  const destinations = [
+    { tile: ".", occupant: "none", trap: false, stairsDown: false },
+    { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    { tile: ".", occupant: "player", trap: false, stairsDown: false },
+    { tile: ".", occupant: "monster", trap: false, stairsDown: false },
+    { tile: ">", occupant: "none", trap: true, stairsDown: true },
+  ] as const;
+  const directions = [[1, 0], [0, 1], [-1, 0], [0, -1]] as const;
+  for (let cursor = 1; cursor <= count; cursor++) {
+    beforeState = { ...beforeState, destination: { ...destinations[(cursor - 1) % destinations.length]! } };
+    const [dx, dy] = directions[(cursor - 1) % directions.length]!;
+    const command = { type: "move", dx, dy } as const;
+    const entry: MovementShadowJournalEntry = createShadowJournalEntry({
+      streamId,
+      cursor,
+      command,
+      beforeState,
+      previousEntryHash,
+    });
+    entries.push(entry);
+    beforeState = reduceMovement(beforeState, command).state;
     previousEntryHash = entry.entryHash;
   }
   return entries;
@@ -58,6 +101,71 @@ describe("ShadowReplay catch-up", () => {
     const second = await ingest(entries.slice(60));
     const result = await second.json() as Record<string, unknown>;
     expect(result).toMatchObject({ checkpoint: 70, accepted: 6, duplicates: 4, stateHash: entries[69]!.afterStateHash });
+  });
+
+  it("replays a mixed V1/vitals and V2/movement chain across eviction", async () => {
+    const [vitals] = trace("mixed-version", 1);
+    const movement = createShadowJournalEntry({
+      streamId: "mixed-version",
+      cursor: 2,
+      previousEntryHash: vitals!.entryHash,
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState(),
+    });
+    await expect((await ingest([vitals!])).json()).resolves.toMatchObject({ checkpoint: 1, accepted: 1 });
+    await evictDurableObject(stubFor("mixed-version"));
+    const response = await ingest([vitals!, movement]);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      checkpoint: 2,
+      accepted: 1,
+      duplicates: 1,
+      stateHash: movement.afterStateHash,
+      entryVersion: 2,
+      stateDomain: "movement",
+    });
+    await expect(runInDurableObject(stubFor("mixed-version"), (_instance, state) =>
+      state.storage.sql.exec<{ entry_version: number; event_hash: string | null }>(
+        "SELECT entry_version, event_hash FROM shadow_entries WHERE stream_id = ? AND cursor = 2",
+        "mixed-version",
+      ).toArray()[0],
+    )).resolves.toEqual({ entry_version: 2, event_hash: movement.eventHash });
+  });
+
+  it("records movement event divergence without advancing the checkpoint", async () => {
+    const correct = createShadowJournalEntry({
+      streamId: "movement-event-divergence",
+      cursor: 1,
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState({ destination: { tile: ".", occupant: "player", trap: false, stairsDown: false } }),
+    });
+    const divergentUnsigned = { ...correct, eventHash: "0000000000000000" };
+    const divergent = { ...divergentUnsigned, entryHash: shadowEntryHash(divergentUnsigned) };
+    const response = await ingest([divergent]);
+    expect(response.status).toBe(422);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "event_hash_divergence",
+      checkpoint: 0,
+      cursor: 1,
+      expectedHash: "0000000000000000",
+      actualHash: correct.eventHash,
+    });
+    await evictDurableObject(stubFor("movement-event-divergence"));
+    await expect((await ingest([correct])).json()).resolves.toMatchObject({ checkpoint: 1, accepted: 1 });
+  });
+
+  it("fences a movement trace to its declared floor authority", async () => {
+    const movement = createShadowJournalEntry({
+      streamId: "movement-route-fence",
+      cursor: 1,
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState(),
+    });
+    const response = await ingest([movement], {
+      batchRoute: { ...route, floorInstanceId: "other-floor" },
+    });
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: "movement_authority_mismatch", checkpoint: 0 });
   });
 
   it("handles exact duplicate retry and rejects conflict, reorder, and gap without advancing", async () => {
@@ -172,6 +280,72 @@ describe("ShadowReplay catch-up", () => {
     await expect((await ingest(trace(streamId, 1))).json()).resolves.toMatchObject({ checkpoint: 1, accepted: 1 });
   });
 
+  it("expands legacy entry storage before accepting a V2 movement record", async () => {
+    const streamId = "entry-migration";
+    const stub = stubFor(streamId);
+    const legacy = trace(streamId, 1)[0]!;
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE shadow_entries");
+      state.storage.sql.exec(`CREATE TABLE shadow_entries (
+        stream_id TEXT NOT NULL,
+        cursor INTEGER NOT NULL,
+        entry_hash TEXT NOT NULL,
+        before_state_hash TEXT NOT NULL,
+        after_state_hash TEXT NOT NULL,
+        terminal INTEGER NOT NULL,
+        ingested_at INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, cursor)
+      ) WITHOUT ROWID`);
+      state.storage.sql.exec(
+        "INSERT INTO shadow_entries (stream_id, cursor, entry_hash, before_state_hash, after_state_hash, terminal, ingested_at) VALUES (?, 1, ?, ?, ?, 0, unixepoch())",
+        streamId, legacy.entryHash, legacy.beforeStateHash, legacy.afterStateHash,
+      );
+      state.storage.sql.exec(`INSERT INTO shadow_checkpoint
+        (stream_id, checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain, updated_at)
+        VALUES (?, 1, ?, ?, 0, 1, 'vitals', unixepoch())
+        ON CONFLICT(stream_id) DO UPDATE SET checkpoint = 1, last_entry_hash = excluded.last_entry_hash,
+          state_hash = excluded.state_hash, terminal = 0, entry_version = 1,
+          state_domain = 'vitals', updated_at = excluded.updated_at`,
+        streamId, legacy.entryHash, legacy.afterStateHash,
+      );
+    });
+    await evictDurableObject(stub);
+    await expect((await ingest([legacy])).json()).resolves.toMatchObject({
+      checkpoint: 1,
+      accepted: 0,
+      duplicates: 1,
+      entryVersion: 1,
+      stateDomain: "vitals",
+    });
+    const movement = createShadowJournalEntry({
+      streamId,
+      cursor: 2,
+      previousEntryHash: legacy.entryHash,
+      command: { type: "move", dx: 0, dy: -1 },
+      beforeState: movementState(),
+    });
+    await expect((await ingest([movement])).json()).resolves.toMatchObject({
+      checkpoint: 2,
+      accepted: 1,
+      entryVersion: 2,
+      stateDomain: "movement",
+    });
+    await expect(runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ name: string }>("PRAGMA table_info(shadow_entries)").toArray().map((row) => row.name),
+    )).resolves.toEqual(expect.arrayContaining(["entry_version", "event_hash"]));
+    await expect(runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ cursor: number }>(
+        "SELECT cursor FROM shadow_entries WHERE stream_id = ? ORDER BY cursor",
+        streamId,
+      ).toArray().map((row) => row.cursor),
+    )).resolves.toEqual([1, 2]);
+    await expect(runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ version: number }>(
+        "SELECT version FROM _shadow_schema_migrations ORDER BY version",
+      ).toArray().map((row) => row.version),
+    )).resolves.toEqual([1, 2, 3]);
+  });
+
   it("keeps checkpoint monotonic across seeded chunking and duplicate delivery", async () => {
     let seed = 0x5eed;
     const random = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
@@ -181,6 +355,22 @@ describe("ShadowReplay catch-up", () => {
       const width = 1 + Math.floor(random() * 7);
       const start = Math.max(0, cursor - (random() < 0.5 ? Math.floor(random() * Math.min(3, cursor + 1)) : 0));
       const response = await ingest(entries.slice(start, Math.min(entries.length, cursor + width)));
+      const body = await response.json() as { checkpoint: number };
+      expect(body.checkpoint).toBeGreaterThanOrEqual(cursor);
+      cursor = body.checkpoint;
+    }
+    expect(cursor).toBe(40);
+  });
+
+  it("keeps mixed movement checkpoints monotonic across seeded duplicate chunking", async () => {
+    let seed = 0x6d6f7665;
+    const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+    const entries = movementTrace("movement-property", 40);
+    let cursor = 0;
+    while (cursor < entries.length) {
+      const width = 1 + Math.floor(random() * 6);
+      const duplicatePrefix = random() < 0.6 ? Math.floor(random() * Math.min(4, cursor + 1)) : 0;
+      const response = await ingest(entries.slice(Math.max(0, cursor - duplicatePrefix), Math.min(entries.length, cursor + width)));
       const body = await response.json() as { checkpoint: number };
       expect(body.checkpoint).toBeGreaterThanOrEqual(cursor);
       cursor = body.checkpoint;

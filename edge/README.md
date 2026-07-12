@@ -38,6 +38,11 @@ The first vertical slice proves final-architecture primitives:
   still-live allocation reservations;
 - monotonic client sequences, atomic durable acknowledgements, and bounded
   replay/deduplication for the application SLO probe and shared `wait` reducer;
+- a mixed-version isolated shadow-replay namespace that preserves frozen V1
+  wait/vitals hashes while independently replaying V2 movement decisions,
+  including collision, door, trap-check, transfer, turn-cost, and visibility
+  intents plus a separate behavioral-event hash, floor-authority fencing, and
+  version/domain-qualified checkpoints;
 - opaque, ticket-bound resume-proof grants, canonical UUID identities, durable
   source/target transfer capabilities, 256-command handoff, and bounded saga artifacts;
 - strict runtime readiness/configuration validation and required-secret typegen;
@@ -47,11 +52,14 @@ The first vertical slice proves final-architecture primitives:
   frame boundaries, exact control-body authentication, concurrent allocation,
   historical shard layouts, automatic retirement, adjacent schemas, and storage bounds.
 
-It runs the shared deterministic `wait`/vitals reducer and intentionally rejects
-the remaining gameplay commands with `edge_gameplay_not_migrated`. Movement,
-combat, monsters, traps, items, the external resume-proof issuer/control plane,
-social services, queues, projections, and migration tooling must still be added
-and proven before any player traffic is routed here.
+`FloorInstance` runs the shared deterministic `wait`/vitals reducer and still
+rejects movement authority with `edge_gameplay_not_migrated`. The isolated
+`ShadowReplay` object now runs the shared movement-decision reducer, but it
+discards the result and cannot serve player state. Authoritative position tables,
+combat resolution, item/trap/room-effect reducers, movement-safe transfer state,
+the external resume-proof issuer/control plane, social services, queues,
+projections, and migration tooling must still be added and proven before any
+player traffic is routed here.
 
 The global route binding rejects an uncommitted different route or higher login
 epoch as `transfer_required`/`takeover_required`. A committed saga now moves the

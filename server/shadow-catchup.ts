@@ -8,6 +8,8 @@ export interface ShadowCatchupCheckpoint {
   duplicates: number;
   terminal: boolean;
   stateHash: string | null;
+  entryVersion: 1 | 2 | null;
+  stateDomain: "vitals" | "movement" | null;
 }
 
 export interface ShadowCatchupResult extends ShadowCatchupCheckpoint {
@@ -33,13 +35,20 @@ export class ShadowCatchupError extends Error {
 function parseCheckpoint(value: unknown): ShadowCatchupCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid shadow response");
   const candidate = value as Partial<ShadowCatchupCheckpoint>;
+  const entryVersion = candidate.entryVersion ?? null;
+  const stateDomain = candidate.stateDomain ?? null;
   if (typeof candidate.streamId !== "string" || !Number.isSafeInteger(candidate.checkpoint) ||
       Number(candidate.checkpoint) < 0 || !Number.isSafeInteger(candidate.accepted) ||
       !Number.isSafeInteger(candidate.duplicates) || typeof candidate.terminal !== "boolean" ||
-      (candidate.stateHash !== null && (typeof candidate.stateHash !== "string" || !/^[0-9a-f]{16}$/u.test(candidate.stateHash)))) {
+      (candidate.stateHash !== null && (typeof candidate.stateHash !== "string" || !/^[0-9a-f]{16}$/u.test(candidate.stateHash))) ||
+      (entryVersion !== null && entryVersion !== 1 && entryVersion !== 2) ||
+      (stateDomain !== null && stateDomain !== "vitals" && stateDomain !== "movement") ||
+      (entryVersion === null) !== (stateDomain === null) ||
+      (entryVersion === 1 && stateDomain !== "vitals") ||
+      (entryVersion === 2 && stateDomain !== "movement")) {
     throw new Error("invalid shadow response");
   }
-  return candidate as ShadowCatchupCheckpoint;
+  return { ...candidate, entryVersion, stateDomain } as ShadowCatchupCheckpoint;
 }
 
 export async function catchUpOriginJournal(options: {
@@ -71,12 +80,14 @@ export async function catchUpOriginJournal(options: {
   let batches = 0;
   let terminal = false;
   let stateHash: string | null = null;
+  let entryVersion: 1 | 2 | null = null;
+  let stateDomain: "vitals" | "movement" | null = null;
   for (; batches < maxBatches; batches++) {
     if (now() - startedAt >= maxDurationMs) {
-      return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, batches, caughtUp: false, backpressured: true };
+      return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: false, backpressured: true };
     }
     const entries = options.journal.readAfter(options.streamId, checkpoint, limit);
-    if (!entries.length) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, batches, caughtUp: true, backpressured: false };
+    if (!entries.length) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: true, backpressured: false };
     const response = await send(options.endpoint, {
       method: "POST",
       headers: { Authorization: `Bearer ${options.secret}`, "Content-Type": "application/json" },
@@ -84,7 +95,7 @@ export async function catchUpOriginJournal(options: {
     });
     const body = await response.json() as unknown;
     if (response.status === 429) {
-      return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, batches, caughtUp: false, backpressured: true };
+      return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: false, backpressured: true };
     }
     if (!response.ok) {
       const failure = body && typeof body === "object" ? body as { code?: unknown; checkpoint?: unknown } : {};
@@ -100,8 +111,10 @@ export async function catchUpOriginJournal(options: {
     duplicates += result.duplicates;
     terminal = result.terminal;
     stateHash = result.stateHash;
-    if (terminal) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, batches: batches + 1, caughtUp: true, backpressured: false };
+    entryVersion = result.entryVersion;
+    stateDomain = result.stateDomain;
+    if (terminal) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches: batches + 1, caughtUp: true, backpressured: false };
   }
   const remaining = options.journal.readAfter(options.streamId, checkpoint, 1);
-  return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, batches, caughtUp: remaining.length === 0, backpressured: remaining.length > 0 };
+  return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: remaining.length === 0, backpressured: remaining.length > 0 };
 }

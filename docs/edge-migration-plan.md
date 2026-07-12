@@ -45,6 +45,13 @@ Exit gate:
 - public/owner DTO contract tests remain green;
 - deterministic replay after process/object reconstruction is byte-stable.
 
+The shared layer now covers turn/vitals and the authoritative movement-decision
+seam: eight-direction validation, terrain/player/monster collision precedence,
+immobilized struggle, door crossing, pickup/trap/room/transfer intents, turn
+cost, and visibility intent. The movement adapter deliberately does not claim
+edge authority yet: combat, pickup mutation, trap/room effects, floor transfer,
+and persistent position still require shared normalized state and reducers.
+
 ## Phase 2: complete the edge substrate
 
 The current [`edge`](../edge/README.md) package is the start of this phase.
@@ -83,8 +90,23 @@ Add an append-only versioned command journal to the legacy authority. Copy its
 events asynchronously into isolated edge objects and compare state hashes. The
 edge result is discarded; it must not serve player state or mutate legacy data.
 
-The first production-shaped slice now journals the shared turn/vitals reducer
-into fsynced, mode-0600, hash-chained 64-entry segments. The bounded copier sends
+The first production-shaped slices now journal the shared turn/vitals reducer
+and movement decisions into fsynced, mode-0600, hash-chained 64-entry segments.
+Each bounded segment is rewritten through a mode-0600 temporary file, file
+fsync, atomic rename, and directory fsync. A pre-rename fsync failure leaves the
+canonical segment unchanged; a lost post-rename acknowledgement is reconciled
+from the canonical file on retry.
+Frozen V1 vitals entries remain byte-compatible; V2 movement entries add
+position/cell input, a state hash, and a separate behavioral-event hash so wall,
+player, and monster blocks cannot alias merely because position did not change.
+The movement decision is recorded before origin mutation so a failed first
+append cannot partially move or pick up an item. Turn-consuming paths retain the
+existing V1 vitals follow-up. These two fsynced records are not yet one atomic
+transaction; the transactional outbox remains required before authority transfer.
+Free wall/player rejections are evidence-sampled by a bounded per-player
+fingerprint set; repeated identical no-ops do not perform another synchronous
+fsync on the origin command hot path. Turn-consuming commands remain unsampled.
+The bounded copier sends
 at most 64 entries per page through an authenticated internal Worker route to a
 dedicated `ShadowReplay` SQLite Durable Object namespace. Checkpoint, immutable
 entry receipts, terminal state, and divergence evidence are committed
@@ -92,10 +114,17 @@ transactionally. Exact overlap/retry is idempotent; conflict, gap, reorder,
 chain break, corrupt input, post-terminal input, and parity divergence fail
 visibly without silently advancing past the failing cursor.
 
-This proves the ingestion/catch-up mechanism for the extracted vitals slice. It
-does not claim full-floor gameplay parity: movement, combat, monsters, traps,
-items, and transfers must enter the shared reducer before their journals can
-satisfy the zero-divergence authority-transfer gate.
+This proves the ingestion/catch-up mechanism for vitals and movement decisions.
+It does not claim full-floor gameplay parity or edge movement authority: combat,
+monsters, item mutation, trap/room effects, durable position, and transfers must
+enter shared normalized reducers before their journals can satisfy the
+zero-divergence authority-transfer gate.
+
+Movement evidence is partitioned into a floor-scoped origin stream and binds
+realm, floor instance, depth, floor epoch, and ruleset version into its state
+hash. The Worker rejects an entry whose authority tuple differs from the routed
+shadow object. Checkpoints expose both entry version and state domain so a
+movement fingerprint cannot be mistaken for a vitals fingerprint.
 
 Exit gate:
 

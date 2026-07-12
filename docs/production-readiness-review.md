@@ -9,7 +9,7 @@ Status: materially hardened locally; **not production-ready for million-user or
 |---|---|---|
 | Legacy origin safety | Improved locally, still a single failure domain | Version-aware readiness, mutation-fenced graceful drain, parser/queue bounds, payment and character authorization, coalesced metadata persistence, privacy-safe reads, atomic joins |
 | Cloudflare edge data plane | Strong undeployed substrate | Signed direct DO routing, PlayerSession route binding, full local authority fences, SQLite dedupe, alarms, hibernation, token buckets, bounded storage |
-| Gameplay parity at edge | Partial undeployed parity | Shared deterministic wait/vitals reducer and shadow replay are proven; movement, combat, monsters, traps, and items remain origin-only |
+| Gameplay parity at edge | Partial undeployed parity | Shared deterministic wait/vitals plus movement-decision replay are proven; authoritative position, combat, monsters, item mutation, trap/room effects, and transfers remain origin-only |
 | Global single-session ownership | Strong undeployed substrate | `PlayerSessionDO` now proves source-bound transfer/takeover, durable target prepare, commit/activation, abort/cleanup alarms, and 256-command handoff; external issuer/adoption remains |
 | Million-user capacity | Unproven | No distributed load test, account-limit approval, cost curve, or hot-shard/reconnect-storm evidence |
 | 99.99% application SLO | Unproven | No deployed end-to-end edge path, independent probes, 30-day SLI window, restore drill, or burn-rate paging |
@@ -125,8 +125,10 @@ idling/backoff policy is active.
 4. Add the transactional outbox, partitioned Queues/DLQ, D1 read projections,
    and independent R2 restore artifacts. None may be synchronous gameplay dependencies.
 5. Extend the now-proven immutable, bounded shadow replay path from shared
-   turn/vitals transitions to every gameplay transition; require byte-stable
-   state hashes before any authority transfer.
+   turn/vitals and movement-decision transitions to combat, monsters, item
+   mutation, trap/room effects, durable position, and every remaining gameplay
+   transition; require byte-stable state and behavioral-event hashes before any
+   authority transfer.
 6. Deploy an internal environment only after explicit approval for resources,
    secrets, DNS, and traffic. Run external synthetic transactions from multiple providers.
 7. Measure object saturation, fanout, storage growth, hot-shard skew, 10x reconnect
