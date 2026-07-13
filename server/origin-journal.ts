@@ -139,6 +139,12 @@ interface MovementTurnPreparation {
   state: "prepared" | "origin_applied" | "persistence_committed";
 }
 
+export interface MovementTurnRecoveryCandidate {
+  streamId: string;
+  operationId: string;
+  state: MovementTurnPreparation["state"];
+}
+
 /** Non-secret character-run discriminator derived from the 256-bit resume credential. */
 export function movementJournalRunId(resumeToken: string): string {
   if (!/^[0-9a-f]{64}$/iu.test(resumeToken)) throw new Error("invalid_movement_run");
@@ -305,6 +311,34 @@ export class OriginGameplayJournal {
       // legacy origin availability is handled by the caller's degraded latch.
       return true;
     }
+  }
+
+  /**
+   * Returns the exact durable preparation identity for database-receipt
+   * reconciliation. This is intentionally read-only: only the caller that
+   * proves the matching committed snapshot may advance or clear the marker.
+   */
+  movementTurnRecoveryCandidate(): MovementTurnRecoveryCandidate | null {
+    this.ensureEvidenceState();
+    const directory = this.movementTurnDirectory();
+    try {
+      fs.lstatSync(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    this.ensureMovementTurnDirectory();
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (!existing) return null;
+    if (existing.state !== "prepared" && !this.movementTurnPreparationIsCommitted(existing)) {
+      throw new Error("movement_turn_preparation_corrupt");
+    }
+    return {
+      streamId: existing.streamId,
+      operationId: existing.operationId,
+      state: existing.state,
+    };
   }
 
   prepareMovementTurn(input: Pick<OriginMovementTurnInput, "streamId" | "operationId" | "command" | "beforeState">): void {

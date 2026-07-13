@@ -163,20 +163,27 @@ turn/vitals reducer fields, appends the combined envelope, and finishes the
 remaining synchronous origin turn effects. Only then does it durably rewrite the
 marker to `origin_applied` and immediately enqueue snapshots of the player and
 every affected source/destination floor through DuckDB's ordered persistence
-queue. All writes are allowed to settle even when one rejects, so the admission
-latch cannot reopen while a later queued floor write is still running. Only
-after every write succeeds does the handler durably advance the marker to
-`persistence_committed`; unlink plus directory fsync then completes cleanup. A
-cold process may reconcile that final phase only when the matching immutable
-envelope exists. `prepared` and `origin_applied` remain poison because neither
-proves the state rows committed. While persistence is pending, the one global
+queue. The player, one/two floor snapshots, and a bounded operation receipt are
+written in one transaction. The receipt binds the journal identity to a SHA-256
+of the exact stored player/floor rows; an exact retry is idempotent, while a
+conflicting or subsequently overwritten snapshot fails closed. After COMMIT,
+the handler durably advances the filesystem marker to `persistence_committed`;
+unlink plus directory fsync completes marker cleanup, and only then may the
+receipt be deleted. A cold process that finds `origin_applied` may advance it
+only when the matching receipt still hashes to the stored rows and the matching
+immutable envelope exists. A crash after marker cleanup can leave only a stale
+receipt, which startup prunes when no preparation exists. `prepared` and an
+`origin_applied` marker without that exact receipt remain poison. While
+persistence is pending, the one global
 preparation slot rejects another movement without mutating origin state. A failed
 persistence acknowledgement retains the marker and keeps
 `shadowEvidenceDegraded` latched. Marker presence reconstructs that latch on
 restart; malformed, oversized, permissive, or symlinked marker/temp state fails
 closed. The handler retries ambiguous phase/cleanup acknowledgements. Graceful
 shutdown joins the in-flight chain and fails its durability barrier if poison
-remains. While latched, legacy origin gameplay
+remains. A failed transaction rollback poisons and closes the shared DuckDB
+connection rather than admitting later work on unknown transaction state. While
+latched, legacy origin gameplay
 remains available but later movement commands publish no new shadow envelopes,
 so they cannot hide or clear the older gap. A real two-process WorldServer/DuckDB
 regression terminates inside the persistence callback before acknowledgement and
@@ -189,8 +196,11 @@ does not clear its durable fence until the movement's player and affected-floor
 snapshots commit. A transfer may therefore wait for the player, source floor,
 and destination floor rows. `saveMovementTurnNow` writes those rows in one
 queued DuckDB transaction: every pre-commit crash/failure rolls back the whole
-snapshot, while a post-commit crash is recovered from the durable
-`persistence_committed` marker. The floor serializer covers the dungeon,
+snapshot, while a crash after COMMIT but before the filesystem phase advance is
+recovered from the in-transaction operation receipt. Schema v2 adds only the
+receipt table; older rows need no rewrite and the table is safe to leave in
+place during code rollback after any in-flight preparation is resolved. The
+floor serializer covers the dungeon,
 monsters, items, traps, timed event state, and mechanical event book. The unit
 is not atomic with score/chat effects, world
 metadata, the authority sidecar, or every other origin persistence side effect.

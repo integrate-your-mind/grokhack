@@ -817,10 +817,13 @@ describe("WorldServer movement shadow journal", () => {
     expect(journal.hasPendingMovementTurn()).toBe(true);
   });
 
-  it("fences a pre-ack crash and recovers a post-persistence cleanup crash", () => {
+  it("recovers exact DB commit receipts while fencing pre-ack and tampered crashes", () => {
     const scenarios = [
-      { name: "before_ack", status: 77, recovered: false },
-      { name: "after_persistence_commit", status: 78, recovered: true },
+      { name: "normal_completion", status: 0, recovered: true, persisted: "after", receipt: false },
+      { name: "before_ack", status: 77, recovered: false, persisted: "before", receipt: false },
+      { name: "after_db_commit", status: 79, recovered: true, persisted: "after", receipt: false },
+      { name: "after_db_commit_tampered", status: 80, recovered: false, persisted: "after", receipt: true },
+      { name: "after_persistence_commit", status: 78, recovered: true, persisted: "after", receipt: false },
     ] as const;
     for (const scenario of scenarios) {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grokhack-world-${scenario.name}-`));
@@ -844,9 +847,12 @@ describe("WorldServer movement shadow journal", () => {
             OriginGameplayJournal,
           } from "./server/origin-journal.ts";
           import {
+            closePersistence,
             flushPersistence,
+            hasMovementTurnCommit,
             initPersistence,
             saveFloorNow,
+            saveMovementTurnNow,
             savePlayerNow,
           } from "./server/persistence.ts";
           import { WorldServer } from "./server/world.ts";
@@ -862,6 +868,28 @@ describe("WorldServer movement shadow journal", () => {
             originJournal: journal,
             ...(scenario === "before_ack"
               ? { persistMovementTurn: async () => { process.exit(77); } }
+              : scenario === "after_db_commit" || scenario === "after_db_commit_tampered"
+                ? {
+                    persistMovementTurn: async (player, floors, identity) => {
+                      await saveMovementTurnNow(player, floors, identity, {
+                        afterCommit() {
+                          if (scenario === "after_db_commit_tampered") {
+                            const marker = path.join(
+                              root,
+                              "journal",
+                              "movement-turn-v1",
+                              ".movement-turn-preparation-v1.json",
+                            );
+                            const tampered = JSON.parse(fs.readFileSync(marker, "utf8"));
+                            tampered.operationId = "00000000-0000-4000-8000-000000000099";
+                            fs.writeFileSync(marker, JSON.stringify(tampered));
+                            process.exit(80);
+                          }
+                          process.exit(79);
+                        },
+                      });
+                    },
+                  }
               : {}),
           });
           await world.hydrateFromDatabase();
@@ -922,6 +950,23 @@ describe("WorldServer movement shadow journal", () => {
           await flushPersistence();
           fs.writeFileSync(path.join(root, "baseline.json"), JSON.stringify(baseline));
           world.handleInput(player.id, step.key);
+          if (scenario === "normal_completion") {
+            for (let attempt = 0; attempt < 200 && world.getStats().shadowEvidenceDegraded; attempt++) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            const envelope = journal.readMovementTurnsAfter(baseline.streamId, 0, 1)[0];
+            const receipt = envelope
+              ? await hasMovementTurnCommit({ streamId: envelope.streamId, operationId: envelope.operationId })
+              : false;
+            process.stdout.write("NORMAL_RESULT " + JSON.stringify({
+              degraded: world.getStats().shadowEvidenceDegraded,
+              pending: journal.hasPendingMovementTurn(),
+              receipt,
+            }) + "\\n");
+            await flushPersistence();
+            await closePersistence();
+            process.exit(0);
+          }
           await new Promise((resolve) => setTimeout(resolve, 10_000));
           throw new Error("crash injection did not fire");
         `,
@@ -929,6 +974,15 @@ describe("WorldServer movement shadow journal", () => {
         scenario.name,
       ], { cwd: process.cwd(), env: environment, encoding: "utf8", timeout: 20_000 });
       expect(crash.status, `${scenario.name}: ${crash.stderr}`).toBe(scenario.status);
+      if (scenario.name === "normal_completion") {
+        const normalLine = crash.stdout.split("\n").find((line) => line.startsWith("NORMAL_RESULT "));
+        expect(normalLine).toBeDefined();
+        expect(JSON.parse(normalLine!.slice("NORMAL_RESULT ".length))).toEqual({
+          degraded: false,
+          pending: false,
+          receipt: false,
+        });
+      }
 
       const restart = spawnSync(process.execPath, [
         "--import", "tsx", "--input-type=module", "-e",
@@ -938,7 +992,11 @@ describe("WorldServer movement shadow journal", () => {
           import { reduceGameplay } from "./src/gameplay-reducer.ts";
           import { reduceMovement } from "./src/movement-reducer.ts";
           import { OriginGameplayJournal } from "./server/origin-journal.ts";
-          import { closePersistence, initPersistence } from "./server/persistence.ts";
+          import {
+            closePersistence,
+            hasMovementTurnCommit,
+            initPersistence,
+          } from "./server/persistence.ts";
           import { WorldServer } from "./server/world.ts";
           const root = process.argv[1];
           const baseline = JSON.parse(fs.readFileSync(path.join(root, "baseline.json"), "utf8"));
@@ -953,6 +1011,9 @@ describe("WorldServer movement shadow journal", () => {
           const result = {
             degraded: world.getStats().shadowEvidenceDegraded,
             pending: journal.hasPendingMovementTurn(),
+            receipt: envelope
+              ? await hasMovementTurnCommit({ streamId: envelope.streamId, operationId: envelope.operationId })
+              : false,
             baseline,
             persisted: player && {
               x: player.state.entity.x,
@@ -978,13 +1039,13 @@ describe("WorldServer movement shadow journal", () => {
       const result = JSON.parse(resultLine.slice("COLD_RESULT ".length)) as {
         degraded: boolean;
         pending: boolean;
+        receipt: boolean;
         baseline: { x: number; y: number; turns: number; hunger: number };
         persisted: { x: number; y: number; turns: number; hunger: number };
         envelopeAfter: { x: number; y: number; turns: number; hunger: number };
       };
-      if (scenario.recovered) {
+      if (scenario.persisted === "after") {
         expect(result.persisted).toEqual(result.envelopeAfter);
-        expect(result).toMatchObject({ degraded: false, pending: false });
       } else {
         expect(result.persisted).toEqual({
           x: result.baseline.x,
@@ -993,6 +1054,11 @@ describe("WorldServer movement shadow journal", () => {
           hunger: result.baseline.hunger,
         });
         expect(result.envelopeAfter).not.toEqual(result.persisted);
+      }
+      expect(result.receipt).toBe(scenario.receipt);
+      if (scenario.recovered) {
+        expect(result).toMatchObject({ degraded: false, pending: false });
+      } else {
         expect(result).toMatchObject({ degraded: true, pending: true });
       }
     }

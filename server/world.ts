@@ -129,7 +129,10 @@ import { redeemLinkCode } from "./discord-links.js";
 import { redeemXLinkCode } from "./x-links.js";
 import {
   appendChatMessages,
+  clearMovementTurnCommits,
+  deleteMovementTurnCommit,
   deletePlayerById,
+  hasMovementTurnCommit,
   isPersistenceReady,
   loadResumablePlayerByName,
   loadWorld,
@@ -140,6 +143,8 @@ import {
   scheduleSaveFloor,
   scheduleSavePlayer,
   scheduleSaveWorldMeta,
+  type MovementTurnPersistenceCrashHooks,
+  type MovementTurnPersistenceIdentity,
 } from "./persistence.js";
 import { sanitizeChatText, sanitizeExternalName } from "./security.js";
 import { normalizeFloorMonsters } from "./floor-monsters.js";
@@ -196,10 +201,17 @@ export interface WorldServerOptions {
     Partial<Pick<OriginGameplayJournal,
       "appendMovementTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
       "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
-      "hasPendingMovementTurn" | "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+      "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
+      "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
   ) | null;
   /** Fault/test seam; production persists the player and every affected floor before clearing the movement fence. */
-  persistMovementTurn?: (player: OnlinePlayer, floors: readonly FloorState[]) => Promise<void>;
+  persistMovementTurn?: (
+    player: OnlinePlayer,
+    floors: readonly FloorState[],
+    identity: MovementTurnPersistenceIdentity,
+  ) => Promise<void>;
+  /** @internal Process-crash seam for the production DuckDB movement transaction. */
+  movementTurnPersistenceCrashHooks?: MovementTurnPersistenceCrashHooks;
 }
 
 interface PendingMovementTurn {
@@ -306,9 +318,15 @@ export class WorldServer {
     Partial<Pick<OriginGameplayJournal,
       "appendMovementTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
       "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
-      "hasPendingMovementTurn" | "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+      "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
+      "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
   ) | null;
-  private readonly persistMovementTurn?: (player: OnlinePlayer, floors: readonly FloorState[]) => Promise<void>;
+  private readonly persistMovementTurn?: (
+    player: OnlinePlayer,
+    floors: readonly FloorState[],
+    identity: MovementTurnPersistenceIdentity,
+  ) => Promise<void>;
+  private readonly movementTurnPersistenceCrashHooks: MovementTurnPersistenceCrashHooks;
   /** Sticky across restart while a durable movement-turn preparation remains unresolved. */
   private shadowEvidenceDegraded = false;
   /** The one global preparation marker cannot admit another movement until its state snapshot is durable. */
@@ -322,6 +340,7 @@ export class WorldServer {
     this.maxPlayers = options.maxPlayers ?? MAX_PLAYERS;
     this.originJournal = options.originJournal === undefined ? new OriginGameplayJournal() : options.originJournal;
     this.persistMovementTurn = options.persistMovementTurn;
+    this.movementTurnPersistenceCrashHooks = options.movementTurnPersistenceCrashHooks ?? {};
     if (!Number.isSafeInteger(this.maxPlayers) || this.maxPlayers < 1) {
       throw new Error("maxPlayers must be a positive safe integer");
     }
@@ -330,6 +349,7 @@ export class WorldServer {
 
   async hydrateFromDatabase(): Promise<void> {
     this.originJournal?.validateMovementAuthorityRegistry?.call(this.originJournal);
+    await this.reconcileMovementTurnPersistence();
     const data = await loadWorld();
     if (!data) {
       await this.persistMeta();
@@ -364,6 +384,79 @@ export class WorldServer {
     console.log(
       `[world] hydrated ${this.players.size} players, ${this.floors.size} floors from database`
     );
+  }
+
+  private async reconcileMovementTurnPersistence(): Promise<void> {
+    const recoveryCandidate = this.originJournal?.movementTurnRecoveryCandidate;
+    if (!recoveryCandidate || !this.originJournal?.markMovementTurnPersistenceCommitted ||
+        !this.originJournal.completeMovementTurnPreparation || !isPersistenceReady()) return;
+
+    let candidate: ReturnType<OriginGameplayJournal["movementTurnRecoveryCandidate"]>;
+    try {
+      candidate = recoveryCandidate.call(this.originJournal);
+    } catch (error) {
+      this.shadowEvidenceDegraded = true;
+      console.error("[world] movement turn recovery marker:", error);
+      return;
+    }
+
+    if (!candidate) {
+      try {
+        await clearMovementTurnCommits();
+      } catch (error) {
+        // A stale receipt is harmless once no filesystem preparation remains;
+        // leave it for the next boot rather than fail origin availability.
+        console.error("[world] movement turn receipt cleanup:", error);
+      }
+      try {
+        this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+      } catch {
+        this.shadowEvidenceDegraded = true;
+      }
+      return;
+    }
+
+    this.shadowEvidenceDegraded = true;
+    if (candidate.state !== "origin_applied") return;
+
+    let committed: boolean;
+    try {
+      committed = await hasMovementTurnCommit(candidate);
+    } catch (error) {
+      console.error("[world] movement turn commit receipt:", error);
+      return;
+    }
+    if (!committed) return;
+
+    const retryMarker = (advance: () => void): void => {
+      try {
+        advance();
+      } catch {
+        // Rename/directory-fsync acknowledgement may be lost after the durable
+        // operation. Exact-identity marker transitions are idempotent.
+        advance();
+      }
+    };
+    try {
+      retryMarker(() => this.originJournal!.markMovementTurnPersistenceCommitted!(candidate));
+      retryMarker(() => this.originJournal!.completeMovementTurnPreparation!(candidate));
+    } catch (error) {
+      console.error("[world] movement turn recovery completion:", error);
+      return;
+    }
+
+    try {
+      await deleteMovementTurnCommit(candidate);
+    } catch (error) {
+      // Marker cleanup happened first, so a leftover receipt is only bounded
+      // garbage and will be pruned on the next cold start.
+      console.error("[world] movement turn receipt cleanup:", error);
+    }
+    try {
+      this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+    } catch {
+      this.shadowEvidenceDegraded = true;
+    }
   }
 
   /**
@@ -1965,8 +2058,15 @@ export class WorldServer {
       }
     }
 
-    const persist = this.persistMovementTurn ?? (isPersistenceReady()
-      ? saveMovementTurnNow
+    const receiptBacked = this.persistMovementTurn === undefined && isPersistenceReady();
+    const persist = this.persistMovementTurn ?? (receiptBacked
+      ? (snapshotPlayer: OnlinePlayer, snapshotFloors: readonly FloorState[]) =>
+          saveMovementTurnNow(
+            snapshotPlayer,
+            snapshotFloors,
+            identity,
+            this.movementTurnPersistenceCrashHooks,
+          )
       : null);
     if (!persist) {
       this.completeMovementTurnEvidence(player, identity);
@@ -1977,7 +2077,7 @@ export class WorldServer {
     this.shadowEvidenceDegraded = true;
     let durability: Promise<void>;
     try {
-      durability = persist(player, floors);
+      durability = persist(player, floors, identity);
     } catch (error) {
       this.movementTurnPersistencePending = false;
       this.logMovementTurnFailure(player, "origin_movement_turn_persistence", error);
@@ -1985,8 +2085,17 @@ export class WorldServer {
       return;
     }
     const completion = Promise.resolve(durability).then(
-      () => {
-        this.completeMovementTurnEvidence(player, identity);
+      async () => {
+        const completed = this.completeMovementTurnEvidence(player, identity);
+        if (completed && receiptBacked) {
+          try {
+            // Delete only after the durable filesystem marker is gone. A crash
+            // between those operations leaves a harmless boot-prunable receipt.
+            await deleteMovementTurnCommit(identity);
+          } catch (error) {
+            this.logMovementTurnFailure(player, "origin_movement_turn_receipt_cleanup", error);
+          }
+        }
         this.movementTurnPersistencePending = false;
       },
       (error: unknown) => {
@@ -2008,7 +2117,7 @@ export class WorldServer {
   private completeMovementTurnEvidence(
     player: OnlinePlayer,
     identity: { streamId: string; operationId: string },
-  ): void {
+  ): boolean {
     let persistenceCommitted = false;
     try {
       this.originJournal?.markMovementTurnPersistenceCommitted?.(identity);
@@ -2028,7 +2137,7 @@ export class WorldServer {
     if (!persistenceCommitted) {
       this.shadowEvidenceDegraded = true;
       this.addMessage(player, "Turn completed; shadow evidence is degraded.");
-      return;
+      return false;
     }
 
     let completed = false;
@@ -2058,6 +2167,7 @@ export class WorldServer {
     if (this.shadowEvidenceDegraded) {
       this.addMessage(player, "Turn completed; shadow evidence is degraded.");
     }
+    return completed;
   }
 
   private logMovementTurnFailure(player: OnlinePlayer, component: string, error: unknown): void {

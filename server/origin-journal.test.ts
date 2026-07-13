@@ -218,11 +218,21 @@ describe("OriginGameplayJournal", () => {
     const committed = new OriginGameplayJournal(committedDirectory);
     committed.prepareMovementTurn(committedInput);
     expect(committed.appendMovementTurn(committedInput).status).toBe("appended");
+    expect(committed.movementTurnRecoveryCandidate()).toEqual({
+      streamId: committedInput.streamId,
+      operationId: committedInput.operationId,
+      state: "prepared",
+    });
 
     const committedRestart = new OriginGameplayJournal(committedDirectory);
     expect(committedRestart.hasPendingMovementTurn()).toBe(true);
     committedRestart.markMovementTurnApplied(committedInput);
     const appliedRestart = new OriginGameplayJournal(committedDirectory);
+    expect(appliedRestart.movementTurnRecoveryCandidate()).toEqual({
+      streamId: committedInput.streamId,
+      operationId: committedInput.operationId,
+      state: "origin_applied",
+    });
     expect(appliedRestart.hasPendingMovementTurn()).toBe(true);
     expect(fs.existsSync(path.join(
       committedDirectory,
