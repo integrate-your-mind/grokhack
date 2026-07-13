@@ -10,6 +10,7 @@ import type { MovementState } from "../src/movement-reducer.js";
 import {
   movementJournalRunId,
   movementJournalStreamId,
+  movementTurnJournalStreamId,
   OriginGameplayJournal,
   type JournalAppendResult,
 } from "./origin-journal.js";
@@ -27,6 +28,30 @@ const movementAuthority = {
   rulesetVersion: 1,
 } as const;
 const movementRunId = movementJournalRunId("a".repeat(64));
+
+const movementBefore = (overrides: Partial<MovementState> = {}): MovementState => ({
+  authority: movementAuthority,
+  x: 8,
+  y: 4,
+  phase: "playing",
+  alive: true,
+  immobilizedTurns: 0,
+  destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+  ...overrides,
+});
+
+function movementTurnInput(operationId = "00000000-0000-4000-8000-000000000001") {
+  return {
+    streamId: movementTurnJournalStreamId("player-1", movementRunId, movementAuthority),
+    operationId,
+    command: { type: "move", dx: 1, dy: 0 } as const,
+    beforeState: movementBefore(),
+    turn: {
+      command: { type: "advance_turn", action: "other" } as const,
+      beforeState: initial(),
+    },
+  };
+}
 
 function journal(): { directory: string; value: OriginGameplayJournal } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-"));
@@ -60,6 +85,883 @@ describe("OriginGameplayJournal", () => {
     expect(() => movementJournalStreamId("player-1", "0".repeat(23), movementAuthority)).toThrow("invalid_movement_stream");
     expect(() => movementJournalStreamId("player-1", movementRunId, { ...movementAuthority, floorEpoch: 0 })).toThrow("invalid_movement_stream");
     expect(() => movementJournalStreamId("player-1", movementRunId, { ...movementAuthority, rulesetVersion: 2 })).toThrow("invalid_movement_stream");
+    expect(movementTurnJournalStreamId("player-1", movementRunId, movementAuthority))
+      .toMatch(/^turn_[0-9a-f]{48}$/u);
+  });
+
+  it("atomically appends, pages, restarts, deduplicates, and conflicts movement-turn envelopes", () => {
+    const { directory, value } = journal();
+    const firstInput = movementTurnInput();
+    const first = value.appendMovementTurn(firstInput);
+    expect(first.status).toBe("appended");
+    const committed = value.readMovementTurnsAfter(firstInput.streamId, 0, 1);
+    expect(committed).toEqual([
+      expect.objectContaining({
+        cursor: 1,
+        operationId: firstInput.operationId,
+        movement: expect.objectContaining({ v: 2 }),
+        turn: expect.objectContaining({ v: 1 }),
+      }),
+    ]);
+    expect(new OriginGameplayJournal(directory).readMovementTurnsAfter(firstInput.streamId, 0, 64))
+      .toEqual(committed);
+    expect(value.appendMovementTurn(firstInput).status).toBe("duplicate");
+    expect(() => value.appendMovementTurn({
+      ...firstInput,
+      beforeState: movementBefore({ x: 99 }),
+    })).toThrow("movement_turn_operation_conflict");
+
+    const secondInput = {
+      ...movementTurnInput("00000000-0000-4000-8000-000000000002"),
+      beforeState: movementBefore({ x: 9 }),
+      turn: {
+        command: { type: "advance_turn", action: "other" } as const,
+        beforeState: initial({ turns: 1, hunger: 798 }),
+      },
+    };
+    expect(value.appendMovementTurn(secondInput).status).toBe("appended");
+    expect(value.readMovementTurnsAfter(firstInput.streamId, 1, 1).map((entry) => entry.cursor)).toEqual([2]);
+    expect(new OriginGameplayJournal(directory).readMovementTurnsAfter(firstInput.streamId, 0, 64)
+      .map((entry) => entry.cursor)).toEqual([1, 2]);
+  });
+
+  it("keeps one preparation durable and clears it only after matching envelope and persistence commit", () => {
+    const { directory, value } = journal();
+    const input = movementTurnInput("00000000-0000-4000-8000-000000000009");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+
+    value.prepareMovementTurn(input);
+    value.prepareMovementTurn(input);
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    const preparationFile = path.join(directory, "movement-turn-v1", ".movement-turn-preparation-v1.json");
+    expect(fs.readdirSync(path.dirname(preparationFile)).filter((name) => name.includes("preparation")))
+      .toEqual([path.basename(preparationFile)]);
+    expect(fs.statSync(preparationFile).mode & 0o077).toBe(0);
+
+    const restarted = new OriginGameplayJournal(directory);
+    expect(restarted.hasPendingMovementTurn()).toBe(true);
+    expect(() => restarted.completeMovementTurnPreparation(input))
+      .toThrow("movement_turn_preparation_uncommitted");
+    expect(() => restarted.prepareMovementTurn({
+      ...input,
+      operationId: "00000000-0000-4000-8000-00000000000a",
+    })).toThrow("movement_turn_preparation_exists");
+
+    expect(restarted.appendMovementTurn(input).status).toBe("appended");
+    const unrelated = {
+      ...movementTurnInput("00000000-0000-4000-8000-00000000000a"),
+      beforeState: movementBefore({ x: 9 }),
+      turn: {
+        command: { type: "advance_turn", action: "other" } as const,
+        beforeState: initial({ turns: 1, hunger: 798 }),
+      },
+    };
+    expect(restarted.appendMovementTurn(unrelated).status).toBe("appended");
+    expect(() => restarted.completeMovementTurnPreparation(unrelated))
+      .toThrow("movement_turn_preparation_conflict");
+    expect(restarted.hasPendingMovementTurn()).toBe(true);
+    expect(() => restarted.completeMovementTurnPreparation(input))
+      .toThrow("movement_turn_origin_not_applied");
+    restarted.markMovementTurnApplied(input);
+    expect(() => restarted.completeMovementTurnPreparation(input))
+      .toThrow("movement_turn_persistence_not_committed");
+    restarted.markMovementTurnPersistenceCommitted(input);
+    restarted.completeMovementTurnPreparation(input);
+    expect(restarted.hasPendingMovementTurn()).toBe(false);
+    expect(new OriginGameplayJournal(directory).hasPendingMovementTurn()).toBe(false);
+  });
+
+  it("does not rescan every movement-turn segment while recovering the fixed preparation temp", () => {
+    const { directory, value } = journal();
+    const movementTurnDirectory = path.join(directory, "movement-turn-v1");
+    const originalReaddirSync = fs.readdirSync;
+    let preparationDirectoryScans = 0;
+    fs.readdirSync = ((...args: unknown[]) => {
+      if (path.resolve(String(args[0])) === movementTurnDirectory) preparationDirectoryScans++;
+      return Reflect.apply(originalReaddirSync, fs, args) as ReturnType<typeof fs.readdirSync>;
+    }) as typeof fs.readdirSync;
+
+    try {
+      const first = movementTurnInput("00000000-0000-4000-8000-000000000101");
+      value.prepareMovementTurn(first);
+      expect(value.appendMovementTurn(first).status).toBe("appended");
+      value.markMovementTurnApplied(first);
+      value.markMovementTurnPersistenceCommitted(first);
+      value.completeMovementTurnPreparation(first);
+      const scansAfterFirstTurn = preparationDirectoryScans;
+
+      const second = {
+        ...movementTurnInput("00000000-0000-4000-8000-000000000102"),
+        beforeState: movementBefore({ x: 9 }),
+        turn: {
+          command: { type: "advance_turn", action: "other" } as const,
+          beforeState: initial({ turns: 1, hunger: 798 }),
+        },
+      };
+      value.prepareMovementTurn(second);
+      expect(value.appendMovementTurn(second).status).toBe("appended");
+      value.markMovementTurnApplied(second);
+      value.markMovementTurnPersistenceCommitted(second);
+      value.completeMovementTurnPreparation(second);
+
+      expect(scansAfterFirstTurn).toBeLessThanOrEqual(1);
+      expect(preparationDirectoryScans - scansAfterFirstTurn).toBe(0);
+    } finally {
+      fs.readdirSync = originalReaddirSync;
+    }
+  });
+
+  it("keeps cold origin-applied and earlier crash preparations fenced", () => {
+    const committedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-reconcile-"));
+    directories.push(committedDirectory);
+    const committedInput = movementTurnInput("00000000-0000-4000-8000-000000000013");
+    const committed = new OriginGameplayJournal(committedDirectory);
+    committed.prepareMovementTurn(committedInput);
+    expect(committed.appendMovementTurn(committedInput).status).toBe("appended");
+
+    const committedRestart = new OriginGameplayJournal(committedDirectory);
+    expect(committedRestart.hasPendingMovementTurn()).toBe(true);
+    committedRestart.markMovementTurnApplied(committedInput);
+    const appliedRestart = new OriginGameplayJournal(committedDirectory);
+    expect(appliedRestart.hasPendingMovementTurn()).toBe(true);
+    expect(fs.existsSync(path.join(
+      committedDirectory,
+      "movement-turn-v1",
+      ".movement-turn-preparation-v1.json",
+    ))).toBe(true);
+    expect(committedRestart.readMovementTurnsAfter(committedInput.streamId, 0, 64)).toHaveLength(1);
+    committedRestart.markMovementTurnPersistenceCommitted(committedInput);
+    expect(new OriginGameplayJournal(committedDirectory).hasPendingMovementTurn()).toBe(false);
+
+    const uncommittedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-uncommitted-"));
+    directories.push(uncommittedDirectory);
+    const uncommittedInput = movementTurnInput("00000000-0000-4000-8000-000000000014");
+    const uncommitted = new OriginGameplayJournal(uncommittedDirectory);
+    uncommitted.prepareMovementTurn(uncommittedInput);
+    expect(new OriginGameplayJournal(uncommittedDirectory).hasPendingMovementTurn()).toBe(true);
+  });
+
+  it("removes bounded preparation temp files left by a crash before rename", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-temp-recovery-"));
+    directories.push(directory);
+    const turnDirectory = path.join(directory, "movement-turn-v1");
+    fs.mkdirSync(turnDirectory, { recursive: true, mode: 0o700 });
+    const legacyTemp = path.join(
+      turnDirectory,
+      ".movement-turn-preparation-v1.json.999.00000000-0000-4000-8000-000000000015.tmp",
+    );
+    const fixedTemp = path.join(turnDirectory, ".movement-turn-preparation-v1.tmp");
+    fs.writeFileSync(legacyTemp, "prepared\n", { mode: 0o600 });
+    fs.writeFileSync(fixedTemp, "prepared\n", { mode: 0o600 });
+
+    expect(new OriginGameplayJournal(directory).hasPendingMovementTurn()).toBe(false);
+    expect(fs.readdirSync(turnDirectory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("fails closed without unlink amplification when the legacy temp inventory is excessive", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-temp-inventory-"));
+    directories.push(directory);
+    const turnDirectory = path.join(directory, "movement-turn-v1");
+    fs.mkdirSync(turnDirectory, { recursive: true, mode: 0o700 });
+    for (let index = 0; index < 65; index++) {
+      fs.writeFileSync(
+        path.join(
+          turnDirectory,
+          `.movement-turn-preparation-v1.json.${index + 1}.${index.toString(16).padStart(8, "0")}-0000-4000-8000-000000000015.tmp`,
+        ),
+        "prepared\n",
+        { mode: 0o600 },
+      );
+    }
+
+    const value = new OriginGameplayJournal(directory);
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    expect(() => value.prepareMovementTurn(movementTurnInput()))
+      .toThrow("movement_turn_preparation_temp_inventory_too_large");
+    expect(fs.readdirSync(turnDirectory).filter((name) => name.endsWith(".tmp"))).toHaveLength(65);
+  });
+
+  it("recovers a real process death after fixed-temp fsync without admitting a marker", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-temp-crash-"));
+    directories.push(directory);
+    const child = spawnSync(process.execPath, [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "-e",
+      `
+        import fs from "node:fs";
+        import {
+          movementJournalRunId,
+          movementTurnJournalStreamId,
+          OriginGameplayJournal,
+        } from "./server/origin-journal.ts";
+        const directory = process.argv[1];
+        const authority = {
+          realmId: "legacy-1",
+          floorInstanceId: "floor-instance-1",
+          depth: 1,
+          floorEpoch: 1,
+          rulesetVersion: 1,
+        };
+        const beforeState = {
+          authority,
+          x: 8,
+          y: 4,
+          phase: "playing",
+          alive: true,
+          immobilizedTurns: 0,
+          destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+        };
+        let markerWritten = false;
+        const journal = new OriginGameplayJournal(directory, {
+          writeSync(descriptor, buffer, offset, length) {
+            const count = fs.writeSync(descriptor, buffer, offset, length);
+            if (Buffer.from(buffer).toString("utf8").includes('"streamId":"turn_')) {
+              markerWritten = true;
+            }
+            return count;
+          },
+          fsyncSync(descriptor) {
+            fs.fsyncSync(descriptor);
+            const metadata = fs.fstatSync(descriptor);
+            if (markerWritten && metadata.isFile() && metadata.size > 0 && metadata.size <= 512) {
+              process.exit(91);
+            }
+          },
+        });
+        const runId = movementJournalRunId("a".repeat(64));
+        journal.prepareMovementTurn({
+          streamId: movementTurnJournalStreamId("player-1", runId, authority),
+          operationId: "00000000-0000-4000-8000-000000000016",
+          command: { type: "move", dx: 1, dy: 0 },
+          beforeState,
+        });
+      `,
+      directory,
+    ], { cwd: process.cwd(), encoding: "utf8" });
+    expect(child.status, child.stderr).toBe(91);
+
+    const turnDirectory = path.join(directory, "movement-turn-v1");
+    expect(fs.existsSync(path.join(turnDirectory, ".movement-turn-preparation-v1.json"))).toBe(false);
+    expect(fs.readdirSync(turnDirectory).filter((name) => name.endsWith(".tmp")))
+      .toEqual([".movement-turn-preparation-v1.tmp"]);
+    expect(new OriginGameplayJournal(directory).hasPendingMovementTurn()).toBe(false);
+    expect(fs.readdirSync(turnDirectory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("recovers real process death across origin, persistence, and cleanup durability boundaries", () => {
+    const scenarios = [
+      { name: "applied_temp_fsync", status: 92, pending: true },
+      { name: "applied_rename", status: 93, pending: true },
+      { name: "applied_directory_fsync", status: 94, pending: true },
+      { name: "after_applied", status: 95, pending: true },
+      { name: "persisted_temp_fsync", status: 98, pending: true },
+      { name: "persisted_rename", status: 99, pending: false },
+      { name: "persisted_directory_fsync", status: 100, pending: false },
+      { name: "after_persisted", status: 101, pending: false },
+      { name: "after_unlink", status: 96, pending: false },
+      { name: "cleanup_directory_fsync", status: 97, pending: false },
+    ] as const;
+    for (const scenario of scenarios) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grokhack-${scenario.name}-`));
+      directories.push(directory);
+      const child = spawnSync(process.execPath, [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        `
+          import fs from "node:fs";
+          import {
+            movementJournalRunId,
+            movementTurnJournalStreamId,
+            OriginGameplayJournal,
+          } from "./server/origin-journal.ts";
+          const directory = process.argv[1];
+          const scenario = process.argv[2];
+          const authority = {
+            realmId: "legacy-1",
+            floorInstanceId: "floor-instance-1",
+            depth: 1,
+            floorEpoch: 1,
+            rulesetVersion: 1,
+          };
+          const beforeState = {
+            authority,
+            x: 8,
+            y: 4,
+            phase: "playing",
+            alive: true,
+            immobilizedTurns: 0,
+            destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+          };
+          let appliedPayloadWritten = false;
+          let persistedPayloadWritten = false;
+          let preparationRenames = 0;
+          let appliedRenamed = false;
+          let persistedRenamed = false;
+          let cleanupUnlinked = false;
+          const journal = new OriginGameplayJournal(directory, {
+            writeSync(descriptor, buffer, offset, length) {
+              const count = fs.writeSync(descriptor, buffer, offset, length);
+              if (Buffer.from(buffer).toString("utf8").includes('"state":"origin_applied"')) {
+                appliedPayloadWritten = true;
+              }
+              if (Buffer.from(buffer).toString("utf8").includes('"state":"persistence_committed"')) {
+                persistedPayloadWritten = true;
+              }
+              return count;
+            },
+            fsyncSync(descriptor) {
+              fs.fsyncSync(descriptor);
+              const metadata = fs.fstatSync(descriptor);
+              if (scenario === "applied_temp_fsync" && appliedPayloadWritten && metadata.isFile()) {
+                process.exit(92);
+              }
+              if (scenario === "applied_directory_fsync" && appliedRenamed && metadata.isDirectory()) {
+                process.exit(94);
+              }
+              if (scenario === "persisted_temp_fsync" && persistedPayloadWritten && metadata.isFile()) {
+                process.exit(98);
+              }
+              if (scenario === "persisted_directory_fsync" && persistedRenamed && metadata.isDirectory()) {
+                process.exit(100);
+              }
+              if (scenario === "cleanup_directory_fsync" && cleanupUnlinked && metadata.isDirectory()) {
+                process.exit(97);
+              }
+            },
+            renameMovementTurnPreparationSync(from, to) {
+              fs.renameSync(from, to);
+              preparationRenames++;
+              if (preparationRenames === 2 && scenario === "applied_rename") process.exit(93);
+              if (preparationRenames === 2 && scenario === "applied_directory_fsync") appliedRenamed = true;
+              if (preparationRenames === 3 && scenario === "persisted_rename") process.exit(99);
+              if (preparationRenames === 3 && scenario === "persisted_directory_fsync") persistedRenamed = true;
+            },
+            unlinkMovementTurnPreparationSync(file) {
+              fs.unlinkSync(file);
+              if (scenario === "after_unlink") process.exit(96);
+              if (scenario === "cleanup_directory_fsync") cleanupUnlinked = true;
+            },
+          });
+          const input = {
+            streamId: movementTurnJournalStreamId(
+              "player-1",
+              movementJournalRunId("a".repeat(64)),
+              authority,
+            ),
+            operationId: "00000000-0000-4000-8000-000000000018",
+            command: { type: "move", dx: 1, dy: 0 },
+            beforeState,
+            turn: {
+              command: { type: "advance_turn", action: "other" },
+              beforeState: {
+                turns: 0,
+                depth: 1,
+                hunger: 800,
+                maxHunger: 1000,
+                hungerState: "normal",
+                hp: 20,
+                alive: true,
+              },
+            },
+          };
+          journal.prepareMovementTurn(input);
+          journal.appendMovementTurn(input);
+          journal.markMovementTurnApplied(input);
+          if (scenario === "after_applied") process.exit(95);
+          journal.markMovementTurnPersistenceCommitted(input);
+          if (scenario === "after_persisted") process.exit(101);
+          journal.completeMovementTurnPreparation(input);
+          throw new Error("scenario did not terminate at its crash boundary");
+        `,
+        directory,
+        scenario.name,
+      ], { cwd: process.cwd(), encoding: "utf8" });
+      expect(child.status, `${scenario.name}: ${child.stderr}`).toBe(scenario.status);
+
+      const restarted = new OriginGameplayJournal(directory);
+      expect(restarted.hasPendingMovementTurn(), scenario.name).toBe(scenario.pending);
+      const turnDirectory = path.join(directory, "movement-turn-v1");
+      expect(fs.readdirSync(turnDirectory).filter((name) => name.endsWith(".tmp")), scenario.name)
+        .toEqual([]);
+      expect(fs.existsSync(path.join(turnDirectory, ".movement-turn-preparation-v1.json")), scenario.name)
+        .toBe(scenario.pending);
+    }
+  }, 30_000);
+
+  it("fails closed on insecure preparation temp state and preserves the survivor", () => {
+    if (process.platform === "win32") return;
+    const cases = [
+      { name: "oversized", create: (file: string) => fs.writeFileSync(file, "x".repeat(513), { mode: 0o600 }) },
+      { name: "permissive", create: (file: string) => fs.writeFileSync(file, "prepared\n", { mode: 0o644 }) },
+      { name: "symlink", create: (file: string) => fs.symlinkSync(path.join(path.dirname(file), "missing"), file) },
+    ];
+    for (const candidate of cases) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grokhack-preparation-temp-${candidate.name}-`));
+      directories.push(directory);
+      const turnDirectory = path.join(directory, "movement-turn-v1");
+      fs.mkdirSync(turnDirectory, { recursive: true, mode: 0o700 });
+      const temporary = path.join(turnDirectory, ".movement-turn-preparation-v1.tmp");
+      candidate.create(temporary);
+      const value = new OriginGameplayJournal(directory);
+      expect(value.hasPendingMovementTurn()).toBe(true);
+      expect(() => value.prepareMovementTurn(movementTurnInput()))
+        .toThrow("movement_turn_preparation_temp_corrupt");
+      expect(fs.lstatSync(temporary)).toBeDefined();
+    }
+  });
+
+  it("fails closed on malformed, oversized, insecure, and symlinked preparation markers", () => {
+    const cases = [
+      { name: "malformed", payload: "not-json\n", mode: 0o600 },
+      { name: "oversized", payload: "x".repeat(513), mode: 0o600 },
+      ...(process.platform === "win32"
+        ? []
+        : [{ name: "permissive", payload: "{}\n", mode: 0o644 }]),
+    ];
+    for (const candidate of cases) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grokhack-preparation-${candidate.name}-`));
+      directories.push(directory);
+      const turnDirectory = path.join(directory, "movement-turn-v1");
+      fs.mkdirSync(turnDirectory, { mode: 0o700 });
+      fs.writeFileSync(path.join(turnDirectory, ".movement-turn-preparation-v1.json"), candidate.payload, {
+        mode: candidate.mode,
+      });
+      const value = new OriginGameplayJournal(directory);
+      expect(value.hasPendingMovementTurn()).toBe(true);
+      expect(() => value.prepareMovementTurn(movementTurnInput()))
+        .toThrow("movement_turn_preparation_corrupt");
+    }
+
+    if (process.platform !== "win32") {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-symlink-"));
+      directories.push(directory);
+      const turnDirectory = path.join(directory, "movement-turn-v1");
+      fs.mkdirSync(turnDirectory, { mode: 0o700 });
+      const marker = path.join(turnDirectory, ".movement-turn-preparation-v1.json");
+      fs.symlinkSync(path.join(directory, "missing-marker-target"), marker);
+      const value = new OriginGameplayJournal(directory);
+      expect(value.hasPendingMovementTurn()).toBe(true);
+      expect(() => value.prepareMovementTurn(movementTurnInput()))
+        .toThrow("movement_turn_preparation_corrupt");
+      expect(fs.lstatSync(marker).isSymbolicLink()).toBe(true);
+    }
+  });
+
+  it("fails closed at preparation write/fsync boundaries and retries unlink acknowledgement loss", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-preparation-faults-"));
+    directories.push(directory);
+    let failPreparationWrite = false;
+    let failPreparationFsync = false;
+    let failDirectoryFsyncAfterCommit = false;
+    const value = new OriginGameplayJournal(directory, {
+      writeSync: (descriptor, buffer, offset, length) => {
+        const payload = Buffer.from(buffer).toString("utf8");
+        if (failPreparationWrite && payload.includes('"streamId":"turn_')) {
+          failPreparationWrite = false;
+          throw new Error("injected preparation write failure");
+        }
+        return fs.writeSync(descriptor, buffer, offset, length);
+      },
+      fsyncSync: (descriptor) => {
+        const metadata = fs.fstatSync(descriptor);
+        if (failPreparationFsync && metadata.isFile() && metadata.size > 0 &&
+            metadata.size <= 512) {
+          failPreparationFsync = false;
+          throw new Error("injected preparation fsync failure");
+        }
+        fs.fsyncSync(descriptor);
+        if (failDirectoryFsyncAfterCommit && metadata.isDirectory()) {
+          failDirectoryFsyncAfterCommit = false;
+          throw new Error("injected preparation directory fsync acknowledgement loss");
+        }
+      },
+    });
+    const prime = movementTurnInput("00000000-0000-4000-8000-00000000000b");
+    value.prepareMovementTurn(prime);
+    expect(value.appendMovementTurn(prime).status).toBe("appended");
+    value.markMovementTurnApplied(prime);
+    value.markMovementTurnPersistenceCommitted(prime);
+    value.completeMovementTurnPreparation(prime);
+
+    const writeFailure = movementTurnInput("00000000-0000-4000-8000-00000000000c");
+    failPreparationWrite = true;
+    expect(() => value.prepareMovementTurn(writeFailure)).toThrow("injected preparation write failure");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+
+    const fsyncFailure = movementTurnInput("00000000-0000-4000-8000-00000000000d");
+    failPreparationFsync = true;
+    expect(() => value.prepareMovementTurn(fsyncFailure)).toThrow("injected preparation fsync failure");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+
+    const prepareAckLoss = movementTurnInput("00000000-0000-4000-8000-00000000000e");
+    failDirectoryFsyncAfterCommit = true;
+    expect(() => value.prepareMovementTurn(prepareAckLoss))
+      .toThrow("injected preparation directory fsync acknowledgement loss");
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    value.prepareMovementTurn(prepareAckLoss);
+    expect(value.appendMovementTurn(prepareAckLoss).status).toBe("appended");
+    value.markMovementTurnApplied(prepareAckLoss);
+    value.markMovementTurnPersistenceCommitted(prepareAckLoss);
+
+    failDirectoryFsyncAfterCommit = true;
+    expect(() => value.completeMovementTurnPreparation(prepareAckLoss))
+      .toThrow("injected preparation directory fsync acknowledgement loss");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    value.completeMovementTurnPreparation(prepareAckLoss);
+  });
+
+  it("keeps the prepared fence when the origin-applied phase write fails", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-applied-write-"));
+    directories.push(directory);
+    let failAppliedWrite = false;
+    const value = new OriginGameplayJournal(directory, {
+      writeSync: (descriptor, buffer, offset, length) => {
+        const payload = Buffer.from(buffer).toString("utf8");
+        if (failAppliedWrite && payload.includes('"state":"origin_applied"')) {
+          failAppliedWrite = false;
+          throw new Error("injected origin-applied marker write failure");
+        }
+        return fs.writeSync(descriptor, buffer, offset, length);
+      },
+    });
+    const input = movementTurnInput("00000000-0000-4000-8000-000000000017");
+    value.prepareMovementTurn(input);
+    expect(value.appendMovementTurn(input).status).toBe("appended");
+
+    failAppliedWrite = true;
+    expect(() => value.markMovementTurnApplied(input))
+      .toThrow("injected origin-applied marker write failure");
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    expect(() => value.completeMovementTurnPreparation(input))
+      .toThrow("movement_turn_origin_not_applied");
+
+    value.markMovementTurnApplied(input);
+    value.markMovementTurnPersistenceCommitted(input);
+    value.completeMovementTurnPreparation(input);
+    expect(new OriginGameplayJournal(directory).hasPendingMovementTurn()).toBe(false);
+  });
+
+  it("fails closed across preparation rename and unlink acknowledgement boundaries", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-rename-unlink-"));
+    directories.push(directory);
+    let renameFailure: "before" | "after" | null = null;
+    let unlinkFailure: "before" | "after" | null = null;
+    const value = new OriginGameplayJournal(directory, {
+      renameMovementTurnPreparationSync: (from, to) => {
+        if (renameFailure === "before") {
+          renameFailure = null;
+          throw new Error("injected preparation rename failure");
+        }
+        fs.renameSync(from, to);
+        if (renameFailure === "after") {
+          renameFailure = null;
+          throw new Error("injected preparation rename acknowledgement loss");
+        }
+      },
+      unlinkMovementTurnPreparationSync: (file) => {
+        if (unlinkFailure === "before") {
+          unlinkFailure = null;
+          throw new Error("injected preparation unlink failure");
+        }
+        fs.unlinkSync(file);
+        if (unlinkFailure === "after") {
+          unlinkFailure = null;
+          throw new Error("injected preparation unlink acknowledgement loss");
+        }
+      },
+    });
+    const first = movementTurnInput("00000000-0000-4000-8000-000000000011");
+
+    renameFailure = "before";
+    expect(() => value.prepareMovementTurn(first)).toThrow("injected preparation rename failure");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    expect(fs.readdirSync(path.join(directory, "movement-turn-v1"))).toEqual([]);
+
+    renameFailure = "after";
+    expect(() => value.prepareMovementTurn(first))
+      .toThrow("injected preparation rename acknowledgement loss");
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    expect(() => value.prepareMovementTurn(first)).not.toThrow();
+    expect(value.appendMovementTurn(first).status).toBe("appended");
+    value.markMovementTurnApplied(first);
+    value.markMovementTurnPersistenceCommitted(first);
+
+    unlinkFailure = "before";
+    expect(() => value.completeMovementTurnPreparation(first))
+      .toThrow("injected preparation unlink failure");
+    // The persistence-committed phase proves every bound state write
+    // acknowledged, so a status/restart path may safely finish cleanup.
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    value.completeMovementTurnPreparation(first);
+    expect(value.hasPendingMovementTurn()).toBe(false);
+
+    const second = {
+      ...movementTurnInput("00000000-0000-4000-8000-000000000012"),
+      beforeState: movementBefore({ x: 9 }),
+      turn: {
+        command: { type: "advance_turn", action: "other" } as const,
+        beforeState: initial({ turns: 1, hunger: 798 }),
+      },
+    };
+    value.prepareMovementTurn(second);
+    expect(value.appendMovementTurn(second).status).toBe("appended");
+    value.markMovementTurnApplied(second);
+    value.markMovementTurnPersistenceCommitted(second);
+    unlinkFailure = "after";
+    expect(() => value.completeMovementTurnPreparation(second))
+      .toThrow("injected preparation unlink acknowledgement loss");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    expect(() => value.completeMovementTurnPreparation(second)).not.toThrow();
+  });
+
+  it("segments movement-turn evidence without per-entry file amplification", () => {
+    const { directory, value } = journal();
+    const streamId = movementTurnJournalStreamId("bounded-player", movementRunId, movementAuthority);
+    const blocked = movementBefore({
+      destination: { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    });
+    for (let index = 1; index <= 65; index++) {
+      expect(value.appendMovementTurn({
+        streamId,
+        operationId: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+        command: { type: "move", dx: 1, dy: 0 },
+        beforeState: blocked,
+        turn: null,
+      }).status).toBe("appended");
+    }
+    const movementTurnDirectory = path.join(directory, "movement-turn-v1");
+    const files = fs.readdirSync(movementTurnDirectory);
+    expect(files.filter((name) => name.endsWith(".jsonl"))).toHaveLength(2);
+    expect(files.filter((name) => name.endsWith(".commits"))).toHaveLength(2);
+    expect(files).toHaveLength(4);
+    expect(files.reduce((bytes, name) => bytes + fs.statSync(path.join(movementTurnDirectory, name)).size, 0))
+      .toBeLessThan(2 * 1024 * 1024);
+    expect(files.every((name) => (fs.statSync(path.join(movementTurnDirectory, name)).mode & 0o077) === 0))
+      .toBe(true);
+    expect(value.readMovementTurnsAfter(streamId, 0, 64)).toHaveLength(64);
+    expect(value.readMovementTurnsAfter(streamId, 64, 64)).toHaveLength(1);
+  });
+
+  it("repairs an uncommitted movement-turn data write without exposing either nested entry", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-commit-"));
+    directories.push(directory);
+    let failCommit = false;
+    const value = new OriginGameplayJournal(directory, {
+      writeSync: (descriptor, buffer, offset, length) => {
+        if (failCommit && buffer.byteLength === 1) throw new Error("injected movement-turn commit failure");
+        return fs.writeSync(descriptor, buffer, offset, length);
+      },
+    });
+    value.appendTransition({
+      streamId: "movement-turn-prime",
+      command: { type: "advance_turn", action: "wait" },
+      beforeState: initial(),
+    });
+    const input = movementTurnInput();
+    failCommit = true;
+    expect(() => value.appendMovementTurn(input)).toThrow("injected movement-turn commit failure");
+    expect(new OriginGameplayJournal(directory).readMovementTurnsAfter(input.streamId, 0, 64)).toEqual([]);
+    failCommit = false;
+    expect(value.appendMovementTurn(input).status).toBe("appended");
+    expect(value.readMovementTurnsAfter(input.streamId, 0, 64)).toHaveLength(1);
+  });
+
+  it("recovers movement-turn data-fsync failure and commit-fsync acknowledgement loss", () => {
+    const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-data-fsync-"));
+    directories.push(dataDirectory);
+    let failDataFsync = false;
+    const dataJournal = new OriginGameplayJournal(dataDirectory, {
+      fsyncSync: (descriptor) => {
+        const metadata = fs.fstatSync(descriptor);
+        if (failDataFsync && metadata.isFile() && metadata.size > 128) {
+          failDataFsync = false;
+          throw new Error("injected movement-turn data fsync failure");
+        }
+        fs.fsyncSync(descriptor);
+      },
+    });
+    dataJournal.appendTransition({
+      streamId: "movement-turn-data-prime",
+      command: { type: "advance_turn", action: "wait" },
+      beforeState: initial(),
+    });
+    const dataInput = movementTurnInput();
+    failDataFsync = true;
+    expect(() => dataJournal.appendMovementTurn(dataInput)).toThrow("injected movement-turn data fsync failure");
+    expect(new OriginGameplayJournal(dataDirectory).readMovementTurnsAfter(dataInput.streamId, 0, 64)).toEqual([]);
+    expect(dataJournal.appendMovementTurn(dataInput).status).toBe("appended");
+
+    const commitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-commit-fsync-"));
+    directories.push(commitDirectory);
+    let failCommitFsync = false;
+    const commitJournal = new OriginGameplayJournal(commitDirectory, {
+      maxMovementEntries: 1,
+      maxGameplayEntries: 1,
+      fsyncSync: (descriptor) => {
+        const metadata = fs.fstatSync(descriptor);
+        fs.fsyncSync(descriptor);
+        if (failCommitFsync && metadata.isFile() && metadata.size === 1) {
+          failCommitFsync = false;
+          throw new Error("injected movement-turn commit fsync acknowledgement loss");
+        }
+      },
+    });
+    const commitInput = movementTurnInput("00000000-0000-4000-8000-000000000003");
+    failCommitFsync = true;
+    expect(() => commitJournal.appendMovementTurn(commitInput))
+      .toThrow("injected movement-turn commit fsync acknowledgement loss");
+    expect(new OriginGameplayJournal(commitDirectory).readMovementTurnsAfter(commitInput.streamId, 0, 64))
+      .toHaveLength(1);
+    expect(commitJournal.appendMovementTurn(commitInput).status).toBe("duplicate");
+  });
+
+  it("recovers atomically when the writer process crashes around the movement-turn commit barrier", () => {
+    const crashWriter = `
+      import fs from "node:fs";
+      import { OriginGameplayJournal } from "./server/origin-journal.ts";
+      const crashPoint = process.env.CRASH_POINT;
+      const value = new OriginGameplayJournal(process.env.JOURNAL_DIR, {
+        writeSync: (descriptor, buffer, offset, length) => {
+          if (crashPoint === "before_commit_write" && buffer.byteLength === 1) process.exit(81);
+          return fs.writeSync(descriptor, buffer, offset, length);
+        },
+        fsyncSync: (descriptor) => {
+          fs.fsyncSync(descriptor);
+          if (crashPoint === "after_commit_fsync" && fs.fstatSync(descriptor).isFile() &&
+              fs.fstatSync(descriptor).size === 1) process.exit(82);
+        },
+      });
+      value.appendMovementTurn(JSON.parse(process.env.MOVEMENT_TURN_INPUT));
+    `;
+    const runCrash = (directory: string, crashPoint: string, input: ReturnType<typeof movementTurnInput>) =>
+      spawnSync(process.execPath, ["--import", "tsx", "-e", crashWriter], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          CRASH_POINT: crashPoint,
+          JOURNAL_DIR: directory,
+          MOVEMENT_TURN_INPUT: JSON.stringify(input),
+        },
+        encoding: "utf8",
+      });
+
+    const preCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-precommit-crash-"));
+    directories.push(preCommitDirectory);
+    const preCommitInput = movementTurnInput("00000000-0000-4000-8000-000000000006");
+    const preCommitCrash = runCrash(preCommitDirectory, "before_commit_write", preCommitInput);
+    expect({ status: preCommitCrash.status, stderr: preCommitCrash.stderr }).toEqual({ status: 81, stderr: "" });
+    const preCommitRestart = new OriginGameplayJournal(preCommitDirectory);
+    expect(preCommitRestart.appendMovementTurn(preCommitInput).status).toBe("appended");
+    expect(preCommitRestart.readMovementTurnsAfter(preCommitInput.streamId, 0, 64))
+      .toEqual([expect.objectContaining({ movement: expect.any(Object), turn: expect.any(Object) })]);
+
+    const postCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-postcommit-crash-"));
+    directories.push(postCommitDirectory);
+    const postCommitInput = movementTurnInput("00000000-0000-4000-8000-000000000007");
+    const postCommitCrash = runCrash(postCommitDirectory, "after_commit_fsync", postCommitInput);
+    expect({ status: postCommitCrash.status, stderr: postCommitCrash.stderr }).toEqual({ status: 82, stderr: "" });
+    const postCommitRestart = new OriginGameplayJournal(postCommitDirectory);
+    expect(postCommitRestart.appendMovementTurn(postCommitInput).status).toBe("duplicate");
+    expect(postCommitRestart.readMovementTurnsAfter(postCommitInput.streamId, 0, 64))
+      .toEqual([expect.objectContaining({ movement: expect.any(Object), turn: expect.any(Object) })]);
+  });
+
+  it("keeps the preparation poison across crashes before mutation and after envelope commit", () => {
+    const crashWriter = `
+      import { OriginGameplayJournal } from "./server/origin-journal.ts";
+      const value = new OriginGameplayJournal(process.env.JOURNAL_DIR);
+      const input = JSON.parse(process.env.MOVEMENT_TURN_INPUT);
+      value.prepareMovementTurn(input);
+      if (process.env.CRASH_POINT === "after_prepare") process.exit(83);
+      value.appendMovementTurn(input);
+      if (process.env.CRASH_POINT === "after_envelope_commit") process.exit(84);
+    `;
+    const runCrash = (directory: string, crashPoint: string, input: ReturnType<typeof movementTurnInput>) =>
+      spawnSync(process.execPath, ["--import", "tsx", "-e", crashWriter], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          CRASH_POINT: crashPoint,
+          JOURNAL_DIR: directory,
+          MOVEMENT_TURN_INPUT: JSON.stringify(input),
+        },
+        encoding: "utf8",
+      });
+
+    const preMutationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-prepared-crash-"));
+    directories.push(preMutationDirectory);
+    const preMutationInput = movementTurnInput("00000000-0000-4000-8000-00000000000f");
+    const preMutationCrash = runCrash(preMutationDirectory, "after_prepare", preMutationInput);
+    expect({ status: preMutationCrash.status, stderr: preMutationCrash.stderr })
+      .toEqual({ status: 83, stderr: "" });
+    const preMutationRestart = new OriginGameplayJournal(preMutationDirectory);
+    expect(preMutationRestart.hasPendingMovementTurn()).toBe(true);
+    expect(preMutationRestart.readMovementTurnsAfter(preMutationInput.streamId, 0, 64)).toEqual([]);
+
+    const postCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-turn-prepared-postcommit-"));
+    directories.push(postCommitDirectory);
+    const postCommitInput = movementTurnInput("00000000-0000-4000-8000-000000000010");
+    const postCommitCrash = runCrash(postCommitDirectory, "after_envelope_commit", postCommitInput);
+    expect({ status: postCommitCrash.status, stderr: postCommitCrash.stderr })
+      .toEqual({ status: 84, stderr: "" });
+    const postCommitRestart = new OriginGameplayJournal(postCommitDirectory);
+    expect(postCommitRestart.hasPendingMovementTurn()).toBe(true);
+    expect(postCommitRestart.readMovementTurnsAfter(postCommitInput.streamId, 0, 64)).toHaveLength(1);
+  });
+
+  it("rejects no-turn carried-state jumps while preserving the last turn hash across no-turn envelopes", () => {
+    const { directory, value } = journal();
+    const streamId = movementTurnJournalStreamId("blocked-player", movementRunId, movementAuthority);
+    const first = value.appendMovementTurn({
+      ...movementTurnInput("00000000-0000-4000-8000-000000000004"),
+      streamId,
+    });
+    if (first.status === "dropped_capacity") throw new Error("unexpected movement-turn capacity");
+    const blocked = movementBefore({
+      x: 9,
+      destination: { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    });
+    expect(value.appendMovementTurn({
+      streamId,
+      operationId: "00000000-0000-4000-8000-000000000005",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: blocked,
+      turn: null,
+    }).status).toBe("appended");
+    expect(value.appendMovementTurn({
+      ...movementTurnInput("00000000-0000-4000-8000-000000000006"),
+      streamId,
+      beforeState: movementBefore({ x: 9 }),
+      turn: {
+        command: { type: "advance_turn", action: "other" },
+        beforeState: initial({ turns: 1, hunger: 798 }),
+      },
+    }).status).toBe("appended");
+    const restarted = new OriginGameplayJournal(directory).readMovementTurnsAfter(streamId, 0, 64);
+    expect(restarted).toHaveLength(3);
+    expect(restarted[1]?.turn).toBeNull();
+    expect(restarted[2]?.turn?.previousEntryHash).toBe(first.envelope.turn?.entryHash);
+
+    const jumpStreamId = movementTurnJournalStreamId("jump-player", movementRunId, movementAuthority);
+    expect(() => value.appendMovementTurn({
+      streamId: jumpStreamId,
+      operationId: "00000000-0000-4000-8000-000000000007",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: blocked,
+      turn: null,
+    })).not.toThrow();
+    expect(() => value.appendMovementTurn({
+      streamId: jumpStreamId,
+      operationId: "00000000-0000-4000-8000-000000000008",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: { ...blocked, x: 40 },
+      turn: null,
+    })).toThrow("movement_turn_state_continuity_mismatch");
+    expect(value.readMovementTurnsAfter(jumpStreamId, 0, 64)).toHaveLength(1);
   });
 
   it("persists floor authority across benign restart and rotates only for regeneration", () => {
@@ -850,7 +1752,8 @@ describe("OriginGameplayJournal", () => {
     const child = spawnSync(
       process.execPath,
       [
-        path.join(process.cwd(), "node_modules/tsx/dist/cli.mjs"),
+        "--import",
+        "tsx",
         "-e",
         "import { OriginGameplayJournal } from './server/origin-journal.ts'; " +
           "const rows = new OriginGameplayJournal(process.env.JOURNAL_DIR).readAfter('online-catchup', 0, 64); " +
@@ -1200,11 +2103,18 @@ describe("OriginGameplayJournal", () => {
         path.join(reusedPidDirectory, reusedPidOwner),
         path.join(reusedPidDirectory, ".origin-journal-writer-v1.lock"),
       );
-      expect(new OriginGameplayJournal(reusedPidDirectory).appendTransition({
+      const appendWithReusedPid = () => new OriginGameplayJournal(reusedPidDirectory).appendTransition({
         streamId: "reused-pid-owner",
-        command: { type: "advance_turn", action: "wait" },
+        command: { type: "advance_turn", action: "wait" } as const,
         beforeState: initial(),
-      }).status).toBe("appended");
+      });
+      const startIdentityProbe = spawnSync(
+        "ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8" },
+      );
+      const startIdentityAvailable = process.platform === "linux" ||
+        (typeof startIdentityProbe.stdout === "string" && startIdentityProbe.stdout.trim().length > 0);
+      if (startIdentityAvailable) expect(appendWithReusedPid().status).toBe("appended");
+      else expect(appendWithReusedPid).toThrow("journal_writer_already_active");
     }
 
     const contendedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-contended-owner-"));

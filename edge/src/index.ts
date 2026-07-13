@@ -15,7 +15,13 @@ import { FloorInstance } from "./floor-instance";
 import { PlayerSession } from "./player-session";
 import { RealmDirectory } from "./realm-directory";
 import { ShadowReplay } from "./shadow-replay";
-import { MAX_SHADOW_BATCH_BYTES, MAX_SHADOW_BATCH_ENTRIES, validateShadowJournalEntry, validateShadowRoute } from "../../src/shadow-journal";
+import {
+  MAX_SHADOW_BATCH_BYTES,
+  MAX_SHADOW_BATCH_ENTRIES,
+  validateMovementTurnEnvelope,
+  validateShadowJournalEntry,
+  validateShadowRoute,
+} from "../../src/shadow-journal";
 import {
   EDGE_PROTOCOL_VERSION,
   MAX_ROUTE_TICKET_BYTES,
@@ -161,25 +167,39 @@ export async function routeShadowCatchup(request: Request, env: Env, config: Edg
   let candidate: unknown;
   try { candidate = JSON.parse(text); } catch { return json({ code: "malformed_json" }, 400); }
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return json({ code: "invalid_batch" }, 400);
-  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown };
-  if (batch.v !== 1 || !Array.isArray(batch.entries) || batch.entries.length < 1) return json({ code: "invalid_batch" }, 400);
-  if (batch.entries.length > MAX_SHADOW_BATCH_ENTRIES) return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429, { "Retry-After": "1" });
+  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown; envelopes?: unknown };
+  const hasEntries = Array.isArray(batch.entries);
+  const hasEnvelopes = Array.isArray(batch.envelopes);
+  if (batch.v !== 1 || hasEntries === hasEnvelopes ||
+      (hasEntries && batch.envelopes !== undefined) ||
+      (hasEnvelopes && batch.entries !== undefined)) {
+    return json({ code: "invalid_batch" }, 400);
+  }
+  const rawRecords = hasEnvelopes ? batch.envelopes as unknown[] : batch.entries as unknown[];
+  if (rawRecords.length < 1) return json({ code: "invalid_batch" }, 400);
+  if (rawRecords.length > MAX_SHADOW_BATCH_ENTRIES) {
+    return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429, { "Retry-After": "1" });
+  }
   let route;
-  let entries;
+  let records;
   try {
     route = validateShadowRoute(batch.route);
-    entries = batch.entries.map(validateShadowJournalEntry);
+    records = hasEnvelopes
+      ? rawRecords.map(validateMovementTurnEnvelope)
+      : rawRecords.map(validateShadowJournalEntry);
   } catch (error) {
     return json({ code: error instanceof Error ? error.message : "invalid_batch", checkpoint: 0 }, 400);
   }
-  if (entries.some((entry) => entry.streamId !== entries[0]!.streamId)) return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
-  const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${entries[0]!.streamId}`;
+  if (records.some((record) => record.streamId !== records[0]!.streamId)) {
+    return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
+  }
+  const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${records[0]!.streamId}`;
   const replay = env.SHADOW_REPLAYS.get(env.SHADOW_REPLAYS.idFromName(name));
   try {
     return await replay.fetch("https://shadow.internal/catch-up", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ route, entries }),
+      body: JSON.stringify(hasEnvelopes ? { route, envelopes: records } : { route, entries: records }),
     });
   } catch (error) {
     const failure = durableObjectFailure(error);

@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { MovementState } from "./movement-reducer.js";
 import {
+  createMovementTurnEnvelope,
   createShadowJournalEntry,
+  movementTurnEnvelopeHash,
   shadowEntryHash,
+  validateMovementTurnEnvelope,
   validateShadowJournalEntry,
 } from "./shadow-journal.js";
 
@@ -62,5 +65,60 @@ describe("movement shadow journal envelope", () => {
     expect(() => validateShadowJournalEntry(badState)).toThrow("invalid_movement_state");
     const badContinuity = { ...entry, beforeContinuityHash: "0000000000000000" };
     expect(() => validateShadowJournalEntry(badContinuity)).toThrow("before_continuity_hash_mismatch");
+  });
+
+  it("binds an effectful movement and its turn proof into one immutable envelope", () => {
+    const envelope = createMovementTurnEnvelope({
+      streamId: `turn_${"a".repeat(48)}`,
+      cursor: 1,
+      operationId: "00000000-0000-4000-8000-000000000001",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState(),
+      turn: {
+        command: { type: "advance_turn", action: "other" },
+        beforeState: {
+          turns: 0,
+          depth: 1,
+          hunger: 800,
+          maxHunger: 1000,
+          hungerState: "normal",
+          hp: 20,
+          alive: true,
+        },
+      },
+    });
+    expect(envelope).toMatchObject({
+      v: 1,
+      kind: "movement_turn",
+      cursor: 1,
+      movement: { v: 2, cursor: 1 },
+      turn: { v: 1, cursor: 1, terminal: false },
+      previousEnvelopeHash: null,
+    });
+    expect(validateMovementTurnEnvelope(JSON.parse(JSON.stringify(envelope)) as unknown)).toEqual(envelope);
+  });
+
+  it("requires a turn proof exactly when the movement consumes a turn and rejects envelope tampering", () => {
+    const base = {
+      streamId: `turn_${"b".repeat(48)}`,
+      cursor: 1,
+      operationId: "00000000-0000-4000-8000-000000000002",
+      command: { type: "move", dx: 1, dy: 0 } as const,
+    };
+    const missingTurn = createMovementTurnEnvelope({ ...base, beforeState: movementState() });
+    expect(() => validateMovementTurnEnvelope(missingTurn)).toThrow("movement_turn_pair_mismatch");
+
+    const blocked = createMovementTurnEnvelope({
+      ...base,
+      beforeState: movementState({ destination: { tile: "#", occupant: "none", trap: false, stairsDown: false } }),
+    });
+    expect(validateMovementTurnEnvelope(blocked).turn).toBeNull();
+    const tampered = { ...blocked, operationId: "00000000-0000-4000-8000-000000000003" };
+    expect(() => validateMovementTurnEnvelope(tampered)).toThrow("movement_turn_envelope_hash_mismatch");
+    const unsigned = { ...tampered };
+    delete (unsigned as { envelopeHash?: string }).envelopeHash;
+    const rehashed = { ...tampered, envelopeHash: movementTurnEnvelopeHash(unsigned) };
+    expect(validateMovementTurnEnvelope(rehashed).operationId).toBe(tampered.operationId);
+    expect(() => validateMovementTurnEnvelope({ ...blocked, v: 2 })).toThrow("invalid_movement_turn_envelope");
   });
 });

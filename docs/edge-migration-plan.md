@@ -117,11 +117,86 @@ those boundaries cannot become strict until their reducers are shared.
 V2 remains undeployed and is establishing its initial merge contract in this
 branch; predecessor feature-branch V2 artifacts without continuity fields are
 not compatible. V1 is the only historical production-shaped format whose bytes
-are frozen.
-The movement decision is recorded before origin mutation so a failed first
-append cannot partially move or pick up an item. Turn-consuming paths retain the
-existing V1 vitals follow-up. These two fsynced records are not yet one atomic
-transaction; the transactional outbox remains required before authority transfer.
+are frozen. An additive movement-turn envelope leaves both nested formats and
+their hashes unchanged: it carries exactly one V2 movement decision and, when
+that decision consumes a turn, its V1 turn/vitals follow-up. A no-turn decision
+has an explicit null V1 member.
+
+The origin publishes that pair as one owner-only JSONL envelope in the dedicated
+`movement-turn-v1` journal. The complete envelope line is appended and fsynced,
+then one byte is appended and fsynced in the segment's commit sidecar. Readers
+expose only the sidecar-committed prefix, so a crash before the commit byte makes
+neither nested record visible and acknowledgement loss after the committed byte
+is recovered as an idempotent duplicate. Envelope, movement, and V1 chains are
+validated independently without changing the frozen standalone V1 or V2 wire
+formats.
+
+The isolated edge copier submits whole envelopes. `ShadowReplay` validates both
+nested transitions and commits the envelope receipt, V2 movement state, optional
+V1 vitals state, checkpoint, and any resulting divergence in one Durable Object
+SQL transaction. Re-sending the exact operation after response loss is
+idempotent; conflicting operation reuse, gap, reorder, stale checkpoint, chain
+break, or partial/corrupt envelope fails closed without advancing the
+checkpoint. A successful response includes the durable checkpoint's envelope
+hash as well as both nested state heads. If the Worker is already ahead of the
+copier's first page after a restart, the copier advances only after the local
+immutable journal proves that exact envelope hash, terminal bit, and nested
+state hashes; an unprovable ahead checkpoint fails closed.
+
+For message-only/no-turn decisions, a failed envelope append still stops before
+origin mutation. Before any turn-consuming movement mutates origin state, the
+single writer durably replaces one mode-0600, at-most-512-byte preparation file
+through one fixed temporary file, write, file fsync, rename, and directory fsync.
+Cold recovery removes only validated fixed or legacy pre-rename temporary files;
+ambiguous, insecure, oversized, or symlinked temp state stays fail-closed. The
+fixed path is probed directly on the hot path. Legacy random names are scanned
+once per shared journal state, with at most 64 candidates eligible for cleanup;
+an excessive legacy inventory is preserved and fences parity instead of causing
+unbounded unlink work. The
+preparation binds the stream, operation, expected cursor, prior envelope hash,
+and exact provisional movement-entry hash. An unresolved preparation is never
+overwritten or cleared by a different operation.
+
+A turn-consuming movement cannot construct its V1 member until the origin's
+post-effect vitals are known. The origin therefore mutates, applies the narrow V1
+turn/vitals reducer fields, appends the combined envelope, and finishes the
+remaining synchronous origin turn effects. Only then does it durably rewrite the
+marker to `origin_applied` and immediately enqueue snapshots of the player and
+every affected source/destination floor through DuckDB's ordered persistence
+queue. All writes are allowed to settle even when one rejects, so the admission
+latch cannot reopen while a later queued floor write is still running. Only
+after every write succeeds does the handler durably advance the marker to
+`persistence_committed`; unlink plus directory fsync then completes cleanup. A
+cold process may reconcile that final phase only when the matching immutable
+envelope exists. `prepared` and `origin_applied` remain poison because neither
+proves the state rows committed. While persistence is pending, the one global
+preparation slot rejects another movement without mutating origin state. A failed
+persistence acknowledgement retains the marker and keeps
+`shadowEvidenceDegraded` latched. Marker presence reconstructs that latch on
+restart; malformed, oversized, permissive, or symlinked marker/temp state fails
+closed. The handler retries ambiguous phase/cleanup acknowledgements. Graceful
+shutdown joins the in-flight chain and fails its durability barrier if poison
+remains. While latched, legacy origin gameplay
+remains available but later movement commands publish no new shadow envelopes,
+so they cannot hide or clear the older gap. A real two-process WorldServer/DuckDB
+regression terminates inside the persistence callback before acknowledgement and
+proves that stale persisted player state remains fenced rather than being
+mislabeled clean. This is bounded state-durability fencing and same-handler
+acknowledgement recovery, not automatic gameplay replay or rollback.
+
+This publication unit closes the V2-movement/V1-vitals shadow-evidence split and
+does not clear its durable fence until the movement's player and affected-floor
+snapshots commit. A transfer may therefore wait for the player, source floor,
+and destination floor rows. Those separate autocommits are ordered before
+cleanup but are not one DuckDB transaction: a partial failure remains visible
+and fenced rather than being declared clean. The floor serializer covers the
+dungeon, monsters, and items; trap/event runtime state is not yet durable. The
+unit is not atomic with score/chat effects, world
+metadata, the authority sidecar, or every other origin persistence side effect.
+Combat, monsters, item mutation, traps, room effects, and floor transfers are
+not yet complete shared-authority reducers. A transactional state/outbox
+boundary, recovery drills, and shared reducers for those effects remain required
+before authority transfer.
 Free wall/player rejections are evidence-sampled with a permanent 64-fingerprint
 budget per retained player and a hard global retained-player ceiling for the
 origin process lifetime. Repeats, new fingerprints beyond either cap, and new
@@ -131,10 +206,14 @@ Turn-consuming commands remain unsampled. This is bounded migration evidence,
 not an unbiased population sample: once the global cohort is full, later players
 produce no new no-turn samples until the origin process is replaced.
 V1 vitals and V2 movement each have a separate origin-wide ceiling of 4,096
-entries, and every serialized entry is limited to 8 KiB. New retained shadow
-payload is therefore capped at 32 MiB per domain across every player, run
-credential, floor, and authority rotation, plus at most 4 KiB of commit bytes per
-domain. Canonical committed segments are the only capacity ledger: the single
+entries. Standalone entries are limited to 8 KiB and an atomic movement-turn
+envelope is limited to 20 KiB. The enforced worst case is therefore at most
+112 MiB of retained record payload: 4,096 no-turn envelopes at the 20 KiB
+envelope ceiling plus 4,096 standalone V1 entries at 8 KiB. A workload made
+entirely of paired envelopes is capped at 80 MiB because each envelope consumes
+both counters. Commit sidecars add at most 8 KiB across both counters, and the
+single preparation file adds at most 512 bytes; fixed metadata and segment names
+add small bounded overhead. Canonical committed segments are the only capacity ledger: the single
 origin writer inventories and structurally validates their filenames, cursors,
 hash chains, terminal boundaries, and domain continuity before its first
 mutation, then reconciles them after an ambiguous append failure. No separately
@@ -169,6 +248,20 @@ It does not claim full-floor gameplay parity or edge movement authority: combat,
 monsters, item mutation, trap/room effects, durable position, and transfers must
 enter shared normalized reducers before their journals can satisfy the
 zero-divergence authority-transfer gate.
+
+The envelope route and its `ShadowReplay` schema are undeployed. No namespace or
+persisted-object migration is needed only if exact account/environment evidence
+confirms that no prior envelope-capable Worker or V2 shadow namespace was ever
+deployed. If that cannot be proved, adoption must use an expand/contract schema
+or a new Durable Object class/namespace and validate every existing object
+before traffic. Adoption additionally requires clean exact-head origin/edge
+parity and failure-injection proof, restart and response-loss recovery, a
+non-degraded origin, bounded catch-up, restore proof, and a fenced canary with no
+player reads served from shadow state. Rollback stops the copier and new shadow
+admission while leaving the Node/DuckDB authority unchanged; it must not delete
+origin envelopes or roll back Durable Object storage in place. Once edge state
+ever becomes authoritative, rollback must instead follow the version-affine
+drain-forward rules in Phase 5.
 
 Movement evidence is partitioned into an opaque character-run and
 authority-derived origin stream. A one-way digest of the 256-bit resume

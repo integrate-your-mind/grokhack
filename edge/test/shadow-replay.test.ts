@@ -2,13 +2,15 @@ import { env } from "cloudflare:workers";
 import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 
-import { reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
+import { gameplayStateHash, reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
 import { reduceMovement, type MovementState } from "../../src/movement-reducer";
 import {
   MAX_SHADOW_BATCH_BYTES,
+  createMovementTurnEnvelope,
   createShadowJournalEntry,
   shadowEntryHash,
   type GameplayShadowJournalEntry,
+  type MovementTurnEnvelope,
   type MovementShadowJournalEntry,
   type ShadowJournalEntry,
   type ShadowRoute,
@@ -79,11 +81,55 @@ function movementTrace(streamId: string, count: number): MovementShadowJournalEn
   return entries;
 }
 
+function movementTurnTrace(streamId: string, count: number): MovementTurnEnvelope[] {
+  const envelopes: MovementTurnEnvelope[] = [];
+  let movement = movementState();
+  // Long receipt-window traces exercise compaction, not terminal handling.
+  // Keep the fixture alive after hunger damage begins so cursor 300 is real.
+  let gameplay = initial({ hp: 1_000 });
+  let previousEnvelopeHash: string | null = null;
+  let previousMovementEntryHash: string | null = null;
+  let previousTurnEntryHash: string | null = null;
+  for (let cursor = 1; cursor <= count; cursor++) {
+    const command = { type: "move", dx: 1, dy: 0 } as const;
+    const turnCommand = { type: "advance_turn", action: "other" } as const;
+    const envelope = createMovementTurnEnvelope({
+      streamId,
+      cursor,
+      operationId: `00000000-0000-4000-8000-${cursor.toString(16).padStart(12, "0")}`,
+      command,
+      beforeState: movement,
+      turn: { command: turnCommand, beforeState: gameplay },
+      previousEnvelopeHash,
+      previousMovementEntryHash,
+      previousTurnEntryHash,
+    });
+    envelopes.push(envelope);
+    movement = reduceMovement(movement, command).state;
+    gameplay = reduceGameplay(gameplay, turnCommand).state;
+    previousEnvelopeHash = envelope.envelopeHash;
+    previousMovementEntryHash = envelope.movement.entryHash;
+    previousTurnEntryHash = envelope.turn!.entryHash;
+  }
+  return envelopes;
+}
+
 async function ingest(entries: readonly ShadowJournalEntry[], options: { secret?: string; batchRoute?: ShadowRoute; extra?: Record<string, unknown> } = {}): Promise<Response> {
   return SELF.fetch("https://edge.test/internal/shadow/catch-up", {
     method: "POST",
     headers: { Authorization: `Bearer ${options.secret ?? SECRET}`, "Content-Type": "application/json" },
     body: JSON.stringify({ v: 1, route: options.batchRoute ?? route, entries, ...options.extra }),
+  });
+}
+
+async function ingestMovementTurns(
+  envelopes: readonly MovementTurnEnvelope[],
+  options: { secret?: string; batchRoute?: ShadowRoute; extra?: Record<string, unknown> } = {},
+): Promise<Response> {
+  return SELF.fetch("https://edge.test/internal/shadow/catch-up", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${options.secret ?? SECRET}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ v: 1, route: options.batchRoute ?? route, envelopes, ...options.extra }),
   });
 }
 
@@ -94,6 +140,242 @@ function stubFor(streamId: string) {
 }
 
 describe("ShadowReplay catch-up", () => {
+  it("atomically replays movement-turn envelopes and deduplicates an exact retry across eviction", async () => {
+    const streamId = `turn_${"1".repeat(48)}`;
+    const envelopes = movementTurnTrace(streamId, 2);
+    const first = await ingestMovementTurns([envelopes[0]!]);
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toEqual({
+      streamId,
+      checkpoint: 1,
+      accepted: 1,
+      duplicates: 0,
+      terminal: false,
+      lastEnvelopeHash: envelopes[0]!.envelopeHash,
+      movementStateHash: envelopes[0]!.movement.afterStateHash,
+      turnStateHash: envelopes[0]!.turn!.afterStateHash,
+    });
+
+    await evictDurableObject(stubFor(streamId));
+    const retried = await ingestMovementTurns(envelopes);
+    expect(retried.status).toBe(200);
+    await expect(retried.json()).resolves.toMatchObject({
+      checkpoint: 2,
+      accepted: 1,
+      duplicates: 1,
+      movementStateHash: envelopes[1]!.movement.afterStateHash,
+      turnStateHash: envelopes[1]!.turn!.afterStateHash,
+    });
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) => ({
+      receipts: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_receipts WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+      checkpoint: state.storage.sql.exec<{ checkpoint: number }>(
+        "SELECT checkpoint FROM movement_turn_checkpoint WHERE stream_id = ?",
+        streamId,
+      ).one().checkpoint,
+    }))).resolves.toEqual({ receipts: 2, checkpoint: 2 });
+  });
+
+  it("preflights a complete envelope batch so a late chain failure commits no partial pair", async () => {
+    const streamId = `turn_${"2".repeat(48)}`;
+    const correct = movementTurnTrace(streamId, 2);
+    const badSecond = createMovementTurnEnvelope({
+      streamId,
+      cursor: 2,
+      operationId: "00000000-0000-4000-8000-000000000099",
+      command: correct[1]!.movement.command,
+      beforeState: correct[1]!.movement.beforeState,
+      turn: {
+        command: correct[1]!.turn!.command,
+        beforeState: correct[1]!.turn!.beforeState,
+      },
+      previousEnvelopeHash: "0000000000000000",
+      previousMovementEntryHash: correct[0]!.movement.entryHash,
+      previousTurnEntryHash: correct[0]!.turn!.entryHash,
+    });
+    const rejected = await ingestMovementTurns([correct[0]!, badSecond]);
+    expect(rejected.status).toBe(409);
+    await expect(rejected.json()).resolves.toMatchObject({
+      code: "envelope_hash_chain_mismatch",
+      checkpoint: 0,
+      cursor: 2,
+    });
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) => ({
+      receipts: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_receipts WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+      checkpoints: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_checkpoint WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+    }))).resolves.toEqual({ receipts: 0, checkpoints: 0 });
+    const gap = await ingestMovementTurns([correct[1]!]);
+    expect(gap.status).toBe(409);
+    await expect(gap.json()).resolves.toMatchObject({ code: "cursor_gap", checkpoint: 0, expectedCursor: 1 });
+    const reordered = await ingestMovementTurns([correct[1]!, correct[0]!]);
+    expect(reordered.status).toBe(409);
+    await expect(reordered.json()).resolves.toMatchObject({ code: "batch_out_of_order", checkpoint: 0 });
+    await expect((await ingestMovementTurns(correct)).json()).resolves.toMatchObject({
+      checkpoint: 2,
+      accepted: 2,
+      duplicates: 0,
+    });
+  });
+
+  it("rolls back receipts and checkpoint together when the edge SQL commit fails", async () => {
+    const streamId = `turn_${"3".repeat(48)}`;
+    const [envelope] = movementTurnTrace(streamId, 1);
+    const stub = stubFor(streamId);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(`CREATE TRIGGER fail_movement_turn_checkpoint
+        BEFORE INSERT ON movement_turn_checkpoint
+        BEGIN SELECT RAISE(ABORT, 'injected movement-turn checkpoint failure'); END`);
+    });
+    const failed = await ingestMovementTurns([envelope!]);
+    expect(failed.status).toBe(503);
+    await expect(failed.json()).resolves.toMatchObject({ code: "shadow_replay_unavailable" });
+    await expect(runInDurableObject(stub, (_instance, state) => ({
+      receipts: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_receipts WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+      checkpoints: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_checkpoint WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+    }))).resolves.toEqual({ receipts: 0, checkpoints: 0 });
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_movement_turn_checkpoint");
+    });
+    await expect((await ingestMovementTurns([envelope!])).json()).resolves.toMatchObject({
+      checkpoint: 1,
+      accepted: 1,
+      duplicates: 0,
+    });
+  });
+
+  it("carries the turn head through no-turn evidence and fences stale continuity and operation reuse", async () => {
+    const streamId = `turn_${"4".repeat(48)}`;
+    const [first] = movementTurnTrace(streamId, 1);
+    const blockedState = movementState({
+      x: 13,
+      destination: { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    });
+    const blocked = createMovementTurnEnvelope({
+      streamId,
+      cursor: 2,
+      operationId: "00000000-0000-4000-8000-000000000102",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: blockedState,
+      turn: null,
+      previousEnvelopeHash: first!.envelopeHash,
+      previousMovementEntryHash: first!.movement.entryHash,
+      previousTurnEntryHash: first!.turn!.entryHash,
+    });
+    await expect((await ingestMovementTurns([first!, blocked])).json()).resolves.toMatchObject({
+      checkpoint: 2,
+      accepted: 2,
+      turnStateHash: first!.turn!.afterStateHash,
+    });
+
+    const stale = createMovementTurnEnvelope({
+      streamId,
+      cursor: 3,
+      operationId: "00000000-0000-4000-8000-000000000103",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState({ x: 99 }),
+      turn: { command: { type: "advance_turn", action: "other" }, beforeState: initial({ turns: 1, hunger: 798 }) },
+      previousEnvelopeHash: blocked.envelopeHash,
+      previousMovementEntryHash: blocked.movement.entryHash,
+      previousTurnEntryHash: first!.turn!.entryHash,
+    });
+    const staleResponse = await ingestMovementTurns([stale]);
+    expect(staleResponse.status).toBe(422);
+    await expect(staleResponse.json()).resolves.toMatchObject({
+      code: "movement_continuity_divergence",
+      checkpoint: 2,
+      cursor: 3,
+    });
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) =>
+      state.storage.sql.exec<{ divergence_kind: string; entry_version: number; state_domain: string }>(
+        "SELECT divergence_kind, entry_version, state_domain FROM shadow_divergences WHERE stream_id = ? AND cursor = 3",
+        streamId,
+      ).one(),
+    )).resolves.toEqual({
+      divergence_kind: "envelope_movement_continuity_before",
+      entry_version: 1,
+      state_domain: "movement",
+    });
+
+    const reused = createMovementTurnEnvelope({
+      streamId,
+      cursor: 3,
+      operationId: first!.operationId,
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState({ x: 13 }),
+      turn: { command: { type: "advance_turn", action: "other" }, beforeState: initial({ turns: 1, hunger: 798 }) },
+      previousEnvelopeHash: blocked.envelopeHash,
+      previousMovementEntryHash: blocked.movement.entryHash,
+      previousTurnEntryHash: first!.turn!.entryHash,
+    });
+    const reusedResponse = await ingestMovementTurns([reused]);
+    expect(reusedResponse.status).toBe(409);
+    await expect(reusedResponse.json()).resolves.toMatchObject({ code: "operation_reused", checkpoint: 2 });
+    expect((await ingestMovementTurns([first!], { extra: { entries: [first!.movement] } })).status).toBe(400);
+  });
+
+  it("rejects a hash-valid envelope that resets the durable turn state", async () => {
+    const streamId = `turn_${"8".repeat(48)}`;
+    const correct = movementTurnTrace(streamId, 2);
+    await expect((await ingestMovementTurns([correct[0]!])).json()).resolves.toMatchObject({
+      checkpoint: 1,
+      accepted: 1,
+    });
+
+    const resetBeforeState = initial({ hp: 1_000 });
+    const resetTurn = createMovementTurnEnvelope({
+      streamId,
+      cursor: 2,
+      operationId: "00000000-0000-4000-8000-000000000802",
+      command: correct[1]!.movement.command,
+      beforeState: correct[1]!.movement.beforeState,
+      turn: { command: correct[1]!.turn!.command, beforeState: resetBeforeState },
+      previousEnvelopeHash: correct[0]!.envelopeHash,
+      previousMovementEntryHash: correct[0]!.movement.entryHash,
+      previousTurnEntryHash: correct[0]!.turn!.entryHash,
+    });
+    const response = await ingestMovementTurns([resetTurn]);
+    expect(response.status).toBe(422);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "turn_state_continuity_divergence",
+      checkpoint: 1,
+      cursor: 2,
+      expectedHash: correct[0]!.turn!.afterStateHash,
+      actualHash: gameplayStateHash(resetBeforeState),
+    });
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) => ({
+      checkpoint: state.storage.sql.exec<{ checkpoint: number }>(
+        "SELECT checkpoint FROM movement_turn_checkpoint WHERE stream_id = ?",
+        streamId,
+      ).one().checkpoint,
+      receipts: state.storage.sql.exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM movement_turn_receipts WHERE stream_id = ?",
+        streamId,
+      ).one().count,
+      divergence: state.storage.sql.exec<{ divergence_kind: string; state_domain: string }>(
+        "SELECT divergence_kind, state_domain FROM shadow_divergences WHERE stream_id = ? AND cursor = 2",
+        streamId,
+      ).one(),
+    }))).resolves.toEqual({
+      checkpoint: 1,
+      receipts: 1,
+      divergence: { divergence_kind: "envelope_turn_state_before", state_domain: "vitals" },
+    });
+  });
+
   it("catches up a representative multi-page trace with exact parity across eviction", async () => {
     const entries = trace("parity", 70);
     const first = await ingest(entries.slice(0, 64));
@@ -505,7 +787,7 @@ describe("ShadowReplay catch-up", () => {
       state.storage.sql.exec<{ version: number }>(
         "SELECT version FROM _shadow_schema_migrations ORDER BY version",
       ).toArray().map((row) => row.version),
-    )).resolves.toEqual([1, 2, 3, 4, 5]);
+    )).resolves.toEqual([1, 2, 3, 4, 5, 6]);
   });
 
   it("fails closed instead of mutating a newer unknown replay schema", async () => {
@@ -532,7 +814,7 @@ describe("ShadowReplay catch-up", () => {
       versions: state.storage.sql.exec<{ version: number }>(
         "SELECT version FROM _shadow_schema_migrations ORDER BY version",
       ).toArray().map((row) => row.version),
-    }))).resolves.toEqual({ entryCount: 1, versions: [1, 2, 3, 4, 5, 999] });
+    }))).resolves.toEqual({ entryCount: 1, versions: [1, 2, 3, 4, 5, 6, 999] });
   });
 
   it("maps a retryable replay-object failure without leaking an uncaught exception", async () => {
@@ -614,6 +896,79 @@ describe("ShadowReplay catch-up", () => {
     )).resolves.toBe(64);
   });
 
+  it("commits a terminal movement-turn pair once and rejects a post-terminal envelope", async () => {
+    const streamId = `turn_${"5".repeat(48)}`;
+    const terminal = createMovementTurnEnvelope({
+      streamId,
+      cursor: 1,
+      operationId: "00000000-0000-4000-8000-000000000501",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: movementState(),
+      turn: {
+        command: { type: "advance_turn", action: "other" },
+        beforeState: initial({ hunger: 1, hungerState: "starving", hp: 3 }),
+      },
+    });
+    expect(terminal.turn?.terminal).toBe(true);
+    await expect((await ingestMovementTurns([terminal])).json()).resolves.toMatchObject({
+      checkpoint: 1,
+      accepted: 1,
+      terminal: true,
+    });
+    await expect((await ingestMovementTurns([terminal])).json()).resolves.toMatchObject({
+      checkpoint: 1,
+      accepted: 0,
+      duplicates: 1,
+      terminal: true,
+    });
+    const later = createMovementTurnEnvelope({
+      streamId,
+      cursor: 2,
+      operationId: "00000000-0000-4000-8000-000000000502",
+      command: { type: "move", dx: 1, dy: 0 },
+      beforeState: reduceMovement(terminal.movement.beforeState, terminal.movement.command).state,
+      turn: {
+        command: { type: "advance_turn", action: "other" },
+        beforeState: reduceGameplay(terminal.turn!.beforeState, terminal.turn!.command).state,
+      },
+      previousEnvelopeHash: terminal.envelopeHash,
+      previousMovementEntryHash: terminal.movement.entryHash,
+      previousTurnEntryHash: terminal.turn!.entryHash,
+    });
+    const response = await ingestMovementTurns([later]);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ code: "terminal_state", checkpoint: 1 });
+  });
+
+  it("retains a bounded movement-turn receipt window and rejects compacted retries", async () => {
+    const streamId = `turn_${"6".repeat(48)}`;
+    const envelopes = movementTurnTrace(streamId, 300);
+    expect(envelopes.every((envelope) => envelope.turn?.terminal === false)).toBe(true);
+    for (let offset = 0; offset < envelopes.length; offset += 64) {
+      const response = await ingestMovementTurns(envelopes.slice(offset, offset + 64));
+      expect(response.status, `offset ${offset}: ${await response.clone().text()}`).toBe(200);
+    }
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) =>
+      state.storage.sql.exec<{ count: number; minimum: number; maximum: number }>(
+        `SELECT COUNT(*) AS count, MIN(cursor) AS minimum, MAX(cursor) AS maximum
+         FROM movement_turn_receipts WHERE stream_id = ?`,
+        streamId,
+      ).one(),
+    )).resolves.toEqual({ count: 256, minimum: 45, maximum: 300 });
+    const compacted = await ingestMovementTurns([envelopes[0]!]);
+    expect(compacted.status).toBe(409);
+    await expect(compacted.json()).resolves.toMatchObject({
+      code: "cursor_compacted",
+      checkpoint: 300,
+      cursor: 1,
+    });
+    await expect((await ingestMovementTurns([envelopes.at(-1)!])).json()).resolves.toMatchObject({
+      checkpoint: 300,
+      accepted: 0,
+      duplicates: 1,
+    });
+  });
+
   it("retains a bounded exact-idempotency window and rejects compacted retries", async () => {
     const streamId = "receipt-window";
     const entries = trace(streamId, 300, initial({ hp: 1_000 }));
@@ -669,6 +1024,25 @@ describe("ShadowReplay catch-up", () => {
       const duplicatePrefix = random() < 0.6 ? Math.floor(random() * Math.min(4, cursor + 1)) : 0;
       const response = await ingest(entries.slice(Math.max(0, cursor - duplicatePrefix), Math.min(entries.length, cursor + width)));
       const body = await response.json() as { checkpoint: number };
+      expect(body.checkpoint).toBeGreaterThanOrEqual(cursor);
+      cursor = body.checkpoint;
+    }
+    expect(cursor).toBe(40);
+  });
+
+  it("keeps movement-turn checkpoints monotonic across seeded duplicate chunking", async () => {
+    let seed = 0x7475726e;
+    const random = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+    const envelopes = movementTurnTrace(`turn_${"7".repeat(48)}`, 40);
+    let cursor = 0;
+    while (cursor < envelopes.length) {
+      const width = 1 + Math.floor(random() * 6);
+      const duplicatePrefix = random() < 0.6 ? Math.floor(random() * Math.min(4, cursor + 1)) : 0;
+      const response = await ingestMovementTurns(
+        envelopes.slice(Math.max(0, cursor - duplicatePrefix), Math.min(envelopes.length, cursor + width)),
+      );
+      const body = await response.json() as { checkpoint: number };
+      expect(response.status).toBe(200);
       expect(body.checkpoint).toBeGreaterThanOrEqual(cursor);
       cursor = body.checkpoint;
     }

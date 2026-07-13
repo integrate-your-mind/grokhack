@@ -17,8 +17,10 @@ import {
 export const SHADOW_JOURNAL_VERSION = 1 as const;
 export const MOVEMENT_SHADOW_JOURNAL_VERSION = 2 as const;
 export const MOVEMENT_RULESET_VERSION = 1 as const;
+export const MOVEMENT_TURN_ENVELOPE_VERSION = 1 as const;
 export const MAX_SHADOW_BATCH_ENTRIES = 64;
 export const MAX_SHADOW_BATCH_BYTES = 256 * 1024;
+export const MAX_MOVEMENT_TURN_ENVELOPE_BYTES = 20 * 1024;
 
 export interface ShadowRoute {
   realmId: string;
@@ -78,6 +80,38 @@ export interface MovementJournalInput {
   previousEntryHash?: string | null;
 }
 
+/**
+ * Additive atomic publication unit for one movement decision and its optional
+ * turn/vitals follow-up. Frozen V1/V2 entries remain unchanged; neither nested
+ * entry is a standalone catch-up record when carried by this envelope.
+ */
+export interface MovementTurnEnvelope {
+  v: typeof MOVEMENT_TURN_ENVELOPE_VERSION;
+  kind: "movement_turn";
+  streamId: string;
+  cursor: number;
+  operationId: string;
+  movement: MovementShadowJournalEntry;
+  turn: GameplayShadowJournalEntry | null;
+  previousEnvelopeHash: string | null;
+  envelopeHash: string;
+}
+
+export interface MovementTurnEnvelopeInput {
+  streamId: string;
+  cursor: number;
+  operationId: string;
+  command: MovementCommand;
+  beforeState: MovementState;
+  turn?: {
+    command: GameplayCommand;
+    beforeState: GameplayState;
+  } | null;
+  previousEnvelopeHash?: string | null;
+  previousMovementEntryHash?: string | null;
+  previousTurnEntryHash?: string | null;
+}
+
 export type ShadowJournalInput = GameplayJournalInput | MovementJournalInput;
 export type ShadowEntryForInput<T extends ShadowJournalInput> =
   T extends GameplayJournalInput ? GameplayShadowJournalEntry : MovementShadowJournalEntry;
@@ -95,6 +129,101 @@ function fnv64(value: string): string {
     hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+export function movementTurnEnvelopeHash(
+  envelope: Omit<MovementTurnEnvelope, "envelopeHash">,
+): string {
+  return fnv64([
+    envelope.v,
+    envelope.kind,
+    envelope.streamId,
+    envelope.cursor,
+    envelope.operationId,
+    envelope.movement.entryHash,
+    envelope.turn?.entryHash ?? "no-turn",
+    envelope.previousEnvelopeHash ?? "genesis",
+  ].join("|"));
+}
+
+export function createMovementTurnEnvelope(input: MovementTurnEnvelopeInput): MovementTurnEnvelope {
+  const movement = createShadowJournalEntry({
+    streamId: `${input.streamId}_movement`,
+    cursor: input.cursor,
+    command: input.command,
+    beforeState: input.beforeState,
+    previousEntryHash: input.previousMovementEntryHash ?? null,
+  });
+  const turn = input.turn
+    ? createShadowJournalEntry({
+        streamId: `${input.streamId}_vitals`,
+        cursor: input.cursor,
+        command: input.turn.command,
+        beforeState: input.turn.beforeState,
+        previousEntryHash: input.previousTurnEntryHash ?? null,
+      })
+    : null;
+  const unsigned: Omit<MovementTurnEnvelope, "envelopeHash"> = {
+    v: MOVEMENT_TURN_ENVELOPE_VERSION,
+    kind: "movement_turn",
+    streamId: input.streamId,
+    cursor: input.cursor,
+    operationId: input.operationId,
+    movement,
+    turn,
+    previousEnvelopeHash: input.previousEnvelopeHash ?? null,
+  };
+  return { ...unsigned, envelopeHash: movementTurnEnvelopeHash(unsigned) };
+}
+
+export function validateMovementTurnEnvelope(value: unknown): MovementTurnEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_movement_turn_envelope");
+  const envelope = value as Partial<MovementTurnEnvelope>;
+  if (envelope.v !== MOVEMENT_TURN_ENVELOPE_VERSION || envelope.kind !== "movement_turn" ||
+      typeof envelope.streamId !== "string" || !/^turn_[0-9a-f]{48}$/u.test(envelope.streamId) ||
+      !Number.isSafeInteger(envelope.cursor) || Number(envelope.cursor) < 1 ||
+      typeof envelope.operationId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(envelope.operationId) ||
+      (envelope.previousEnvelopeHash !== null &&
+        (typeof envelope.previousEnvelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.previousEnvelopeHash))) ||
+      typeof envelope.envelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.envelopeHash)) {
+    throw new Error("invalid_movement_turn_envelope");
+  }
+  const movement = validateShadowJournalEntry(envelope.movement);
+  if (movement.v !== MOVEMENT_SHADOW_JOURNAL_VERSION ||
+      movement.streamId !== `${envelope.streamId}_movement` || movement.cursor !== envelope.cursor) {
+    throw new Error("invalid_movement_turn_envelope");
+  }
+  let turn: GameplayShadowJournalEntry | null = null;
+  if (envelope.turn !== null) {
+    const candidate = validateShadowJournalEntry(envelope.turn);
+    if (candidate.v !== SHADOW_JOURNAL_VERSION ||
+        candidate.streamId !== `${envelope.streamId}_vitals` || candidate.cursor !== envelope.cursor) {
+      throw new Error("invalid_movement_turn_envelope");
+    }
+    turn = candidate;
+  }
+  const movementTransition = reduceMovement(movement.beforeState, movement.command);
+  if ((movementTransition.turnCost === "none") !== (turn === null)) {
+    throw new Error("movement_turn_pair_mismatch");
+  }
+  const validated: MovementTurnEnvelope = {
+    v: MOVEMENT_TURN_ENVELOPE_VERSION,
+    kind: "movement_turn",
+    streamId: envelope.streamId,
+    cursor: Number(envelope.cursor),
+    operationId: envelope.operationId,
+    movement,
+    turn,
+    previousEnvelopeHash: envelope.previousEnvelopeHash ?? null,
+    envelopeHash: envelope.envelopeHash,
+  };
+  const unsigned = { ...validated } as Omit<MovementTurnEnvelope, "envelopeHash"> & { envelopeHash?: string };
+  delete unsigned.envelopeHash;
+  if (validated.envelopeHash !== movementTurnEnvelopeHash(unsigned)) {
+    throw new Error("movement_turn_envelope_hash_mismatch");
+  }
+  return validated;
 }
 
 export function shadowEntryHash(entry: UnsignedShadowJournalEntry): string {

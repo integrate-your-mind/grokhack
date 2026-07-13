@@ -87,4 +87,5 @@ export interface WorldStats {
   floorsActive: number;
   totalTurns: number;
   uptimeMs: number;
+  shadowEvidenceDegraded: boolean;
 }

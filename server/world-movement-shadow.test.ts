@@ -1,11 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isWalkable } from "../src/dungeon.js";
-import { movementJournalRunId, movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
+import {
+  movementJournalRunId,
+  movementTurnJournalStreamId,
+  OriginGameplayJournal,
+} from "./origin-journal.js";
 import type { ClientConnection } from "./types.js";
 import {
   shouldRecordMovementNoopEvidence,
@@ -66,6 +71,38 @@ function ordinaryStep(floor: ReturnType<WorldServer["buildView"]>["floor"]): {
   return step;
 }
 
+function prepareTransfer(
+  world: WorldServer,
+  player: Exclude<Awaited<ReturnType<WorldServer["joinPlayer"]>>, string>,
+): {
+  sourceFloor: ReturnType<WorldServer["buildView"]>["floor"];
+  pickupId: string;
+  key: string;
+} {
+  const sourceFloor = world.buildView(player).floor;
+  const { stairsDown, tiles } = sourceFloor.dungeon;
+  const approach = [
+    { x: stairsDown.x - 1, y: stairsDown.y, key: "l" },
+    { x: stairsDown.x + 1, y: stairsDown.y, key: "h" },
+    { x: stairsDown.x, y: stairsDown.y - 1, key: "j" },
+    { x: stairsDown.x, y: stairsDown.y + 1, key: "k" },
+  ].find(({ x, y }) => isWalkable(tiles, x, y));
+  if (!approach) throw new Error("stairs have no walkable approach");
+  const pickup = sourceFloor.items[0];
+  if (!pickup) throw new Error("generated floor has no item for transfer persistence proof");
+  sourceFloor.items = [{ ...pickup, x: stairsDown.x, y: stairsDown.y }];
+  sourceFloor.monsters = sourceFloor.monsters.filter(
+    (monster) => monster.x !== stairsDown.x || monster.y !== stairsDown.y,
+  );
+  sourceFloor.traps = [];
+  player.state.entity.x = approach.x;
+  player.state.entity.y = approach.y;
+  player.state.hunger = 2_000;
+  player.state.entity.hp = 999;
+  player.state.entity.maxHp = 999;
+  return { sourceFloor, pickupId: pickup.item.id, key: approach.key };
+}
+
 function wallStep(floor: ReturnType<WorldServer["buildView"]>["floor"]): {
   x: number;
   y: number;
@@ -93,13 +130,13 @@ function createJournal(): OriginGameplayJournal {
   return new OriginGameplayJournal(directory);
 }
 
-function movementStream(
+function movementTurnStream(
   player: Awaited<ReturnType<WorldServer["joinPlayer"]>>,
   floor: ReturnType<WorldServer["buildView"]>["floor"],
 ): string {
   if (typeof player === "string") throw new Error("player unavailable");
   if (!floor.movementAuthority) throw new Error("floor movement authority unavailable");
-  return movementJournalStreamId(
+  return movementTurnJournalStreamId(
     player.id,
     movementJournalRunId(player.resumeToken ?? ""),
     floor.movementAuthority,
@@ -257,7 +294,7 @@ describe("WorldServer movement shadow journal", () => {
     expect(evidence.size).toBe(2);
   });
 
-  it("records the movement decision before its existing turn/vitals transition", async () => {
+  it("publishes a movement decision and its turn/vitals transition in one envelope", async () => {
     const journal = createJournal();
     const world = new WorldServer({ originJournal: journal });
     world.registerConnection(connection("walker"));
@@ -276,14 +313,20 @@ describe("WorldServer movement shadow journal", () => {
     const turnsBefore = player.state.turns;
     world.handleInput(player.id, step.key);
 
-    const streamId = movementStream(player, floor);
-    const entries = journal.readAfter(streamId, 0, 64);
-    expect(entries[0]?.command).toMatchObject({ type: "move", dx: step.dx, dy: step.dy });
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ v: 2, terminal: false });
-    expect(journal.readAfter(player.id, 0, 64)).toEqual([
-      expect.objectContaining({ v: 1, command: { type: "advance_turn", action: "other" } }),
-    ]);
+    const streamId = movementTurnStream(player, floor);
+    const envelopes = journal.readMovementTurnsAfter(streamId, 0, 64);
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0]?.movement).toMatchObject({
+      v: 2,
+      command: { type: "move", dx: step.dx, dy: step.dy },
+      terminal: false,
+    });
+    expect(envelopes[0]?.turn).toMatchObject({
+      v: 1,
+      command: { type: "advance_turn", action: "other" },
+      terminal: false,
+    });
+    expect(journal.readAfter(player.id, 0, 64)).toEqual([]);
     expect(player.state).toMatchObject({
       turns: turnsBefore + 1,
       entity: { x: step.x + step.dx, y: step.y + step.dy },
@@ -325,8 +368,9 @@ describe("WorldServer movement shadow journal", () => {
       turns: 2,
       entity: { x: step.x, y: step.y },
     });
-    expect(journal.readAfter(movementStream(player, floor), 0, 64)).toHaveLength(1);
-    expect(journal.readAfter(player.id, 0, 64)).toHaveLength(1);
+    expect(journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64)).toHaveLength(1);
+    expect(journal.readAfter(player.id, 0, 64)).toHaveLength(0);
+    world.handleInput(player.id, ".");
     expect((world as unknown as { evidenceCapacityReported: Set<string> }).evidenceCapacityReported)
       .toEqual(new Set(["movement", "vitals"]));
   });
@@ -348,12 +392,12 @@ describe("WorldServer movement shadow journal", () => {
     const beforeWallTurns = player.state.turns;
     world.handleInput(player.id, wall.key);
     expect(player.state).toMatchObject({ turns: beforeWallTurns, entity: { x: wall.x, y: wall.y } });
-    const streamId = movementStream(player, floor);
-    const wallEntry = journal.readAfter(streamId, 0, 64)[0];
-    if (!wallEntry || wallEntry.v !== 2) throw new Error("missing movement entry");
+    const streamId = movementTurnStream(player, floor);
+    const wallEntry = journal.readMovementTurnsAfter(streamId, 0, 64)[0]?.movement;
+    if (!wallEntry) throw new Error("missing movement entry");
     expect(wallEntry.beforeState.destination.tile === null || wallEntry.beforeState.destination.tile === "#").toBe(true);
     world.handleInput(player.id, wall.key);
-    expect(journal.readAfter(streamId, 0, 64)).toHaveLength(1);
+    expect(journal.readMovementTurnsAfter(streamId, 0, 64)).toHaveLength(1);
 
     // Use the second player's untouched stream so this test does not inject an
     // unjournaled coordinate jump after the wall decision above.
@@ -365,8 +409,8 @@ describe("WorldServer movement shadow journal", () => {
     const beforePlayerTurns = blocker.state.turns;
     world.handleInput(blocker.id, open.key);
     expect(blocker.state).toMatchObject({ turns: beforePlayerTurns, entity: { x: open.x, y: open.y } });
-    const playerEntry = journal.readAfter(movementStream(blocker, floor), 0, 64)[0];
-    if (!playerEntry || playerEntry.v !== 2) throw new Error("missing player collision entry");
+    const playerEntry = journal.readMovementTurnsAfter(movementTurnStream(blocker, floor), 0, 64)[0]?.movement;
+    if (!playerEntry) throw new Error("missing player collision entry");
     expect(playerEntry.beforeState.destination.occupant).toBe("player");
     expect(blocker.messages.at(-1)).toBe("BlockedWalker is in the way.");
   });
@@ -392,9 +436,9 @@ describe("WorldServer movement shadow journal", () => {
     player.state.entity.hp = 999;
     player.state.entity.maxHp = 999;
     world.handleInput(player.id, trapStep.key);
-    const streamId = movementStream(player, floor);
-    const trapEntry = journal.readAfter(streamId, 0, 64)[0];
-    if (!trapEntry || trapEntry.v !== 2) throw new Error("missing trap movement entry");
+    const streamId = movementTurnStream(player, floor);
+    const trapEntry = journal.readMovementTurnsAfter(streamId, 0, 64)[0]?.movement;
+    if (!trapEntry) throw new Error("missing trap movement entry");
     expect(trapEntry.beforeState.destination.trap).toBe(true);
 
     const currentFloor = world.buildView(player).floor;
@@ -412,8 +456,10 @@ describe("WorldServer movement shadow journal", () => {
     currentFloor.items = currentFloor.items.filter((item) => item.x !== stairsDown.x || item.y !== stairsDown.y);
     currentFloor.traps = [];
     world.handleInput(transferPlayer.id, attempts.key);
-    const transferEntry = journal.readAfter(movementStream(transferPlayer, currentFloor), 0, 64)[0];
-    if (!transferEntry || transferEntry.v !== 2) throw new Error("missing transfer movement entry");
+    const transferEntry = journal.readMovementTurnsAfter(
+      movementTurnStream(transferPlayer, currentFloor), 0, 64,
+    )[0]?.movement;
+    if (!transferEntry) throw new Error("missing transfer movement entry");
     expect(transferEntry.beforeState.destination).toMatchObject({ tile: ">", stairsDown: true });
     expect(transferEntry.command).toEqual({ type: "move", dx: attempts.dx, dy: attempts.dy });
     expect(transferPlayer.floorDepth).toBe(2);
@@ -439,15 +485,530 @@ describe("WorldServer movement shadow journal", () => {
     world.handleInput(player.id, step.key);
 
     expect(player.phase).toBe("dead");
-    const movement = journal.readAfter(movementStream(player, floor), 0, 64);
-    const vitals = journal.readAfter(player.id, 0, 64);
-    expect(movement).toEqual([expect.objectContaining({ v: 2, terminal: false })]);
-    expect(vitals).toEqual([expect.objectContaining({ v: 1, terminal: true })]);
+    const envelopes = journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64);
+    expect(envelopes).toEqual([
+      expect.objectContaining({
+        movement: expect.objectContaining({ v: 2, terminal: false }),
+        turn: expect.objectContaining({ v: 1, terminal: true }),
+      }),
+    ]);
   });
 
-  it("does not partially mutate a movement when its immutable journal append fails", async () => {
+  it("marks origin application only after synchronous turn and status effects finish", async () => {
+    const journal = createJournal();
+    let world!: WorldServer;
+    let playerDuringMark: { state: { turns: number; immobilizedTurns?: number } } | undefined;
+    let appliedObservation: { turns: number; immobilizedTurns: number; totalTurns: number } | undefined;
+    world = new WorldServer({
+      originJournal: {
+        appendTransition: journal.appendTransition.bind(journal),
+        appendMovementTurn: journal.appendMovementTurn.bind(journal),
+        prepareMovementTurn: journal.prepareMovementTurn.bind(journal),
+        markMovementTurnApplied: (input) => {
+          if (!playerDuringMark) throw new Error("missing player during applied marker");
+          appliedObservation = {
+            turns: playerDuringMark.state.turns,
+            immobilizedTurns: playerDuringMark.state.immobilizedTurns ?? 0,
+            totalTurns: world.getStats().totalTurns,
+          };
+          journal.markMovementTurnApplied(input);
+        },
+        markMovementTurnPersistenceCommitted: journal.markMovementTurnPersistenceCommitted.bind(journal),
+        completeMovementTurnPreparation: journal.completeMovementTurnPreparation.bind(journal),
+        hasPendingMovementTurn: journal.hasPendingMovementTurn.bind(journal),
+        movementAuthorityForFloor: journal.movementAuthorityForFloor.bind(journal),
+        validateMovementAuthorityRegistry: journal.validateMovementAuthorityRegistry.bind(journal),
+      },
+    });
+    world.registerConnection(connection("applied-order"));
+    const player = await world.joinPlayer("applied-order", "AppliedOrder");
+    if (typeof player === "string") throw new Error(player);
+    playerDuringMark = player;
+    const floor = world.buildView(player).floor;
+    floor.monsters = [];
+    floor.items = [];
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.immobilizedTurns = 1;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+    const turnsBefore = player.state.turns;
+
+    world.handleInput(player.id, step.key);
+
+    expect(appliedObservation).toEqual({
+      turns: turnsBefore + 1,
+      immobilizedTurns: 0,
+      totalTurns: 1,
+    });
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+  });
+
+  it("recovers same-process availability after an applied-marker rename acknowledgement loss", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-applied-ack-loss-"));
+    directories.push(directory);
+    let preparationRenames = 0;
+    const journal = new OriginGameplayJournal(directory, {
+      renameMovementTurnPreparationSync: (from, to) => {
+        fs.renameSync(from, to);
+        preparationRenames++;
+        if (preparationRenames === 2) {
+          throw new Error("injected origin-applied rename acknowledgement loss");
+        }
+      },
+    });
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("applied-ack-loss"));
+    const player = await world.joinPlayer("applied-ack-loss", "AppliedAckLoss");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+
+    world.handleInput(player.id, step.key);
+
+    expect(preparationRenames).toBe(3);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+    expect(player.messages).not.toContain("Turn completed; shadow evidence is degraded.");
+  });
+
+  it("recovers same-process availability after a persistence-marker rename acknowledgement loss", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-persisted-ack-loss-"));
+    directories.push(directory);
+    let preparationRenames = 0;
+    const journal = new OriginGameplayJournal(directory, {
+      renameMovementTurnPreparationSync: (from, to) => {
+        fs.renameSync(from, to);
+        preparationRenames++;
+        if (preparationRenames === 3) {
+          throw new Error("injected persistence marker rename acknowledgement loss");
+        }
+      },
+    });
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("persisted-ack-loss"));
+    const player = await world.joinPlayer("persisted-ack-loss", "PersistedAckLoss");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+
+    world.handleInput(player.id, step.key);
+
+    expect(preparationRenames).toBe(3);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+    expect(player.messages).not.toContain("Turn completed; shadow evidence is degraded.");
+  });
+
+  it("keeps movement fenced until its player and floor persistence acknowledgement", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-world-persistence-fence-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory);
+    let acknowledgePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      acknowledgePersistence = resolve;
+    });
     const world = new WorldServer({
-      originJournal: { appendTransition: () => { throw new Error("disk unavailable"); } },
+      originJournal: journal,
+      persistMovementTurn: () => persistence,
+    });
+    world.registerConnection(connection("persistence-fence"));
+    const player = await world.joinPlayer("persistence-fence", "PersistenceFence");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+
+    world.handleInput(player.id, step.key);
+    const committed = {
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      turns: player.state.turns,
+    };
+    expect(world.getStats().shadowEvidenceDegraded).toBe(true);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+
+    world.handleInput(player.id, step.key);
+    expect({ x: player.state.entity.x, y: player.state.entity.y, turns: player.state.turns })
+      .toEqual(committed);
+    expect(player.messages).toContain("Movement persistence is still committing — retry shortly.");
+
+    acknowledgePersistence();
+    await vi.waitFor(() => {
+      expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+      expect(journal.hasPendingMovementTurn()).toBe(false);
+    });
+  });
+
+  it("holds the graceful durability barrier until movement persistence finishes", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-world-shutdown-fence-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory);
+    let acknowledgePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      acknowledgePersistence = resolve;
+    });
+    const world = new WorldServer({
+      originJournal: journal,
+      persistMovementTurn: () => persistence,
+    });
+    world.registerConnection(connection("shutdown-persistence-fence"));
+    const player = await world.joinPlayer("shutdown-persistence-fence", "ShutdownPersistenceFence");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+    world.handleInput(player.id, step.key);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+
+    world.beginShutdown();
+    let durabilityFinished = false;
+    const durability = world.flushAllDurable().then(() => {
+      durabilityFinished = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(durabilityFinished).toBe(false);
+
+    acknowledgePersistence();
+    await durability;
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+  });
+
+  it("fails the graceful durability barrier when movement persistence remains poisoned", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-world-shutdown-poison-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory);
+    const world = new WorldServer({
+      originJournal: journal,
+      persistMovementTurn: async () => {
+        throw new Error("injected shutdown persistence failure");
+      },
+    });
+    world.registerConnection(connection("shutdown-persistence-poison"));
+    const player = await world.joinPlayer("shutdown-persistence-poison", "ShutdownPersistencePoison");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+    world.handleInput(player.id, step.key);
+    await vi.waitFor(() => {
+      expect(player.messages).toContain("Turn completed; shadow evidence is degraded.");
+    });
+
+    world.beginShutdown();
+    await expect(world.flushAllDurable()).rejects.toThrow("movement turn persistence remains unresolved");
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+  });
+
+  it("keeps both source and destination floor mutations fenced during a transfer", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-world-transfer-fence-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory);
+    let acknowledgePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      acknowledgePersistence = resolve;
+    });
+    let persistedFloorDepths: number[] = [];
+    let persistedSourceHasPickup: boolean | undefined;
+    const world = new WorldServer({
+      originJournal: journal,
+      persistMovementTurn: (_player, floors) => {
+        persistedFloorDepths = floors.map((floor) => floor.depth);
+        persistedSourceHasPickup = floors.find((floor) => floor.depth === 1)?.items
+          .some((ground) => ground.item.id === pickupId);
+        return persistence;
+      },
+    });
+    world.registerConnection(connection("transfer-persistence-fence"));
+    const player = await world.joinPlayer("transfer-persistence-fence", "TransferPersistenceFence");
+    if (typeof player === "string") throw new Error(player);
+    const { sourceFloor, pickupId, key } = prepareTransfer(world, player);
+
+    world.handleInput(player.id, key);
+
+    expect(player.floorDepth).toBe(2);
+    expect(sourceFloor.items.some((ground) => ground.item.id === pickupId)).toBe(false);
+    expect(persistedFloorDepths).toEqual([1, 2]);
+    expect(persistedSourceHasPickup).toBe(false);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(true);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+
+    acknowledgePersistence();
+    await vi.waitFor(() => {
+      expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+      expect(journal.hasPendingMovementTurn()).toBe(false);
+    });
+  });
+
+  it("keeps a failed source-and-destination transfer persistence attempt fenced", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-world-transfer-failure-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory);
+    let persistedFloorDepths: number[] = [];
+    let persistedSourceHasPickup: boolean | undefined;
+    let pickupId = "";
+    const world = new WorldServer({
+      originJournal: journal,
+      persistMovementTurn: async (_player, floors) => {
+        persistedFloorDepths = floors.map((floor) => floor.depth);
+        persistedSourceHasPickup = floors.find((floor) => floor.depth === 1)?.items
+          .some((ground) => ground.item.id === pickupId);
+        throw new Error("injected destination floor persistence failure");
+      },
+    });
+    world.registerConnection(connection("transfer-persistence-failure"));
+    const player = await world.joinPlayer("transfer-persistence-failure", "TransferPersistenceFailure");
+    if (typeof player === "string") throw new Error(player);
+    const prepared = prepareTransfer(world, player);
+    pickupId = prepared.pickupId;
+
+    world.handleInput(player.id, prepared.key);
+
+    await vi.waitFor(() => {
+      expect(player.messages).toContain("Turn completed; shadow evidence is degraded.");
+    });
+    expect(player.floorDepth).toBe(2);
+    expect(prepared.sourceFloor.items.some((ground) => ground.item.id === pickupId)).toBe(false);
+    expect(persistedFloorDepths).toEqual([1, 2]);
+    expect(persistedSourceHasPickup).toBe(false);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(true);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+  });
+
+  it("fences a pre-ack crash and recovers a post-persistence cleanup crash", () => {
+    const scenarios = [
+      { name: "before_ack", status: 77, recovered: false },
+      { name: "after_persistence_commit", status: 78, recovered: true },
+    ] as const;
+    for (const scenario of scenarios) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), `grokhack-world-${scenario.name}-`));
+      directories.push(directory);
+      const environment = {
+        ...process.env,
+        GROKHACK_DATA_DIR: path.join(directory, "data"),
+        GROKHACK_DB_PATH: path.join(directory, "data", "world.duckdb"),
+        GROKHACK_DISCONNECT_GRACE_MS: "0",
+        IRC_ENABLED: "0",
+      };
+      const crash = spawnSync(process.execPath, [
+        "--import", "tsx", "--input-type=module", "-e",
+        `
+          import fs from "node:fs";
+          import path from "node:path";
+          import { isWalkable } from "./src/dungeon.ts";
+          import {
+            movementJournalRunId,
+            movementTurnJournalStreamId,
+            OriginGameplayJournal,
+          } from "./server/origin-journal.ts";
+          import {
+            flushPersistence,
+            initPersistence,
+            saveFloorNow,
+            savePlayerNow,
+          } from "./server/persistence.ts";
+          import { WorldServer } from "./server/world.ts";
+          const root = process.argv[1];
+          const scenario = process.argv[2];
+          await initPersistence();
+          const journal = new OriginGameplayJournal(path.join(root, "journal"),
+            scenario === "after_persistence_commit"
+              ? { unlinkMovementTurnPreparationSync() { process.exit(78); } }
+              : {});
+          const world = new WorldServer({
+            loadResumablePlayer: async () => null,
+            originJournal: journal,
+            ...(scenario === "before_ack"
+              ? { persistMovementTurn: async () => { process.exit(77); } }
+              : {}),
+          });
+          await world.hydrateFromDatabase();
+          const connection = {
+            id: "cold-crash",
+            sessionId: "cold-crash-session",
+            transport: "websocket",
+            playerId: null,
+            agentMode: false,
+            send() {},
+            close() {},
+          };
+          world.registerConnection(connection);
+          const player = await world.joinPlayer(connection.id, "ColdCrash");
+          if (typeof player === "string" || !player.resumeToken) throw new Error(String(player));
+          const floor = world.buildView(player).floor;
+          floor.monsters = [];
+          floor.items = [];
+          floor.traps = [];
+          const directions = [
+            { dx: 1, dy: 0, key: "l" },
+            { dx: -1, dy: 0, key: "h" },
+            { dx: 0, dy: 1, key: "j" },
+            { dx: 0, dy: -1, key: "k" },
+          ];
+          const step = floor.dungeon.tiles.flatMap((row, y) => row.map((_tile, x) => ({ x, y })))
+            .flatMap(({ x, y }) => directions.map((direction) => ({ x, y, ...direction })))
+            .find(({ x, y, dx, dy }) => {
+              const targetX = x + dx;
+              const targetY = y + dy;
+              return isWalkable(floor.dungeon.tiles, x, y) &&
+                isWalkable(floor.dungeon.tiles, targetX, targetY) &&
+                (targetX !== floor.dungeon.stairsDown.x || targetY !== floor.dungeon.stairsDown.y);
+            });
+          if (!step || !floor.movementAuthority) throw new Error("no ordinary crash step");
+          player.state.entity.x = step.x;
+          player.state.entity.y = step.y;
+          player.state.hunger = 2_000;
+          player.state.entity.hp = 999;
+          player.state.entity.maxHp = 999;
+          const baseline = {
+            playerId: player.id,
+            x: player.state.entity.x,
+            y: player.state.entity.y,
+            turns: player.state.turns,
+            hunger: player.state.hunger,
+            key: step.key,
+            dx: step.dx,
+            dy: step.dy,
+            streamId: movementTurnJournalStreamId(
+              player.id,
+              movementJournalRunId(player.resumeToken),
+              floor.movementAuthority,
+            ),
+          };
+          await savePlayerNow(player);
+          await saveFloorNow(floor);
+          await flushPersistence();
+          fs.writeFileSync(path.join(root, "baseline.json"), JSON.stringify(baseline));
+          world.handleInput(player.id, step.key);
+          await new Promise((resolve) => setTimeout(resolve, 10_000));
+          throw new Error("crash injection did not fire");
+        `,
+        directory,
+        scenario.name,
+      ], { cwd: process.cwd(), env: environment, encoding: "utf8", timeout: 20_000 });
+      expect(crash.status, `${scenario.name}: ${crash.stderr}`).toBe(scenario.status);
+
+      const restart = spawnSync(process.execPath, [
+        "--import", "tsx", "--input-type=module", "-e",
+        `
+          import fs from "node:fs";
+          import path from "node:path";
+          import { reduceGameplay } from "./src/gameplay-reducer.ts";
+          import { reduceMovement } from "./src/movement-reducer.ts";
+          import { OriginGameplayJournal } from "./server/origin-journal.ts";
+          import { closePersistence, initPersistence } from "./server/persistence.ts";
+          import { WorldServer } from "./server/world.ts";
+          const root = process.argv[1];
+          const baseline = JSON.parse(fs.readFileSync(path.join(root, "baseline.json"), "utf8"));
+          await initPersistence();
+          const journal = new OriginGameplayJournal(path.join(root, "journal"));
+          const world = new WorldServer({ originJournal: journal });
+          await world.hydrateFromDatabase();
+          const player = world.getPlayer(baseline.playerId);
+          const envelope = journal.readMovementTurnsAfter(baseline.streamId, 0, 1)[0];
+          const movementAfter = envelope && reduceMovement(envelope.movement.beforeState, envelope.movement.command).state;
+          const turnAfter = envelope?.turn && reduceGameplay(envelope.turn.beforeState, envelope.turn.command).state;
+          const result = {
+            degraded: world.getStats().shadowEvidenceDegraded,
+            pending: journal.hasPendingMovementTurn(),
+            baseline,
+            persisted: player && {
+              x: player.state.entity.x,
+              y: player.state.entity.y,
+              turns: player.state.turns,
+              hunger: player.state.hunger,
+            },
+            envelopeAfter: movementAfter && turnAfter && {
+              x: movementAfter.x,
+              y: movementAfter.y,
+              turns: turnAfter.turns,
+              hunger: turnAfter.hunger,
+            },
+          };
+          await closePersistence();
+          process.stdout.write("COLD_RESULT " + JSON.stringify(result) + "\\n");
+        `,
+        directory,
+      ], { cwd: process.cwd(), env: environment, encoding: "utf8", timeout: 20_000 });
+      expect(restart.status, `${scenario.name}: ${restart.stderr}`).toBe(0);
+      const resultLine = restart.stdout.split("\n").find((line) => line.startsWith("COLD_RESULT "));
+      if (!resultLine) throw new Error(`missing ${scenario.name} cold restart result: ${restart.stdout}`);
+      const result = JSON.parse(resultLine.slice("COLD_RESULT ".length)) as {
+        degraded: boolean;
+        pending: boolean;
+        baseline: { x: number; y: number; turns: number; hunger: number };
+        persisted: { x: number; y: number; turns: number; hunger: number };
+        envelopeAfter: { x: number; y: number; turns: number; hunger: number };
+      };
+      if (scenario.recovered) {
+        expect(result.persisted).toEqual(result.envelopeAfter);
+        expect(result).toMatchObject({ degraded: false, pending: false });
+      } else {
+        expect(result.persisted).toEqual({
+          x: result.baseline.x,
+          y: result.baseline.y,
+          turns: result.baseline.turns,
+          hunger: result.baseline.hunger,
+        });
+        expect(result.envelopeAfter).not.toEqual(result.persisted);
+        expect(result).toMatchObject({ degraded: true, pending: true });
+      }
+    }
+  }, 60_000);
+
+  it("does not partially mutate a movement when durable preparation fails", async () => {
+    const world = new WorldServer({
+      originJournal: {
+        appendTransition: () => { throw new Error("unexpected legacy append"); },
+        appendMovementTurn: () => { throw new Error("unexpected envelope append"); },
+        prepareMovementTurn: () => { throw new Error("disk unavailable"); },
+        markMovementTurnApplied: () => { throw new Error("unexpected apply marker"); },
+        markMovementTurnPersistenceCommitted: () => { throw new Error("unexpected persistence marker"); },
+        completeMovementTurnPreparation: () => { throw new Error("unexpected preparation completion"); },
+        hasPendingMovementTurn: () => false,
+      },
     });
     world.registerConnection(connection("guarded-walker"));
     const player = await world.joinPlayer("guarded-walker", "GuardedWalker");
@@ -480,5 +1041,89 @@ describe("WorldServer movement shadow journal", () => {
       floorTraps: floor.traps,
     }).toEqual(before);
     expect(player.messages.at(-1)).toBe("Turn journal unavailable — retry shortly.");
+  });
+
+  it("rolls a started movement forward and latches degradation when the atomic envelope fails", async () => {
+    const journal = createJournal();
+    let playerDuringAppend: { state: { turns: number; hunger: number } } | undefined;
+    let appendObservation: { turns: number; hunger: number } | undefined;
+    const world = new WorldServer({
+      originJournal: {
+        appendTransition: journal.appendTransition.bind(journal),
+        appendMovementTurn: () => {
+          appendObservation = playerDuringAppend
+            ? { turns: playerDuringAppend.state.turns, hunger: playerDuringAppend.state.hunger }
+            : undefined;
+          throw new Error("injected envelope commit failure");
+        },
+        prepareMovementTurn: journal.prepareMovementTurn.bind(journal),
+        markMovementTurnApplied: journal.markMovementTurnApplied.bind(journal),
+        markMovementTurnPersistenceCommitted: journal.markMovementTurnPersistenceCommitted.bind(journal),
+        completeMovementTurnPreparation: journal.completeMovementTurnPreparation.bind(journal),
+        hasPendingMovementTurn: journal.hasPendingMovementTurn.bind(journal),
+        movementAuthorityForFloor: journal.movementAuthorityForFloor.bind(journal),
+        validateMovementAuthorityRegistry: journal.validateMovementAuthorityRegistry.bind(journal),
+      },
+    });
+    world.registerConnection(connection("degraded-walker"));
+    const player = await world.joinPlayer("degraded-walker", "DegradedWalker");
+    if (typeof player === "string") throw new Error(player);
+    playerDuringAppend = player;
+
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    floor.monsters = floor.monsters.filter((monster) =>
+      monster.x !== step.x + step.dx || monster.y !== step.y + step.dy);
+    floor.items = floor.items.filter((item) =>
+      item.x !== step.x + step.dx || item.y !== step.y + step.dy);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+    const before = {
+      turns: player.state.turns,
+      hunger: player.state.hunger,
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+    };
+
+    world.handleInput(player.id, step.key);
+
+    expect(player.state).toMatchObject({
+      turns: before.turns + 1,
+      entity: { x: before.x + step.dx, y: before.y + step.dy },
+    });
+    expect(player.state.hunger).toBeLessThan(before.hunger);
+    expect(appendObservation).toEqual({ turns: before.turns + 1, hunger: player.state.hunger });
+    expect(world.getStats().shadowEvidenceDegraded).toBe(true);
+    expect(player.messages).toContain("Turn completed; shadow evidence is degraded.");
+    expect(journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64)).toEqual([]);
+    const restarted = new WorldServer({ originJournal: journal });
+    expect(restarted.getStats().shadowEvidenceDegraded).toBe(true);
+    restarted.registerConnection(connection("degraded-restart"));
+    const resumedPlayer = await restarted.joinPlayer("degraded-restart", "DegradedRestart");
+    if (typeof resumedPlayer === "string") throw new Error(resumedPlayer);
+    const resumedFloor = restarted.buildView(resumedPlayer).floor;
+    resumedFloor.traps = [];
+    const resumedStep = ordinaryStep(resumedFloor);
+    resumedFloor.monsters = resumedFloor.monsters.filter((candidate) =>
+      candidate.x !== resumedStep.x + resumedStep.dx || candidate.y !== resumedStep.y + resumedStep.dy);
+    resumedFloor.items = resumedFloor.items.filter((candidate) =>
+      candidate.x !== resumedStep.x + resumedStep.dx || candidate.y !== resumedStep.y + resumedStep.dy);
+    resumedPlayer.state.entity.x = resumedStep.x;
+    resumedPlayer.state.entity.y = resumedStep.y;
+    const resumedTurns = resumedPlayer.state.turns;
+
+    restarted.handleInput(resumedPlayer.id, resumedStep.key);
+
+    expect(resumedPlayer.state).toMatchObject({
+      turns: resumedTurns + 1,
+      entity: { x: resumedStep.x + resumedStep.dx, y: resumedStep.y + resumedStep.dy },
+    });
+    expect(restarted.getStats().shadowEvidenceDegraded).toBe(true);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+    expect(journal.readMovementTurnsAfter(movementTurnStream(resumedPlayer, resumedFloor), 0, 64)).toEqual([]);
   });
 });

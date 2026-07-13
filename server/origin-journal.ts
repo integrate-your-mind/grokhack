@@ -5,10 +5,15 @@ import { execFileSync } from "node:child_process";
 
 import { dataPath } from "./data-paths.js";
 import {
+  createMovementTurnEnvelope,
   createShadowJournalEntry,
+  MAX_MOVEMENT_TURN_ENVELOPE_BYTES,
+  validateMovementTurnEnvelope,
   validateShadowJournalEntry,
   validateShadowRoute,
   type GameplayJournalInput,
+  type MovementTurnEnvelope,
+  type MovementTurnEnvelopeInput,
   type MovementJournalInput,
   type ShadowJournalEntry,
   type ShadowJournalInput,
@@ -30,6 +35,15 @@ interface StreamHead {
   entryHash: string;
   terminal: boolean;
   lastEntry?: ShadowJournalEntry;
+}
+
+interface MovementTurnHead {
+  cursor: number;
+  envelopeHash: string;
+  movementEntryHash: string;
+  turnEntryHash: string | null;
+  terminal: boolean;
+  lastEnvelope?: MovementTurnEnvelope;
 }
 
 interface WriterOwner {
@@ -66,6 +80,11 @@ function processStartIdentity(pid: number): string | null {
 const SEGMENT_ENTRIES = 64;
 const AUTHORITY_REGISTRY_FILE = "_movement-authority-v1.json";
 const MOVEMENT_EVIDENCE_DIRECTORY = "movement-v2";
+const MOVEMENT_TURN_DIRECTORY = "movement-turn-v1";
+const MOVEMENT_TURN_PREPARATION_FILE = ".movement-turn-preparation-v1.json";
+const MOVEMENT_TURN_PREPARATION_TEMP_FILE = ".movement-turn-preparation-v1.tmp";
+const LEGACY_MOVEMENT_TURN_PREPARATION_TEMP =
+  /^\.movement-turn-preparation-v1\.json\.[1-9][0-9]*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/u;
 const JOURNAL_WRITER_FILE = ".origin-journal-writer-v1.lock";
 const JOURNAL_WRITER_RECOVERY_FILE = ".origin-journal-writer-recovery-v1.lock";
 const JOURNAL_COMMIT_MIGRATION_FILE = ".origin-journal-commit-sidecars-v1";
@@ -77,9 +96,11 @@ export const MAX_MOVEMENT_EVIDENCE_ENTRIES = 4_096;
 export const MAX_MOVEMENT_EVIDENCE_ENTRY_BYTES = 8 * 1024;
 const MAX_JOURNAL_SEGMENT_BYTES = SEGMENT_ENTRIES * MAX_MOVEMENT_EVIDENCE_ENTRY_BYTES;
 const MAX_EVIDENCE_FILES = MAX_GAMEPLAY_EVIDENCE_ENTRIES + MAX_MOVEMENT_EVIDENCE_ENTRIES;
+const MAX_LEGACY_MOVEMENT_TURN_PREPARATION_TEMPS = 64;
 const JOURNAL_WRITER_MAX_BYTES = 4 * 1024;
 const JOURNAL_READER_RETRY_ATTEMPTS = 200;
 const JOURNAL_READER_RETRY_DELAY_MS = 5;
+const MAX_MOVEMENT_TURN_PREPARATION_BYTES = 512;
 const PROCESS_WRITER_ID = randomUUID();
 const PROCESS_WRITER_START_ID = processStartIdentity(process.pid);
 
@@ -90,6 +111,8 @@ interface SharedEvidenceState {
   valid: boolean;
   recoveryFiles: Set<string>;
   heads: Map<string, StreamHead>;
+  movementTurnHeads: Map<string, MovementTurnHead>;
+  movementTurnLegacyTempsChecked: boolean;
   writeSequence: number;
 }
 
@@ -104,6 +127,16 @@ interface MovementAuthorityRecord extends MovementAuthority {
 interface MovementAuthorityRegistry {
   v: 1;
   floors: MovementAuthorityRecord[];
+}
+
+interface MovementTurnPreparation {
+  v: 1;
+  streamId: string;
+  operationId: string;
+  expectedCursor: number;
+  previousEnvelopeHash: string | null;
+  movementEntryHash: string;
+  state: "prepared" | "origin_applied" | "persistence_committed";
 }
 
 /** Non-secret character-run discriminator derived from the 256-bit resume credential. */
@@ -140,15 +173,51 @@ export function movementJournalStreamId(
   return `movement_${streamHash}`;
 }
 
+/** Dedicated additive stream for atomic movement plus optional turn evidence. */
+export function movementTurnJournalStreamId(
+  playerId: string,
+  runId: string,
+  authority: Readonly<MovementAuthority>,
+): string {
+  const movementStream = movementJournalStreamId(playerId, runId, authority);
+  const streamHash = createHash("sha256").update(`movement-turn-v1|${movementStream}`, "utf8").digest("hex").slice(0, 48);
+  return `turn_${streamHash}`;
+}
+
+function validateMovementTurnPreparationIdentity(input: {
+  streamId: string;
+  operationId: string;
+}): { streamId: string; operationId: string } {
+  if (!/^turn_[0-9a-f]{48}$/u.test(input.streamId) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(input.operationId)) {
+    throw new Error("invalid_movement_turn_preparation");
+  }
+  return { streamId: input.streamId, operationId: input.operationId };
+}
+
 export type OriginTransitionInput =
   | Omit<GameplayJournalInput, "cursor" | "previousEntryHash">
   | Omit<MovementJournalInput, "cursor" | "previousEntryHash">;
+
+export type OriginMovementTurnInput = Omit<
+  MovementTurnEnvelopeInput,
+  "cursor" | "previousEnvelopeHash" | "previousMovementEntryHash" | "previousTurnEntryHash"
+>;
+
+export type MovementTurnAppendResult =
+  | { status: "appended"; envelope: MovementTurnEnvelope }
+  | { status: "duplicate"; envelope: MovementTurnEnvelope }
+  | Extract<JournalAppendResult, { status: "dropped_capacity" }>;
 
 export interface OriginGameplayJournalOptions {
   /** Fault-injection seam used to prove pre/post-rename fsync recovery. */
   fsyncSync?: (descriptor: number) => void;
   /** Fault-injection seam used to prove short writes cannot truncate a segment. */
   writeSync?: (descriptor: number, buffer: Uint8Array, offset: number, length: number) => number;
+  /** Fault-injection seam for the durable movement-turn preparation rename. */
+  renameMovementTurnPreparationSync?: (from: string, to: string) => void;
+  /** Fault-injection seam for the durable movement-turn preparation unlink. */
+  unlinkMovementTurnPreparationSync?: (file: string) => void;
   /** Fault/interleaving seam used to prove online readers take a stable prefix. */
   readFileSync?: (file: string) => Buffer;
   /** Global retained V2 evidence ceiling. Primarily configurable for focused tests. */
@@ -160,9 +229,12 @@ export interface OriginGameplayJournalOptions {
 export class OriginGameplayJournal {
   private readonly directory: string;
   private heads = new Map<string, StreamHead>();
+  private movementTurnHeads = new Map<string, MovementTurnHead>();
   private evidenceState?: SharedEvidenceState;
   private readonly fsyncSync: (descriptor: number) => void;
   private readonly writeSync: (descriptor: number, buffer: Uint8Array, offset: number, length: number) => number;
+  private readonly renameMovementTurnPreparationSync: (from: string, to: string) => void;
+  private readonly unlinkMovementTurnPreparationSync: (file: string) => void;
   private readonly readFileSync: (file: string) => Buffer;
   private readonly maxMovementEntries: number;
   private readonly maxGameplayEntries: number;
@@ -174,6 +246,8 @@ export class OriginGameplayJournal {
     this.fsyncSync = options.fsyncSync ?? fs.fsyncSync;
     this.writeSync = options.writeSync ?? ((descriptor, buffer, offset, length) =>
       fs.writeSync(descriptor, buffer, offset, length));
+    this.renameMovementTurnPreparationSync = options.renameMovementTurnPreparationSync ?? fs.renameSync;
+    this.unlinkMovementTurnPreparationSync = options.unlinkMovementTurnPreparationSync ?? fs.unlinkSync;
     this.readFileSync = options.readFileSync ?? ((file) => fs.readFileSync(file));
     this.maxMovementEntries = options.maxMovementEntries ?? MAX_MOVEMENT_EVIDENCE_ENTRIES;
     this.maxGameplayEntries = options.maxGameplayEntries ?? MAX_GAMEPLAY_EVIDENCE_ENTRIES;
@@ -197,6 +271,154 @@ export class OriginGameplayJournal {
   validateMovementAuthorityRegistry(): void {
     this.ensureDirectory();
     this.readAuthorityRegistry();
+  }
+
+  /**
+   * One global durable preparation fences the origin mutation and persistence
+   * window. A cold process clears only `persistence_committed`: that phase is
+   * written after every required DuckDB write acknowledges, so an exact
+   * committed envelope plus that durable phase can safely reconcile cleanup.
+   * Earlier phases remain poison because they cannot prove persisted state.
+   */
+  hasPendingMovementTurn(): boolean {
+    this.ensureEvidenceState();
+    const directory = this.movementTurnDirectory();
+    try {
+      fs.lstatSync(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    this.ensureMovementTurnDirectory();
+    try {
+      this.recoverMovementTurnPreparationTemps();
+      const existing = this.readMovementTurnPreparation();
+      if (existing?.state === "persistence_committed" &&
+          this.movementTurnPreparationIsCommitted(existing)) {
+        this.unlinkMovementTurnPreparationSync(this.movementTurnPreparationFile());
+        this.syncDirectory(this.movementTurnDirectory());
+        return false;
+      }
+      return existing !== null;
+    } catch {
+      // Corrupt or ambiguous marker/temp state must fence shadow adoption, but
+      // legacy origin availability is handled by the caller's degraded latch.
+      return true;
+    }
+  }
+
+  prepareMovementTurn(input: Pick<OriginMovementTurnInput, "streamId" | "operationId" | "command" | "beforeState">): void {
+    const identity = validateMovementTurnPreparationIdentity(input);
+    this.ensureEvidenceState();
+    this.ensureMovementTurnDirectory();
+    const head = this.movementTurnHead(identity.streamId);
+    if (head.terminal || reduceMovement(input.beforeState, input.command).turnCost === "none") {
+      throw new Error("invalid_movement_turn_preparation");
+    }
+    const movement = createShadowJournalEntry({
+      streamId: `${identity.streamId}_movement`,
+      cursor: head.cursor + 1,
+      command: input.command,
+      beforeState: input.beforeState,
+      previousEntryHash: head.cursor === 0 ? null : head.movementEntryHash,
+    });
+    const preparation: MovementTurnPreparation = {
+      v: 1,
+      ...identity,
+      expectedCursor: head.cursor + 1,
+      previousEnvelopeHash: head.cursor === 0 ? null : head.envelopeHash,
+      movementEntryHash: movement.entryHash,
+      state: "prepared",
+    };
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (existing) {
+      if (existing.state === "prepared" && this.sameMovementTurnPreparation(existing, preparation)) {
+        // A lost directory-fsync acknowledgement may leave the exact marker
+        // durable even though the caller did not observe prepare success.
+        this.syncDirectory(this.movementTurnDirectory());
+        return;
+      }
+      throw new Error("movement_turn_preparation_exists");
+    }
+    this.writeMovementTurnPreparationDurably(preparation);
+  }
+
+  /** Durably records that all synchronous origin effects represented by the operation finished. */
+  markMovementTurnApplied(input: { streamId: string; operationId: string }): void {
+    const identity = validateMovementTurnPreparationIdentity(input);
+    this.ensureEvidenceState();
+    this.ensureMovementTurnDirectory();
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (!existing) throw new Error("movement_turn_preparation_uncommitted");
+    if (existing.streamId !== identity.streamId || existing.operationId !== identity.operationId) {
+      throw new Error("movement_turn_preparation_conflict");
+    }
+    if (!this.movementTurnPreparationIsCommitted(existing)) {
+      throw new Error("movement_turn_preparation_uncommitted");
+    }
+    if (existing.state === "origin_applied" || existing.state === "persistence_committed") {
+      this.syncDirectory(this.movementTurnDirectory());
+      return;
+    }
+    this.writeMovementTurnPreparationDurably({ ...existing, state: "origin_applied" });
+  }
+
+  /** Durably records that every movement-bound origin persistence write acknowledged. */
+  markMovementTurnPersistenceCommitted(input: { streamId: string; operationId: string }): void {
+    const identity = validateMovementTurnPreparationIdentity(input);
+    this.ensureEvidenceState();
+    this.ensureMovementTurnDirectory();
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (!existing) throw new Error("movement_turn_preparation_uncommitted");
+    if (existing.streamId !== identity.streamId || existing.operationId !== identity.operationId) {
+      throw new Error("movement_turn_preparation_conflict");
+    }
+    if (!this.movementTurnPreparationIsCommitted(existing)) {
+      throw new Error("movement_turn_preparation_uncommitted");
+    }
+    if (existing.state === "persistence_committed") {
+      this.syncDirectory(this.movementTurnDirectory());
+      return;
+    }
+    if (existing.state !== "origin_applied") {
+      throw new Error("movement_turn_origin_not_applied");
+    }
+    this.writeMovementTurnPreparationDurably({ ...existing, state: "persistence_committed" });
+  }
+
+  completeMovementTurnPreparation(input: { streamId: string; operationId: string }): void {
+    const identity = validateMovementTurnPreparationIdentity(input);
+    this.ensureEvidenceState();
+    this.ensureMovementTurnDirectory();
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (!existing) {
+      // An unlink may have committed even if its directory fsync response was
+      // lost. The matching immutable envelope makes this retry safe.
+      const head = this.movementTurnHead(identity.streamId).lastEnvelope;
+      if (head?.operationId !== identity.operationId) {
+        throw new Error("movement_turn_preparation_uncommitted");
+      }
+      this.syncDirectory(this.movementTurnDirectory());
+      return;
+    }
+    if (existing.streamId !== identity.streamId || existing.operationId !== identity.operationId) {
+      throw new Error("movement_turn_preparation_conflict");
+    }
+    if (!this.movementTurnPreparationIsCommitted(existing)) {
+      throw new Error("movement_turn_preparation_uncommitted");
+    }
+    if (existing.state === "prepared") {
+      throw new Error("movement_turn_origin_not_applied");
+    }
+    if (existing.state !== "persistence_committed") {
+      throw new Error("movement_turn_persistence_not_committed");
+    }
+    this.unlinkMovementTurnPreparationSync(this.movementTurnPreparationFile());
+    this.syncDirectory(this.movementTurnDirectory());
   }
 
   /**
@@ -297,6 +519,114 @@ export class OriginGameplayJournal {
       cursor: head.cursor + 1,
       previousEntryHash: head.cursor === 0 ? null : head.entryHash,
     } as ShadowJournalInput));
+  }
+
+  appendMovementTurn(input: OriginMovementTurnInput): MovementTurnAppendResult {
+    const movementCapacity = this.capacityResult(2);
+    const gameplayCapacity = input.turn ? this.capacityResult(1) : null;
+    const head = this.movementTurnHead(input.streamId);
+    const last = head.lastEnvelope;
+    if (last?.operationId === input.operationId) {
+      const retry = createMovementTurnEnvelope({
+        ...input,
+        cursor: last.cursor,
+        previousEnvelopeHash: last.previousEnvelopeHash,
+        previousMovementEntryHash: last.movement.previousEntryHash,
+        previousTurnEntryHash: last.turn ? last.turn.previousEntryHash : head.turnEntryHash,
+      });
+      if (retry.envelopeHash === last.envelopeHash) return { status: "duplicate", envelope: last };
+      throw new Error("movement_turn_operation_conflict");
+    }
+    if (movementCapacity) return movementCapacity;
+    if (gameplayCapacity) return gameplayCapacity;
+    return this.appendMovementTurnEnvelope(createMovementTurnEnvelope({
+      ...input,
+      cursor: head.cursor + 1,
+      previousEnvelopeHash: head.cursor === 0 ? null : head.envelopeHash,
+      previousMovementEntryHash: head.cursor === 0 ? null : head.movementEntryHash,
+      previousTurnEntryHash: head.turnEntryHash,
+    }));
+  }
+
+  appendMovementTurnEnvelope(envelope: MovementTurnEnvelope): MovementTurnAppendResult {
+    const validated = validateMovementTurnEnvelope(envelope);
+    const movementCapacity = this.capacityResult(2);
+    if (movementCapacity) {
+      const last = this.movementTurnHeads.get(validated.streamId)?.lastEnvelope;
+      if (last?.envelopeHash === validated.envelopeHash) return { status: "duplicate", envelope: last };
+      return movementCapacity;
+    }
+    if (validated.turn) {
+      const gameplayCapacity = this.capacityResult(1);
+      if (gameplayCapacity) {
+        const last = this.movementTurnHeads.get(validated.streamId)?.lastEnvelope;
+        if (last?.envelopeHash === validated.envelopeHash) return { status: "duplicate", envelope: last };
+        return gameplayCapacity;
+      }
+    }
+    const head = this.movementTurnHead(validated.streamId);
+    if (head.terminal) throw new Error("movement_turn_terminal_stream");
+    if (validated.cursor <= head.cursor) {
+      const existing = this.movementTurnEnvelopeAt(validated.streamId, validated.cursor);
+      if (existing?.envelopeHash === validated.envelopeHash) return { status: "duplicate", envelope: existing };
+      throw new Error("movement_turn_cursor_conflict");
+    }
+    if (validated.cursor !== head.cursor + 1) throw new Error("movement_turn_cursor_gap");
+    if (validated.previousEnvelopeHash !== (head.cursor === 0 ? null : head.envelopeHash)) {
+      throw new Error("movement_turn_hash_chain_mismatch");
+    }
+    if (validated.movement.previousEntryHash !== (head.cursor === 0 ? null : head.movementEntryHash)) {
+      throw new Error("movement_turn_movement_chain_mismatch");
+    }
+    if (validated.turn && validated.turn.previousEntryHash !== head.turnEntryHash) {
+      throw new Error("movement_turn_vitals_chain_mismatch");
+    }
+    const previous = head.lastEnvelope;
+    if (head.cursor > 0 && !previous) throw new Error("movement_turn_missing_segment");
+    if (previous) {
+      const previousTransition = reduceMovement(previous.movement.beforeState, previous.movement.command);
+      if (previousTransition.turnCost === "none" &&
+          movementContinuityHash(previousTransition.state) !== validated.movement.beforeContinuityHash) {
+        throw new Error("movement_turn_state_continuity_mismatch");
+      }
+    }
+    const payload = Buffer.from(`${JSON.stringify(validated)}\n`, "utf8");
+    if (payload.byteLength > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) {
+      throw new Error("movement_turn_envelope_too_large");
+    }
+    const evidence = this.ensureEvidenceState();
+    this.beginJournalWrite(evidence);
+    let file: string;
+    try {
+      this.ensureMovementTurnDirectory();
+      file = this.movementTurnFileFor(validated.streamId, this.segmentFor(validated.cursor));
+      try {
+        this.ensureCommitFile(file);
+        this.appendFileDurably(file, payload);
+        // The single commit byte publishes the complete pair or neither nested
+        // transition. Readers never observe the preceding data append alone.
+        this.appendCommitDurably(file);
+      } catch (error) {
+        this.movementTurnHeads.delete(validated.streamId);
+        this.invalidateAndReconcileEvidence(file);
+        throw error;
+      }
+      evidence.movementEntries++;
+      if (validated.turn) evidence.gameplayEntries++;
+      const next: MovementTurnHead = {
+        cursor: validated.cursor,
+        envelopeHash: validated.envelopeHash,
+        movementEntryHash: validated.movement.entryHash,
+        turnEntryHash: validated.turn?.entryHash ?? head.turnEntryHash,
+        terminal: validated.turn?.terminal ?? validated.movement.terminal,
+        lastEnvelope: validated,
+      };
+      this.movementTurnHeads.set(validated.streamId, next);
+      evidence.movementTurnHeads.set(validated.streamId, next);
+      return { status: "appended", envelope: validated };
+    } finally {
+      if (evidence.valid) this.endJournalWrite(evidence);
+    }
   }
 
   append(entry: ShadowJournalEntry): JournalAppendResult {
@@ -400,6 +730,33 @@ export class OriginGameplayJournal {
     throw new Error("journal_writer_busy", { cause: lastError });
   }
 
+  readMovementTurnsAfter(streamId: string, cursor: number, limit: number): MovementTurnEnvelope[] {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new RangeError("invalid cursor");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new RangeError("invalid limit");
+    this.assertMovementTurnStreamId(streamId);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < JOURNAL_READER_RETRY_ATTEMPTS; attempt++) {
+      const before = this.readWriteSequenceToken();
+      if (before?.active) {
+        if (before.ownerId === PROCESS_WRITER_ID) throw new Error("journal_writer_busy");
+        this.waitForWriter();
+        continue;
+      }
+      this.movementTurnHeads.delete(streamId);
+      try {
+        const result = this.readMovementTurnsAfterSnapshot(streamId, cursor, limit);
+        const after = this.readWriteSequenceToken();
+        if (before?.token === after?.token && !after?.active) return result;
+      } catch (error) {
+        lastError = error;
+        const after = this.readWriteSequenceToken();
+        if (before?.token === after?.token && !after?.active) throw error;
+      }
+      this.waitForWriter();
+    }
+    throw new Error("journal_writer_busy", { cause: lastError });
+  }
+
   private readAfterSnapshot(streamId: string, cursor: number, limit: number): ShadowJournalEntry[] {
     const head = this.head(streamId, false);
     if (cursor >= head.cursor) return [];
@@ -417,6 +774,99 @@ export class OriginGameplayJournal {
     const expected = Math.min(limit, head.cursor - cursor);
     if (result.length !== expected) throw new Error("journal_missing_segment");
     return result;
+  }
+
+  private readMovementTurnsAfterSnapshot(
+    streamId: string,
+    cursor: number,
+    limit: number,
+  ): MovementTurnEnvelope[] {
+    const head = this.movementTurnHead(streamId, false);
+    if (cursor >= head.cursor) return [];
+    const result: MovementTurnEnvelope[] = [];
+    let segment = this.segmentFor(cursor + 1);
+    while (result.length < limit) {
+      const envelopes = this.readMovementTurnSegment(streamId, segment, false);
+      for (const envelope of envelopes) {
+        if (envelope.cursor > cursor && envelope.cursor <= head.cursor) result.push(envelope);
+        if (result.length === limit) return result;
+      }
+      if (envelopes.length < SEGMENT_ENTRIES) break;
+      segment++;
+    }
+    const expected = Math.min(limit, head.cursor - cursor);
+    if (result.length !== expected) throw new Error("movement_turn_missing_segment");
+    return result;
+  }
+
+  private movementTurnHead(streamId: string, repair = true): MovementTurnHead {
+    this.assertMovementTurnStreamId(streamId);
+    const cached = this.movementTurnHeads.get(streamId);
+    if (cached) return cached;
+    this.ensureDirectory();
+    const segments = this.boundedMovementTurnSegments(streamId);
+    if (!segments.length) {
+      const empty: MovementTurnHead = {
+        cursor: 0,
+        envelopeHash: "",
+        movementEntryHash: "",
+        turnEntryHash: null,
+        terminal: false,
+      };
+      this.movementTurnHeads.set(streamId, empty);
+      return empty;
+    }
+    const latestSegment = segments.at(-1)!;
+    if (segments.some((value, index) => value !== index)) throw new Error("movement_turn_missing_segment");
+    let envelopes = this.readMovementTurnSegment(streamId, latestSegment, repair);
+    if (!envelopes.length) {
+      if (repair && this.removeEmptyMovementTurnSegmentFiles(streamId, latestSegment)) {
+        return this.movementTurnHead(streamId);
+      }
+      if (repair) throw new Error("movement_turn_empty_segment");
+      if (latestSegment === 0) {
+        return { cursor: 0, envelopeHash: "", movementEntryHash: "", turnEntryHash: null, terminal: false };
+      }
+      throw new Error("movement_turn_empty_segment");
+    }
+    if (repair) this.syncMovementTurnSegmentFiles(streamId, latestSegment);
+    const allEnvelopes = segments.flatMap((segment) =>
+      segment === latestSegment ? envelopes : this.readMovementTurnSegment(streamId, segment, false));
+    let lastTurnHash: string | null = null;
+    for (let index = 0; index < allEnvelopes.length; index++) {
+      const envelope = allEnvelopes[index]!;
+      const previous = allEnvelopes[index - 1];
+      if (envelope.cursor !== index + 1 ||
+          envelope.previousEnvelopeHash !== (previous?.envelopeHash ?? null) ||
+          envelope.movement.previousEntryHash !== (previous?.movement.entryHash ?? null) ||
+          (envelope.turn !== null && envelope.turn.previousEntryHash !== lastTurnHash) ||
+          previous?.turn?.terminal || previous?.movement.terminal) {
+        throw new Error("movement_turn_corrupt_sequence");
+      }
+      if (previous) {
+        const transition = reduceMovement(previous.movement.beforeState, previous.movement.command);
+        if (transition.turnCost === "none" &&
+            movementContinuityHash(transition.state) !== envelope.movement.beforeContinuityHash) {
+          throw new Error("movement_turn_state_continuity_mismatch");
+        }
+      }
+      if (envelope.turn) lastTurnHash = envelope.turn.entryHash;
+    }
+    const last = allEnvelopes.at(-1)!;
+    const head: MovementTurnHead = {
+      cursor: last.cursor,
+      envelopeHash: last.envelopeHash,
+      movementEntryHash: last.movement.entryHash,
+      turnEntryHash: lastTurnHash,
+      terminal: last.turn?.terminal ?? last.movement.terminal,
+      lastEnvelope: last,
+    };
+    this.movementTurnHeads.set(streamId, head);
+    return head;
+  }
+
+  private movementTurnEnvelopeAt(streamId: string, cursor: number): MovementTurnEnvelope | undefined {
+    return this.readMovementTurnSegment(streamId, this.segmentFor(cursor)).find((entry) => entry.cursor === cursor);
   }
 
   private head(streamId: string, repair = true): StreamHead {
@@ -506,6 +956,168 @@ export class OriginGameplayJournal {
     }
   }
 
+  private ensureMovementTurnDirectory(): void {
+    this.ensureDirectory();
+    const directory = this.movementTurnDirectory();
+    if (!fs.existsSync(directory)) {
+      fs.mkdirSync(directory, { mode: 0o700 });
+      this.syncDirectory(this.directory);
+    }
+    const metadata = fs.lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() ||
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("movement_turn_directory_insecure");
+    }
+  }
+
+  private movementTurnPreparationFile(): string {
+    return path.join(this.movementTurnDirectory(), MOVEMENT_TURN_PREPARATION_FILE);
+  }
+
+  private movementTurnPreparationTempFile(): string {
+    return path.join(this.movementTurnDirectory(), MOVEMENT_TURN_PREPARATION_TEMP_FILE);
+  }
+
+  private readMovementTurnPreparation(): MovementTurnPreparation | null {
+    const file = this.movementTurnPreparationFile();
+    let metadata: fs.Stats;
+    try {
+      metadata = fs.lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 1 ||
+        metadata.size > MAX_MOVEMENT_TURN_PREPARATION_BYTES ||
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("movement_turn_preparation_corrupt");
+    }
+    try {
+      const candidate = JSON.parse(this.readFileSync(file).toString("utf8")) as Partial<MovementTurnPreparation>;
+      const keys = Object.keys(candidate);
+      const state = candidate.state ?? "prepared";
+      if (candidate.v !== 1 || typeof candidate.streamId !== "string" ||
+          typeof candidate.operationId !== "string" || !Number.isSafeInteger(candidate.expectedCursor) ||
+          Number(candidate.expectedCursor) < 1 ||
+          (candidate.previousEnvelopeHash !== null &&
+            (typeof candidate.previousEnvelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(candidate.previousEnvelopeHash))) ||
+          typeof candidate.movementEntryHash !== "string" || !/^[0-9a-f]{16}$/u.test(candidate.movementEntryHash) ||
+          (state !== "prepared" && state !== "origin_applied" && state !== "persistence_committed") ||
+          (keys.length !== 6 && keys.length !== 7) ||
+          (keys.length === 7 && !keys.includes("state"))) {
+        throw new Error("movement_turn_preparation_corrupt");
+      }
+      const identity = validateMovementTurnPreparationIdentity({
+        streamId: candidate.streamId,
+        operationId: candidate.operationId,
+      });
+      return {
+        v: 1,
+        ...identity,
+        expectedCursor: Number(candidate.expectedCursor),
+        previousEnvelopeHash: candidate.previousEnvelopeHash ?? null,
+        movementEntryHash: candidate.movementEntryHash,
+        state,
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message === "movement_turn_preparation_corrupt") throw error;
+      throw new Error("movement_turn_preparation_corrupt", { cause: error });
+    }
+  }
+
+  private sameMovementTurnPreparation(
+    left: MovementTurnPreparation,
+    right: MovementTurnPreparation,
+  ): boolean {
+    return left.streamId === right.streamId &&
+      left.operationId === right.operationId &&
+      left.expectedCursor === right.expectedCursor &&
+      left.previousEnvelopeHash === right.previousEnvelopeHash &&
+      left.movementEntryHash === right.movementEntryHash;
+  }
+
+  private movementTurnPreparationIsCommitted(preparation: MovementTurnPreparation): boolean {
+    const committed = this.movementTurnEnvelopeAt(preparation.streamId, preparation.expectedCursor);
+    return committed?.operationId === preparation.operationId &&
+      committed.previousEnvelopeHash === preparation.previousEnvelopeHash &&
+      committed.movement.entryHash === preparation.movementEntryHash;
+  }
+
+  private recoverMovementTurnPreparationTemps(): void {
+    const directory = this.movementTurnDirectory();
+    const legacyScanRequired = this.evidenceState?.movementTurnLegacyTempsChecked !== true;
+    const files = [this.movementTurnPreparationTempFile()];
+    if (legacyScanRequired) {
+      const legacyNames = fs.readdirSync(directory).filter((name) =>
+        LEGACY_MOVEMENT_TURN_PREPARATION_TEMP.test(name));
+      if (legacyNames.length > MAX_LEGACY_MOVEMENT_TURN_PREPARATION_TEMPS) {
+        throw new Error("movement_turn_preparation_temp_inventory_too_large");
+      }
+      files.push(...legacyNames.map((name) => path.join(directory, name)));
+    }
+    let removed = false;
+    for (const file of files) {
+      let metadata: fs.Stats;
+      try {
+        metadata = fs.lstatSync(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (!metadata.isFile() || metadata.isSymbolicLink() ||
+          metadata.size > MAX_MOVEMENT_TURN_PREPARATION_BYTES ||
+          (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+        throw new Error("movement_turn_preparation_temp_corrupt");
+      }
+      fs.unlinkSync(file);
+      removed = true;
+    }
+    if (removed) this.syncDirectory(directory);
+    if (legacyScanRequired && this.evidenceState) {
+      this.evidenceState.movementTurnLegacyTempsChecked = true;
+    }
+  }
+
+  private writeMovementTurnPreparationDurably(preparation: MovementTurnPreparation): void {
+    const payload = Buffer.from(`${JSON.stringify(preparation)}\n`, "utf8");
+    if (payload.byteLength > MAX_MOVEMENT_TURN_PREPARATION_BYTES) {
+      throw new Error("movement_turn_preparation_too_large");
+    }
+    this.recoverMovementTurnPreparationTemps();
+    const temporary = this.movementTurnPreparationTempFile();
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(
+        temporary,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      const metadata = fs.fstatSync(descriptor);
+      if (!metadata.isFile() || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+        throw new Error("movement_turn_preparation_temp_corrupt");
+      }
+      let written = 0;
+      while (written < payload.byteLength) {
+        const count = this.writeSync(descriptor, payload, written, payload.byteLength - written);
+        if (!Number.isSafeInteger(count) || count < 1 || count > payload.byteLength - written) {
+          throw new Error("journal_short_write");
+        }
+        written += count;
+      }
+      this.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      this.renameMovementTurnPreparationSync(temporary, this.movementTurnPreparationFile());
+      this.syncDirectory(this.movementTurnDirectory());
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch { /* preserve the original write/sync error */ }
+      }
+      try { fs.unlinkSync(temporary); } catch { /* cold recovery validates any survivor */ }
+      throw error;
+    }
+  }
+
   private syncDirectory(directory: string): void {
     const descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
     try {
@@ -515,7 +1127,11 @@ export class OriginGameplayJournal {
     }
   }
 
-  private replaceFileDurably(file: string, payload: Uint8Array): void {
+  private replaceFileDurably(
+    file: string,
+    payload: Uint8Array,
+    renameSync: (from: string, to: string) => void = fs.renameSync,
+  ): void {
     const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     let descriptor: number | undefined;
     try {
@@ -531,7 +1147,7 @@ export class OriginGameplayJournal {
       this.fsyncSync(descriptor);
       fs.closeSync(descriptor);
       descriptor = undefined;
-      fs.renameSync(temporary, file);
+      renameSync(temporary, file);
       this.syncDirectory(path.dirname(file));
     } catch (error) {
       if (descriptor !== undefined) {
@@ -685,6 +1301,74 @@ export class OriginGameplayJournal {
         }
         return validateShadowJournalEntry(JSON.parse(line) as unknown);
       });
+  }
+
+  private readMovementTurnSegment(
+    streamId: string,
+    segment: number,
+    repair = true,
+  ): MovementTurnEnvelope[] {
+    const file = this.movementTurnFileFor(streamId, segment);
+    const dataExists = fs.existsSync(file);
+    const commitFile = this.commitFileFor(file);
+    if (!dataExists) {
+      if (fs.existsSync(commitFile) && this.readCommitCount(commitFile) > 0) {
+        throw new Error("movement_turn_missing_segment");
+      }
+      return [];
+    }
+    const envelopes = this.readCommittedMovementTurnFile(file, repair);
+    if (envelopes.length > SEGMENT_ENTRIES) throw new Error("movement_turn_corrupt_sequence");
+    return envelopes;
+  }
+
+  private readMovementTurnFile(file: string, repair = true): MovementTurnEnvelope[] {
+    const metadata = fs.statSync(file);
+    if (metadata.size > SEGMENT_ENTRIES * MAX_MOVEMENT_TURN_ENVELOPE_BYTES) {
+      throw new Error("movement_turn_segment_too_large");
+    }
+    if (!metadata.isFile() ||
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("movement_turn_insecure_file");
+    }
+    let payload = this.readFileSync(file);
+    if (payload.byteLength > 0 && payload[payload.byteLength - 1] !== 0x0a) {
+      const lastNewline = payload.lastIndexOf(0x0a);
+      const durableLength = lastNewline < 0 ? 0 : lastNewline + 1;
+      if (repair) {
+        const descriptor = fs.openSync(file, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          fs.ftruncateSync(descriptor, durableLength);
+          this.fsyncSync(descriptor);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      }
+      payload = payload.subarray(0, durableLength);
+    }
+    if (payload.byteLength === 0) return [];
+    return payload.toString("utf8").split("\n").filter(Boolean).map((line) => {
+      if (Buffer.byteLength(line, "utf8") + 1 > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) {
+        throw new Error("movement_turn_envelope_too_large");
+      }
+      return validateMovementTurnEnvelope(JSON.parse(line) as unknown);
+    });
+  }
+
+  private readCommittedMovementTurnFile(file: string, repair: boolean): MovementTurnEnvelope[] {
+    const commitFile = this.commitFileFor(file);
+    if (!repair && fs.existsSync(commitFile)) {
+      const committed = this.readCommitCount(commitFile);
+      const envelopes = this.readMovementTurnFile(file, false);
+      if (committed > envelopes.length) throw new Error("movement_turn_commit_sidecar_corrupt");
+      return envelopes.slice(0, committed);
+    }
+    const envelopes = this.readMovementTurnFile(file, repair);
+    if (!fs.existsSync(commitFile)) throw new Error("movement_turn_commit_sidecar_missing");
+    const committed = this.readCommitCount(commitFile);
+    if (committed > envelopes.length) throw new Error("movement_turn_commit_sidecar_corrupt");
+    if (repair && envelopes.length > committed) this.truncateJournalToLineCount(file, committed);
+    return envelopes.slice(0, committed);
   }
 
   private readCommittedJournalFile(
@@ -888,6 +1572,7 @@ export class OriginGameplayJournal {
   private ensureEvidenceState(): SharedEvidenceState {
     if (this.evidenceState) {
       this.heads = this.evidenceState.heads;
+      this.movementTurnHeads = this.evidenceState.movementTurnHeads;
       if (!this.evidenceState.valid || this.evidenceState.writeSequence % 2 !== 0) {
         this.reconcileEvidenceStateWithSequence(this.evidenceState);
       }
@@ -899,6 +1584,7 @@ export class OriginGameplayJournal {
     if (shared) {
       this.evidenceState = shared;
       this.heads = shared.heads;
+      this.movementTurnHeads = shared.movementTurnHeads;
       if (!shared.valid || shared.writeSequence % 2 !== 0) {
         this.reconcileEvidenceStateWithSequence(shared);
       }
@@ -912,6 +1598,8 @@ export class OriginGameplayJournal {
       valid: false,
       recoveryFiles: new Set(),
       heads: this.heads,
+      movementTurnHeads: this.movementTurnHeads,
+      movementTurnLegacyTempsChecked: false,
       writeSequence: 0,
     };
     sharedEvidenceByDirectory.set(key, created);
@@ -952,6 +1640,7 @@ export class OriginGameplayJournal {
     let files = 0;
     let totalEntries = 0;
     const streams = new Map<string, ShadowJournalEntry[]>();
+    const movementTurnStreams = new Map<string, MovementTurnEnvelope[]>();
     for (const directory of this.journalDirectories()) {
       if (!fs.existsSync(directory)) continue;
       for (const name of fs.readdirSync(directory)) {
@@ -976,6 +1665,37 @@ export class OriginGameplayJournal {
           streams.set(streamId, stream);
           if (entry.v === 2) movementEntries++;
           else gameplayEntries++;
+        }
+      }
+    }
+    const movementTurnDirectory = this.movementTurnDirectory();
+    if (fs.existsSync(movementTurnDirectory)) {
+      const metadata = fs.lstatSync(movementTurnDirectory);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() ||
+          (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+        throw new Error("movement_turn_directory_insecure");
+      }
+      for (const name of fs.readdirSync(movementTurnDirectory)) {
+        const match = /^(turn_[0-9a-f]{48})\.([0-9]{8})\.jsonl$/u.exec(name);
+        if (!match) continue;
+        files++;
+        if (files > MAX_EVIDENCE_FILES) throw new Error("journal_evidence_inventory_too_large");
+        const streamId = match[1]!;
+        const segment = Number(match[2]);
+        const envelopes = this.readCommittedMovementTurnFile(path.join(movementTurnDirectory, name), true);
+        totalEntries += envelopes.reduce((count, envelope) => count + 1 + (envelope.turn ? 1 : 0), 0);
+        if (totalEntries > MAX_GAMEPLAY_EVIDENCE_ENTRIES + MAX_MOVEMENT_EVIDENCE_ENTRIES) {
+          throw new Error("journal_evidence_inventory_too_large");
+        }
+        for (const envelope of envelopes) {
+          if (envelope.streamId !== streamId || this.segmentFor(envelope.cursor) !== segment) {
+            throw new Error("movement_turn_corrupt_sequence");
+          }
+          const stream = movementTurnStreams.get(streamId) ?? [];
+          stream.push(envelope);
+          movementTurnStreams.set(streamId, stream);
+          movementEntries++;
+          if (envelope.turn) gameplayEntries++;
         }
       }
     }
@@ -1006,6 +1726,42 @@ export class OriginGameplayJournal {
         lastEntry: last,
       });
     }
+    const rebuiltMovementTurnHeads = new Map<string, MovementTurnHead>();
+    for (const [streamId, envelopes] of movementTurnStreams) {
+      envelopes.sort((left, right) => left.cursor - right.cursor);
+      let lastTurnHash: string | null = null;
+      for (let index = 0; index < envelopes.length; index++) {
+        const envelope = envelopes[index]!;
+        const previous = envelopes[index - 1];
+        if (envelope.cursor !== index + 1 ||
+            envelope.previousEnvelopeHash !== (previous?.envelopeHash ?? null) ||
+            envelope.movement.previousEntryHash !== (previous?.movement.entryHash ?? null) ||
+            (envelope.turn !== null && envelope.turn.previousEntryHash !== lastTurnHash) ||
+            previous?.turn?.terminal || previous?.movement.terminal) {
+          throw new Error("movement_turn_corrupt_sequence");
+        }
+        if (previous) {
+          const transition = reduceMovement(previous.movement.beforeState, previous.movement.command);
+          if (transition.turnCost === "none" &&
+              movementContinuityHash(transition.state) !== envelope.movement.beforeContinuityHash) {
+            throw new Error("movement_turn_state_continuity_mismatch");
+          }
+        }
+        if (envelope.turn) lastTurnHash = envelope.turn.entryHash;
+      }
+      const last = envelopes.at(-1)!;
+      rebuiltMovementTurnHeads.set(streamId, {
+        cursor: last.cursor,
+        envelopeHash: last.envelopeHash,
+        movementEntryHash: last.movement.entryHash,
+        turnEntryHash: lastTurnHash,
+        terminal: last.turn?.terminal ?? last.movement.terminal,
+        lastEnvelope: last,
+      });
+    }
+    if (movementEntries > this.maxMovementEntries || gameplayEntries > this.maxGameplayEntries) {
+      throw new Error("journal_evidence_capacity_exceeded");
+    }
     if (!migrated) {
       // Sidecars may live in the child movement directory. Re-sync every
       // journal directory before the root sentinel can durably declare the
@@ -1013,6 +1769,7 @@ export class OriginGameplayJournal {
       for (const directory of this.journalDirectories()) {
         if (fs.existsSync(directory)) this.syncDirectory(directory);
       }
+      if (fs.existsSync(movementTurnDirectory)) this.syncDirectory(movementTurnDirectory);
       this.replaceFileDurably(
         path.join(this.directory, JOURNAL_COMMIT_MIGRATION_FILE),
         Buffer.from("v1\n", "utf8"),
@@ -1021,6 +1778,9 @@ export class OriginGameplayJournal {
     state.heads.clear();
     for (const [streamId, head] of rebuiltHeads) state.heads.set(streamId, head);
     this.heads = state.heads;
+    state.movementTurnHeads.clear();
+    for (const [streamId, head] of rebuiltMovementTurnHeads) state.movementTurnHeads.set(streamId, head);
+    this.movementTurnHeads = state.movementTurnHeads;
     state.gameplayEntries = gameplayEntries;
     state.movementEntries = movementEntries;
     this.syncRecoveryFiles(state);
@@ -1244,6 +2004,31 @@ export class OriginGameplayJournal {
     return segments;
   }
 
+  private boundedMovementTurnSegments(streamId: string): number[] {
+    this.assertMovementTurnStreamId(streamId);
+    const maxSegments = Math.ceil(this.maxMovementEntries / SEGMENT_ENTRIES);
+    const segments: number[] = [];
+    let missing = false;
+    for (let segment = 0; segment < maxSegments; segment++) {
+      const file = this.movementTurnFileFor(streamId, segment);
+      const exists = fs.existsSync(file);
+      if (!exists) {
+        const commitFile = this.commitFileFor(file);
+        if (fs.existsSync(commitFile) && this.readCommitCount(commitFile) > 0) {
+          throw new Error("movement_turn_missing_segment");
+        }
+        missing = true;
+        continue;
+      }
+      if (missing) throw new Error("movement_turn_missing_segment");
+      segments.push(segment);
+    }
+    if (fs.existsSync(this.movementTurnFileFor(streamId, maxSegments))) {
+      throw new Error("movement_turn_evidence_capacity_exceeded");
+    }
+    return segments;
+  }
+
   private syncSegmentFiles(streamId: string, segment: number): void {
     const files = this.segmentFilesFor(streamId, segment);
     for (const file of files) {
@@ -1259,6 +2044,20 @@ export class OriginGameplayJournal {
     }
   }
 
+  private syncMovementTurnSegmentFiles(streamId: string, segment: number): void {
+    const file = this.movementTurnFileFor(streamId, segment);
+    const files = [file, this.commitFileFor(file)].filter((candidate) => fs.existsSync(candidate));
+    for (const candidate of files) {
+      const descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try {
+        this.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    }
+    if (files.length) this.syncDirectory(this.movementTurnDirectory());
+  }
+
   private removeEmptySegmentFiles(streamId: string, segment: number): boolean {
     const files = this.segmentFilesFor(streamId, segment);
     if (!files.length || files.some((file) => fs.statSync(file).size !== 0)) return false;
@@ -1266,6 +2065,16 @@ export class OriginGameplayJournal {
     for (const directory of new Set(files.map((file) => path.dirname(file)))) {
       this.syncDirectory(directory);
     }
+    return true;
+  }
+
+  private removeEmptyMovementTurnSegmentFiles(streamId: string, segment: number): boolean {
+    const file = this.movementTurnFileFor(streamId, segment);
+    const commitFile = this.commitFileFor(file);
+    const files = [file, commitFile].filter((candidate) => fs.existsSync(candidate));
+    if (!files.length || files.some((candidate) => fs.statSync(candidate).size !== 0)) return false;
+    for (const candidate of files) fs.rmSync(candidate);
+    this.syncDirectory(this.movementTurnDirectory());
     return true;
   }
 
@@ -1295,6 +2104,16 @@ export class OriginGameplayJournal {
     return path.join(this.directory, MOVEMENT_EVIDENCE_DIRECTORY);
   }
 
+  private movementTurnFileFor(streamId: string, segment: number): string {
+    this.assertMovementTurnStreamId(streamId);
+    if (!Number.isSafeInteger(segment) || segment < 0) throw new Error("invalid_segment");
+    return path.join(this.movementTurnDirectory(), `${streamId}.${String(segment).padStart(8, "0")}.jsonl`);
+  }
+
+  private movementTurnDirectory(): string {
+    return path.join(this.directory, MOVEMENT_TURN_DIRECTORY);
+  }
+
   private journalDirectories(): string[] {
     return [this.directory, this.movementDirectory()];
   }
@@ -1305,5 +2124,9 @@ export class OriginGameplayJournal {
 
   private assertStreamId(streamId: string): void {
     if (!/^[A-Za-z0-9_-]{1,128}$/u.test(streamId)) throw new Error("invalid_stream_id");
+  }
+
+  private assertMovementTurnStreamId(streamId: string): void {
+    if (!/^turn_[0-9a-f]{48}$/u.test(streamId)) throw new Error("invalid_movement_turn_stream_id");
   }
 }

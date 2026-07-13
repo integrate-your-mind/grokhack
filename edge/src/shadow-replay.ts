@@ -6,8 +6,10 @@ import {
   MAX_SHADOW_BATCH_BYTES,
   MAX_SHADOW_BATCH_ENTRIES,
   SHADOW_JOURNAL_VERSION,
+  validateMovementTurnEnvelope,
   validateShadowJournalEntry,
   validateShadowRoute,
+  type MovementTurnEnvelope,
   type ShadowJournalEntry,
   type ShadowRoute,
 } from "../../src/shadow-journal";
@@ -28,6 +30,23 @@ interface EntryRow extends Record<string, SqlStorageValue> {
   entry_hash: string;
 }
 
+interface MovementTurnCheckpointRow extends Record<string, SqlStorageValue> {
+  checkpoint: number;
+  last_envelope_hash: string | null;
+  last_movement_entry_hash: string | null;
+  last_turn_entry_hash: string | null;
+  movement_state_hash: string | null;
+  turn_state_hash: string | null;
+  movement_continuity_hash: string | null;
+  terminal: number;
+}
+
+interface MovementTurnReceiptRow extends Record<string, SqlStorageValue> {
+  cursor: number;
+  operation_id: string;
+  envelope_hash: string;
+}
+
 interface TableColumnRow extends Record<string, SqlStorageValue> { name: string }
 interface VersionRow extends Record<string, SqlStorageValue> { version: number | null }
 interface CountRow extends Record<string, SqlStorageValue> { count: number }
@@ -40,7 +59,7 @@ interface IdentityRow extends Record<string, SqlStorageValue> {
   stream_id: string;
 }
 
-const SHADOW_SCHEMA_VERSION = 5;
+const SHADOW_SCHEMA_VERSION = 6;
 const MAX_DIVERGENCES_PER_STREAM = 64;
 const SHADOW_RECEIPT_WINDOW = 256;
 
@@ -64,6 +83,18 @@ type IngestSuccess = {
   stateHash: string | null;
   entryVersion: number | null;
   stateDomain: "vitals" | "movement" | null;
+};
+
+type MovementTurnIngestSuccess = {
+  ok: true;
+  streamId: string;
+  checkpoint: number;
+  accepted: number;
+  duplicates: number;
+  terminal: boolean;
+  lastEnvelopeHash: string | null;
+  movementStateHash: string | null;
+  turnStateHash: string | null;
 };
 
 function firstRow<T>(rows: Iterable<T>): T | undefined {
@@ -143,6 +174,27 @@ export class ShadowReplay extends DurableObject<Env> {
         detected_at INTEGER NOT NULL,
         PRIMARY KEY (stream_id, cursor, entry_hash)
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS movement_turn_checkpoint (
+        stream_id TEXT PRIMARY KEY,
+        checkpoint INTEGER NOT NULL CHECK (checkpoint >= 0),
+        last_envelope_hash TEXT,
+        last_movement_entry_hash TEXT,
+        last_turn_entry_hash TEXT,
+        movement_state_hash TEXT,
+        turn_state_hash TEXT,
+        movement_continuity_hash TEXT,
+        terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+        updated_at INTEGER NOT NULL
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS movement_turn_receipts (
+        stream_id TEXT NOT NULL,
+        cursor INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        envelope_hash TEXT NOT NULL,
+        ingested_at INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, cursor),
+        UNIQUE (stream_id, operation_id)
+      ) WITHOUT ROWID;
     `);
     const columns = new Set(this.ctx.storage.sql.exec<TableColumnRow>("PRAGMA table_info(shadow_checkpoint)").toArray().map((row) => row.name));
     const expansions = [
@@ -181,7 +233,7 @@ export class ShadowReplay extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE shadow_checkpoint
       SET entry_version = 1, state_domain = 'vitals'
       WHERE checkpoint > 0 AND entry_version IS NULL AND state_domain IS NULL`);
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch()), (4, unixepoch()), (5, unixepoch())");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch()), (4, unixepoch()), (5, unixepoch()), (6, unixepoch())");
     return true;
   }
 
@@ -205,7 +257,48 @@ export class ShadowReplay extends DurableObject<Env> {
     let route: ShadowRoute;
     try { route = validateShadowRoute((candidate as { route?: unknown }).route); }
     catch (error) { return json({ code: error instanceof Error ? error.message : "invalid_route" }, 400); }
+    const rawEnvelopes = (candidate as { envelopes?: unknown }).envelopes;
     const rawEntries = (candidate as { entries?: unknown }).entries;
+    if (Array.isArray(rawEnvelopes)) {
+      if (rawEntries !== undefined || rawEnvelopes.length < 1) return json({ code: "invalid_batch" }, 400);
+      if (rawEnvelopes.length > MAX_SHADOW_BATCH_ENTRIES) {
+        return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429);
+      }
+      let envelopes: MovementTurnEnvelope[];
+      try { envelopes = rawEnvelopes.map(validateMovementTurnEnvelope); } catch (error) {
+        return json({ code: error instanceof Error ? error.message : "invalid_movement_turn_envelope", checkpoint: 0 }, 400);
+      }
+      const streamId = envelopes[0]!.streamId;
+      if (envelopes.some((envelope) => envelope.streamId !== streamId)) {
+        return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
+      }
+      if (envelopes.some((envelope, index) => index > 0 && envelope.cursor <= envelopes[index - 1]!.cursor)) {
+        return json({ code: "batch_out_of_order", checkpoint: this.movementTurnCheckpoint(streamId).checkpoint }, 409);
+      }
+      if (envelopes.some((envelope) => {
+        const authority = envelope.movement.beforeState.authority;
+        return authority.realmId !== route.realmId || authority.floorInstanceId !== route.floorInstanceId ||
+          authority.depth !== route.depth || authority.floorEpoch !== route.floorEpoch ||
+          authority.rulesetVersion !== route.rulesetVersion;
+      })) {
+        return json({ code: "movement_authority_mismatch", checkpoint: this.movementTurnCheckpoint(streamId).checkpoint }, 409);
+      }
+      const result = this.ingestMovementTurns(envelopes, route);
+      if (result.ok) {
+        return json({
+          streamId: result.streamId,
+          checkpoint: result.checkpoint,
+          accepted: result.accepted,
+          duplicates: result.duplicates,
+          terminal: result.terminal,
+          lastEnvelopeHash: result.lastEnvelopeHash,
+          movementStateHash: result.movementStateHash,
+          turnStateHash: result.turnStateHash,
+        });
+      }
+      const status = result.code.endsWith("_divergence") || result.code === "terminal_mismatch" ? 422 : 409;
+      return json(result, status);
+    }
     if (!Array.isArray(rawEntries) || rawEntries.length < 1) return json({ code: "invalid_batch" }, 400);
     if (rawEntries.length > MAX_SHADOW_BATCH_ENTRIES) return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429);
     let entries: ShadowJournalEntry[];
@@ -240,38 +333,107 @@ export class ShadowReplay extends DurableObject<Env> {
     )) ?? { checkpoint: 0, last_entry_hash: null, state_hash: null, terminal: 0, entry_version: null, state_domain: null, continuity_hash: null };
   }
 
+  private movementTurnCheckpoint(streamId: string): MovementTurnCheckpointRow {
+    return firstRow(this.ctx.storage.sql.exec<MovementTurnCheckpointRow>(
+      `SELECT checkpoint, last_envelope_hash, last_movement_entry_hash, last_turn_entry_hash,
+        movement_state_hash, turn_state_hash, movement_continuity_hash, terminal
+       FROM movement_turn_checkpoint WHERE stream_id = ?`,
+      streamId,
+    )) ?? {
+      checkpoint: 0,
+      last_envelope_hash: null,
+      last_movement_entry_hash: null,
+      last_turn_entry_hash: null,
+      movement_state_hash: null,
+      turn_state_hash: null,
+      movement_continuity_hash: null,
+      terminal: 0,
+    };
+  }
+
   private recordDivergence(
     entry: ShadowJournalEntry,
     kind: "state" | "event" | "continuity_before" | "continuity_after" | "terminal",
     expectedHash: string,
     actualHash: string,
   ): void {
+    this.recordDivergenceEvidence({
+      streamId: entry.streamId,
+      cursor: entry.cursor,
+      entryHash: entry.entryHash,
+      kind,
+      expectedHash,
+      actualHash,
+      entryVersion: entry.v,
+      stateDomain: entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+    });
+  }
+
+  private recordDivergenceEvidence(evidence: {
+    streamId: string;
+    cursor: number;
+    entryHash: string;
+    kind: string;
+    expectedHash: string;
+    actualHash: string;
+    entryVersion: number;
+    stateDomain: "vitals" | "movement";
+  }): void {
     const retained = this.ctx.storage.sql.exec<CountRow>(
       "SELECT COUNT(*) AS count FROM shadow_divergences WHERE stream_id = ?",
-      entry.streamId,
+      evidence.streamId,
     ).one().count;
     if (retained >= MAX_DIVERGENCES_PER_STREAM) return;
     this.ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO shadow_divergences
         (stream_id, cursor, entry_hash, expected_hash, actual_hash, divergence_kind, entry_version, state_domain, detected_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
-      entry.streamId,
-      entry.cursor,
-      entry.entryHash,
-      expectedHash,
-      actualHash,
-      kind,
-      entry.v,
-      entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+      evidence.streamId,
+      evidence.cursor,
+      evidence.entryHash,
+      evidence.expectedHash,
+      evidence.actualHash,
+      evidence.kind,
+      evidence.entryVersion,
+      evidence.stateDomain,
     );
     console.error(JSON.stringify({
       event: "shadow_replay_divergence",
-      streamId: entry.streamId,
-      cursor: entry.cursor,
-      kind,
-      entryVersion: entry.v,
-      stateDomain: entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+      streamId: evidence.streamId,
+      cursor: evidence.cursor,
+      kind: evidence.kind,
+      entryVersion: evidence.entryVersion,
+      stateDomain: evidence.stateDomain,
     }));
+  }
+
+  private movementTurnDivergence(
+    envelope: MovementTurnEnvelope,
+    kind: string,
+    stateDomain: "vitals" | "movement",
+    code: string,
+    checkpoint: number,
+    expectedHash: string,
+    actualHash: string,
+  ): IngestFailure {
+    this.recordDivergenceEvidence({
+      streamId: envelope.streamId,
+      cursor: envelope.cursor,
+      entryHash: envelope.envelopeHash,
+      kind,
+      expectedHash,
+      actualHash,
+      entryVersion: envelope.v,
+      stateDomain,
+    });
+    return {
+      ok: false,
+      code,
+      checkpoint,
+      cursor: envelope.cursor,
+      expectedHash,
+      actualHash,
+    };
   }
 
   private bindIdentity(route: ShadowRoute, streamId: string): boolean {
@@ -296,6 +458,288 @@ export class ShadowReplay extends DurableObject<Env> {
       identity.floor_epoch === route.floorEpoch &&
       identity.ruleset_version === route.rulesetVersion &&
       identity.stream_id === streamId;
+  }
+
+  private ingestMovementTurns(
+    envelopes: readonly MovementTurnEnvelope[],
+    route: ShadowRoute,
+  ): MovementTurnIngestSuccess | IngestFailure {
+    return this.ctx.storage.transactionSync(() => {
+      const streamId = envelopes[0]!.streamId;
+      if (!this.bindIdentity(route, streamId)) {
+        return { ok: false, code: "shadow_identity_mismatch", checkpoint: this.movementTurnCheckpoint(streamId).checkpoint };
+      }
+      let checkpoint = this.movementTurnCheckpoint(streamId);
+      const committedCheckpoint = checkpoint.checkpoint;
+      let accepted = 0;
+      let duplicates = 0;
+      const planned: Array<{
+        envelope: MovementTurnEnvelope;
+        movementStateHash: string;
+        turnStateHash: string | null;
+        movementContinuityHash: string | null;
+        terminal: boolean;
+      }> = [];
+      const plannedByCursor = new Map<number, MovementTurnEnvelope>();
+      const plannedByOperation = new Map<string, MovementTurnEnvelope>();
+
+      // Validate the complete batch against a simulated checkpoint before the
+      // first receipt write. A validation failure therefore advances neither
+      // the envelope cursor nor either nested state head.
+      for (const envelope of envelopes) {
+        const pendingAtCursor = plannedByCursor.get(envelope.cursor);
+        if (pendingAtCursor) {
+          if (pendingAtCursor.envelopeHash !== envelope.envelopeHash ||
+              pendingAtCursor.operationId !== envelope.operationId) {
+            return { ok: false, code: "idempotency_conflict", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+          }
+          duplicates++;
+          continue;
+        }
+        if (plannedByOperation.has(envelope.operationId)) {
+          return { ok: false, code: "operation_reused", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        const existing = firstRow(this.ctx.storage.sql.exec<MovementTurnReceiptRow>(
+          `SELECT cursor, operation_id, envelope_hash FROM movement_turn_receipts
+           WHERE stream_id = ? AND cursor = ?`,
+          streamId,
+          envelope.cursor,
+        ));
+        if (existing) {
+          if (existing.envelope_hash !== envelope.envelopeHash || existing.operation_id !== envelope.operationId) {
+            return { ok: false, code: "idempotency_conflict", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+          }
+          duplicates++;
+          continue;
+        }
+        const reusedOperation = firstRow(this.ctx.storage.sql.exec<MovementTurnReceiptRow>(
+          `SELECT cursor, operation_id, envelope_hash FROM movement_turn_receipts
+           WHERE stream_id = ? AND operation_id = ?`,
+          streamId,
+          envelope.operationId,
+        ));
+        if (reusedOperation) {
+          return { ok: false, code: "operation_reused", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        const expectedCursor = checkpoint.checkpoint + 1;
+        if (envelope.cursor <= checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW) {
+          return {
+            ok: false,
+            code: "cursor_compacted",
+            checkpoint: committedCheckpoint,
+            expectedCursor,
+            cursor: envelope.cursor,
+          };
+        }
+        if (envelope.cursor !== expectedCursor) {
+          return {
+            ok: false,
+            code: envelope.cursor < expectedCursor ? "cursor_out_of_order" : "cursor_gap",
+            checkpoint: committedCheckpoint,
+            expectedCursor,
+            cursor: envelope.cursor,
+          };
+        }
+        if (checkpoint.terminal === 1) {
+          return { ok: false, code: "terminal_state", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        if (envelope.previousEnvelopeHash !== checkpoint.last_envelope_hash) {
+          return { ok: false, code: "envelope_hash_chain_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        if (envelope.movement.previousEntryHash !== checkpoint.last_movement_entry_hash) {
+          return { ok: false, code: "movement_hash_chain_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        if (envelope.turn && envelope.turn.previousEntryHash !== checkpoint.last_turn_entry_hash) {
+          return { ok: false, code: "turn_hash_chain_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+
+        const beforeContinuityHash = movementContinuityHash(envelope.movement.beforeState);
+        if (checkpoint.movement_continuity_hash !== null &&
+            beforeContinuityHash !== checkpoint.movement_continuity_hash) {
+          return this.movementTurnDivergence(
+            envelope,
+            "envelope_movement_continuity_before",
+            "movement",
+            "movement_continuity_divergence",
+            committedCheckpoint,
+            checkpoint.movement_continuity_hash,
+            beforeContinuityHash,
+          );
+        }
+        const movementTransition = reduceMovement(envelope.movement.beforeState, envelope.movement.command);
+        const actualMovementStateHash = movementStateHash(movementTransition.state);
+        const actualMovementEventHash = movementEventHash(movementTransition);
+        const actualMovementContinuityHash = movementContinuityHash(movementTransition.state);
+        const actualMovementTerminal = !movementTransition.state.alive;
+        if (actualMovementStateHash !== envelope.movement.afterStateHash) {
+          return this.movementTurnDivergence(
+            envelope,
+            "envelope_movement_state",
+            "movement",
+            "movement_state_divergence",
+            committedCheckpoint,
+            envelope.movement.afterStateHash,
+            actualMovementStateHash,
+          );
+        }
+        if (actualMovementEventHash !== envelope.movement.eventHash) {
+          return this.movementTurnDivergence(
+            envelope,
+            "envelope_movement_event",
+            "movement",
+            "movement_event_divergence",
+            committedCheckpoint,
+            envelope.movement.eventHash,
+            actualMovementEventHash,
+          );
+        }
+        if (actualMovementContinuityHash !== envelope.movement.afterContinuityHash) {
+          return this.movementTurnDivergence(
+            envelope,
+            "envelope_movement_continuity_after",
+            "movement",
+            "movement_continuity_divergence",
+            committedCheckpoint,
+            envelope.movement.afterContinuityHash,
+            actualMovementContinuityHash,
+          );
+        }
+        if (actualMovementTerminal !== envelope.movement.terminal) {
+          return this.movementTurnDivergence(
+            envelope,
+            "envelope_movement_terminal",
+            "movement",
+            "terminal_mismatch",
+            committedCheckpoint,
+            envelope.movement.terminal ? "1" : "0",
+            actualMovementTerminal ? "1" : "0",
+          );
+        }
+
+        let nextTurnEntryHash = checkpoint.last_turn_entry_hash;
+        let nextTurnStateHash = checkpoint.turn_state_hash;
+        if (envelope.turn) {
+          const actualTurnBeforeStateHash = gameplayStateHash(envelope.turn.beforeState);
+          if (checkpoint.turn_state_hash !== null &&
+              actualTurnBeforeStateHash !== checkpoint.turn_state_hash) {
+            return this.movementTurnDivergence(
+              envelope,
+              "envelope_turn_state_before",
+              "vitals",
+              "turn_state_continuity_divergence",
+              committedCheckpoint,
+              checkpoint.turn_state_hash,
+              actualTurnBeforeStateHash,
+            );
+          }
+          const turnTransition = reduceGameplay(envelope.turn.beforeState, envelope.turn.command);
+          const actualTurnStateHash = gameplayStateHash(turnTransition.state);
+          const actualTurnTerminal = !turnTransition.state.alive;
+          if (actualTurnStateHash !== envelope.turn.afterStateHash) {
+            return this.movementTurnDivergence(
+              envelope,
+              "envelope_turn_state",
+              "vitals",
+              "turn_state_divergence",
+              committedCheckpoint,
+              envelope.turn.afterStateHash,
+              actualTurnStateHash,
+            );
+          }
+          if (actualTurnTerminal !== envelope.turn.terminal) {
+            return this.movementTurnDivergence(
+              envelope,
+              "envelope_turn_terminal",
+              "vitals",
+              "terminal_mismatch",
+              committedCheckpoint,
+              envelope.turn.terminal ? "1" : "0",
+              actualTurnTerminal ? "1" : "0",
+            );
+          }
+          nextTurnEntryHash = envelope.turn.entryHash;
+          nextTurnStateHash = actualTurnStateHash;
+        }
+        const terminal = envelope.turn?.terminal ?? envelope.movement.terminal;
+        const nextMovementContinuityHash = movementTransition.turnCost === "none"
+          ? actualMovementContinuityHash
+          : null;
+        planned.push({
+          envelope,
+          movementStateHash: actualMovementStateHash,
+          turnStateHash: nextTurnStateHash,
+          movementContinuityHash: nextMovementContinuityHash,
+          terminal,
+        });
+        plannedByCursor.set(envelope.cursor, envelope);
+        plannedByOperation.set(envelope.operationId, envelope);
+        checkpoint = {
+          checkpoint: envelope.cursor,
+          last_envelope_hash: envelope.envelopeHash,
+          last_movement_entry_hash: envelope.movement.entryHash,
+          last_turn_entry_hash: nextTurnEntryHash,
+          movement_state_hash: actualMovementStateHash,
+          turn_state_hash: nextTurnStateHash,
+          movement_continuity_hash: nextMovementContinuityHash,
+          terminal: terminal ? 1 : 0,
+        };
+        accepted++;
+      }
+
+      for (const item of planned) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO movement_turn_receipts
+            (stream_id, cursor, operation_id, envelope_hash, ingested_at)
+           VALUES (?, ?, ?, ?, unixepoch())`,
+          streamId,
+          item.envelope.cursor,
+          item.envelope.operationId,
+          item.envelope.envelopeHash,
+        );
+      }
+      if (planned.length > 0) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO movement_turn_checkpoint
+            (stream_id, checkpoint, last_envelope_hash, last_movement_entry_hash, last_turn_entry_hash,
+             movement_state_hash, turn_state_hash, movement_continuity_hash, terminal, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+           ON CONFLICT(stream_id) DO UPDATE SET checkpoint = excluded.checkpoint,
+             last_envelope_hash = excluded.last_envelope_hash,
+             last_movement_entry_hash = excluded.last_movement_entry_hash,
+             last_turn_entry_hash = excluded.last_turn_entry_hash,
+             movement_state_hash = excluded.movement_state_hash,
+             turn_state_hash = excluded.turn_state_hash,
+             movement_continuity_hash = excluded.movement_continuity_hash,
+             terminal = excluded.terminal, updated_at = excluded.updated_at`,
+          streamId,
+          checkpoint.checkpoint,
+          checkpoint.last_envelope_hash,
+          checkpoint.last_movement_entry_hash,
+          checkpoint.last_turn_entry_hash,
+          checkpoint.movement_state_hash,
+          checkpoint.turn_state_hash,
+          checkpoint.movement_continuity_hash,
+          checkpoint.terminal,
+        );
+        this.ctx.storage.sql.exec(
+          "DELETE FROM movement_turn_receipts WHERE stream_id = ? AND cursor <= ?",
+          streamId,
+          checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW,
+        );
+      }
+      const durableCheckpoint = this.movementTurnCheckpoint(streamId);
+      return {
+        ok: true,
+        streamId,
+        checkpoint: durableCheckpoint.checkpoint,
+        accepted,
+        duplicates,
+        terminal: durableCheckpoint.terminal === 1,
+        lastEnvelopeHash: durableCheckpoint.last_envelope_hash,
+        movementStateHash: durableCheckpoint.movement_state_hash,
+        turnStateHash: durableCheckpoint.turn_state_hash,
+      };
+    });
   }
 
   private ingest(entries: readonly ShadowJournalEntry[], route: ShadowRoute): IngestSuccess | IngestFailure {

@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { createShadowJournalEntry, type ShadowJournalEntry } from "../src/shadow-journal.js";
+import {
+  createMovementTurnEnvelope,
+  createShadowJournalEntry,
+  type MovementTurnEnvelope,
+  type ShadowJournalEntry,
+} from "../src/shadow-journal.js";
 import type { GameplayState } from "../src/gameplay-reducer.js";
-import { catchUpOriginJournal } from "./shadow-catchup.js";
+import { catchUpMovementTurnJournal, catchUpOriginJournal } from "./shadow-catchup.js";
 
 const state: GameplayState = { turns: 0, depth: 1, hunger: 800, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true };
 const entry = createShadowJournalEntry({ streamId: "copy", cursor: 1, command: { type: "advance_turn", action: "wait" }, beforeState: state });
@@ -11,6 +16,72 @@ const secret = "shadow-copy-test-secret-at-least-32-bytes";
 
 function source(entries: readonly ShadowJournalEntry[]) {
   return { readAfter: (_streamId: string, cursor: number, limit: number) => entries.filter((value) => value.cursor > cursor).slice(0, limit) };
+}
+
+const movementTurnStream = `turn_${"a".repeat(48)}`;
+const firstMovementTurn = createMovementTurnEnvelope({
+  streamId: movementTurnStream,
+  cursor: 1,
+  operationId: "00000000-0000-4000-8000-000000000001",
+  command: { type: "move", dx: 1, dy: 0 },
+  beforeState: {
+    authority: route,
+    x: 1,
+    y: 1,
+    phase: "playing",
+    alive: true,
+    immobilizedTurns: 0,
+    destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+  },
+  turn: { command: { type: "advance_turn", action: "other" }, beforeState: state },
+});
+const secondMovementTurn = createMovementTurnEnvelope({
+  streamId: movementTurnStream,
+  cursor: 2,
+  operationId: "00000000-0000-4000-8000-000000000002",
+  command: { type: "move", dx: 0, dy: 1 },
+  beforeState: {
+    authority: route,
+    x: 2,
+    y: 1,
+    phase: "playing",
+    alive: true,
+    immobilizedTurns: 0,
+    destination: { tile: ".", occupant: "none", trap: false, stairsDown: false },
+  },
+  turn: {
+    command: { type: "advance_turn", action: "other" },
+    beforeState: { ...state, turns: 1, hunger: 798 },
+  },
+  previousEnvelopeHash: firstMovementTurn.envelopeHash,
+  previousMovementEntryHash: firstMovementTurn.movement.entryHash,
+  previousTurnEntryHash: firstMovementTurn.turn?.entryHash,
+});
+const noTurnMovement = createMovementTurnEnvelope({
+  streamId: movementTurnStream,
+  cursor: 2,
+  operationId: "00000000-0000-4000-8000-000000000003",
+  command: { type: "move", dx: 1, dy: 0 },
+  beforeState: {
+    authority: route,
+    x: 2,
+    y: 1,
+    phase: "playing",
+    alive: true,
+    immobilizedTurns: 0,
+    destination: { tile: "#", occupant: "none", trap: false, stairsDown: false },
+  },
+  turn: null,
+  previousEnvelopeHash: firstMovementTurn.envelopeHash,
+  previousMovementEntryHash: firstMovementTurn.movement.entryHash,
+  previousTurnEntryHash: firstMovementTurn.turn?.entryHash,
+});
+
+function movementTurnSource(envelopes: readonly MovementTurnEnvelope[]) {
+  return {
+    readMovementTurnsAfter: (_streamId: string, cursor: number, limit: number) =>
+      envelopes.filter((value) => value.cursor > cursor).slice(0, limit),
+  };
 }
 
 describe("catchUpOriginJournal", () => {
@@ -127,5 +198,206 @@ describe("catchUpOriginJournal", () => {
       maxDurationMs: 10,
       fetchImpl: async () => new Promise<Response>(() => { /* deliberate blackhole */ }),
     })).rejects.toMatchObject({ code: "shadow_timeout", status: 504, checkpoint: 0 });
+  });
+});
+
+describe("catchUpMovementTurnJournal", () => {
+  it("pages complete envelopes and reports both nested state hashes", async () => {
+    let requests = 0;
+    const result = await catchUpMovementTurnJournal({
+      journal: movementTurnSource([firstMovementTurn, secondMovementTurn]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret,
+      maxEntriesPerBatch: 1,
+      fetchImpl: async (_url, init) => {
+        requests++;
+        const body = JSON.parse(String(init?.body)) as { envelopes: MovementTurnEnvelope[] };
+        expect(body.envelopes).toHaveLength(1);
+        const envelope = body.envelopes[0]!;
+        return Response.json({
+          streamId: movementTurnStream,
+          checkpoint: envelope.cursor,
+          accepted: 1,
+          duplicates: 0,
+          terminal: envelope.turn?.terminal ?? envelope.movement.terminal,
+          lastEnvelopeHash: envelope.envelopeHash,
+          movementStateHash: envelope.movement.afterStateHash,
+          turnStateHash: envelope.turn?.afterStateHash ?? null,
+        });
+      },
+    });
+    expect(requests).toBe(2);
+    expect(result).toMatchObject({
+      checkpoint: 2,
+      accepted: 2,
+      batches: 2,
+      caughtUp: true,
+      backpressured: false,
+      movementStateHash: secondMovementTurn.movement.afterStateHash,
+      turnStateHash: secondMovementTurn.turn?.afterStateHash,
+    });
+  });
+
+  it("re-submits an exact envelope after response loss and preserves backpressure", async () => {
+    let delivered = false;
+    const fetchImpl = async () => {
+      if (!delivered) {
+        delivered = true;
+        throw new Error("envelope response lost");
+      }
+      return Response.json({
+        streamId: movementTurnStream,
+        checkpoint: 1,
+        accepted: 0,
+        duplicates: 1,
+        terminal: false,
+        lastEnvelopeHash: firstMovementTurn.envelopeHash,
+        movementStateHash: firstMovementTurn.movement.afterStateHash,
+        turnStateHash: firstMovementTurn.turn?.afterStateHash ?? null,
+      });
+    };
+    const options = {
+      journal: movementTurnSource([firstMovementTurn]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test",
+      secret,
+      fetchImpl,
+    };
+    await expect(catchUpMovementTurnJournal(options)).rejects.toThrow("envelope response lost");
+    await expect(catchUpMovementTurnJournal(options)).resolves.toMatchObject({ checkpoint: 1, duplicates: 1 });
+    await expect(catchUpMovementTurnJournal({
+      ...options,
+      fetchImpl: async () => Response.json({ code: "shadow_backpressure" }, { status: 429 }),
+    })).resolves.toMatchObject({ checkpoint: 0, caughtUp: false, backpressured: true });
+  });
+
+  it("accepts a Worker checkpoint already ahead only when the local envelope proves it", async () => {
+    const result = await catchUpMovementTurnJournal({
+      journal: movementTurnSource([firstMovementTurn, secondMovementTurn]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret,
+      maxEntriesPerBatch: 1,
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { envelopes: MovementTurnEnvelope[] };
+        expect(body.envelopes.map((envelope) => envelope.cursor)).toEqual([1]);
+        return Response.json({
+          streamId: movementTurnStream,
+          checkpoint: 2,
+          accepted: 0,
+          duplicates: 1,
+          terminal: false,
+          lastEnvelopeHash: secondMovementTurn.envelopeHash,
+          movementStateHash: secondMovementTurn.movement.afterStateHash,
+          turnStateHash: secondMovementTurn.turn?.afterStateHash ?? null,
+        });
+      },
+    });
+    expect(result).toMatchObject({
+      checkpoint: 2,
+      accepted: 0,
+      duplicates: 1,
+      batches: 1,
+      caughtUp: true,
+      lastEnvelopeHash: secondMovementTurn.envelopeHash,
+      movementStateHash: secondMovementTurn.movement.afterStateHash,
+      turnStateHash: secondMovementTurn.turn?.afterStateHash,
+    });
+  });
+
+  it("resumes at a no-turn envelope with the prior durable turn-state hash", async () => {
+    const result = await catchUpMovementTurnJournal({
+      journal: movementTurnSource([firstMovementTurn, noTurnMovement]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret,
+      cursor: 2,
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { envelopes: MovementTurnEnvelope[] };
+        expect(body.envelopes.map((envelope) => envelope.cursor)).toEqual([2]);
+        return Response.json({
+          streamId: movementTurnStream,
+          checkpoint: 2,
+          accepted: 1,
+          duplicates: 0,
+          terminal: false,
+          lastEnvelopeHash: noTurnMovement.envelopeHash,
+          movementStateHash: noTurnMovement.movement.afterStateHash,
+          turnStateHash: firstMovementTurn.turn!.afterStateHash,
+        });
+      },
+    });
+    expect(result).toMatchObject({
+      checkpoint: 2,
+      accepted: 1,
+      duplicates: 0,
+      movementStateHash: noTurnMovement.movement.afterStateHash,
+      turnStateHash: firstMovementTurn.turn!.afterStateHash,
+      caughtUp: true,
+    });
+  });
+
+  it("fails closed on an impossible checkpoint and bounds a blackholed request", async () => {
+    const options = {
+      journal: movementTurnSource([firstMovementTurn]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test",
+      secret,
+    };
+    await expect(catchUpMovementTurnJournal({
+      ...options,
+      fetchImpl: async () => Response.json({
+        streamId: movementTurnStream,
+        checkpoint: 2,
+        accepted: 1,
+        duplicates: 0,
+        terminal: false,
+        lastEnvelopeHash: firstMovementTurn.envelopeHash,
+        movementStateHash: firstMovementTurn.movement.afterStateHash,
+        turnStateHash: firstMovementTurn.turn?.afterStateHash ?? null,
+      }),
+    })).rejects.toThrow("invalid movement-turn shadow checkpoint advance");
+    await expect(catchUpMovementTurnJournal({
+      ...options,
+      maxDurationMs: 10,
+      fetchImpl: async () => new Promise<Response>(() => { /* deliberate blackhole */ }),
+    })).rejects.toMatchObject({ code: "shadow_timeout", status: 504, checkpoint: 0 });
+  });
+
+  it("rejects acknowledgements whose counts, terminal state, or hashes do not prove the sent envelope", async () => {
+    const acknowledged = {
+      streamId: movementTurnStream,
+      checkpoint: 1,
+      accepted: 1,
+      duplicates: 0,
+      terminal: false,
+      lastEnvelopeHash: firstMovementTurn.envelopeHash,
+      movementStateHash: firstMovementTurn.movement.afterStateHash,
+      turnStateHash: firstMovementTurn.turn?.afterStateHash ?? null,
+    };
+    const falseAcknowledgements = [
+      { ...acknowledged, accepted: 0 },
+      { ...acknowledged, checkpoint: 0, accepted: 0 },
+      { ...acknowledged, terminal: true },
+      { ...acknowledged, lastEnvelopeHash: "0000000000000000" },
+      { ...acknowledged, movementStateHash: "0000000000000000" },
+      { ...acknowledged, turnStateHash: "0000000000000000" },
+    ];
+    for (const response of falseAcknowledgements) {
+      await expect(catchUpMovementTurnJournal({
+        journal: movementTurnSource([firstMovementTurn]),
+        streamId: movementTurnStream,
+        route,
+        endpoint: "https://edge.test",
+        secret,
+        fetchImpl: async () => Response.json(response),
+      })).rejects.toThrow("invalid movement-turn shadow checkpoint advance");
+    }
   });
 });
