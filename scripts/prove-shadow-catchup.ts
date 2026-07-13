@@ -110,7 +110,9 @@ function findOrdinaryStep(floor: FloorState): MovementStep | undefined {
         targetX >= room.x && targetX < room.x + room.w &&
         targetY >= room.y && targetY < room.y + room.h);
       return isWalkable(floor.dungeon.tiles, x, y) &&
-        isWalkable(floor.dungeon.tiles, targetX, targetY) && !special &&
+        isWalkable(floor.dungeon.tiles, targetX, targetY) &&
+        floor.dungeon.tiles[targetY]?.[targetX] !== "+" &&
+        !special &&
         (targetX !== floor.dungeon.stairsDown.x || targetY !== floor.dungeon.stairsDown.y);
     });
 }
