@@ -9,7 +9,7 @@ Status: materially hardened locally; **not production-ready for million-user or
 |---|---|---|
 | Legacy origin safety | Improved locally, still a single failure domain | Version-aware readiness, mutation-fenced graceful drain, parser/queue bounds, payment and character authorization, coalesced metadata persistence, privacy-safe reads, atomic joins |
 | Cloudflare edge data plane | Strong undeployed substrate | Signed direct DO routing, PlayerSession route binding, full local authority fences, SQLite dedupe, alarms, hibernation, token buckets, bounded storage |
-| Gameplay parity at edge | Partial undeployed parity | Shared deterministic wait/vitals plus movement-decision replay are proven; authoritative position, combat, monsters, item mutation, trap/room effects, and transfers remain origin-only |
+| Gameplay parity at edge | Partial undeployed parity | Shared deterministic wait/vitals plus movement-decision replay exist; no-turn carried-state continuity is fenced, while turn-consuming effect boundaries remain explicit because authoritative position, combat, monsters, item mutation, trap/room effects, and transfers are still origin-only |
 | Global single-session ownership | Strong undeployed substrate | `PlayerSessionDO` now proves source-bound transfer/takeover, durable target prepare, commit/activation, abort/cleanup alarms, and 256-command handoff; external issuer/adoption remains |
 | Million-user capacity | Unproven | No distributed load test, account-limit approval, cost curve, or hot-shard/reconnect-storm evidence |
 | 99.99% application SLO | Unproven | No deployed end-to-end edge path, independent probes, 30-day SLI window, restore drill, or burn-rate paging |

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  movementContinuityHash,
   movementEventHash,
   movementStateHash,
   reduceMovement,
@@ -104,5 +105,15 @@ describe("reduceMovement", () => {
     expect(() => validateMovementState({ ...input, x: -1 })).toThrow("invalid_movement_state");
     expect(() => validateMovementState({ ...input, authority: { ...input.authority, floorInstanceId: "../escape" } })).toThrow("invalid_movement_state");
     expect(() => validateMovementState({ ...input, destination: { ...input.destination, tile: "?" } })).toThrow("invalid_movement_state");
+  });
+
+  it("separates fresh destination observations from carried movement continuity", () => {
+    const input = state();
+    const differentObservation = state({
+      destination: { tile: ">", occupant: "monster", trap: true, stairsDown: true },
+    });
+    expect(movementStateHash(differentObservation)).not.toBe(movementStateHash(input));
+    expect(movementContinuityHash(differentObservation)).toBe(movementContinuityHash(input));
+    expect(movementContinuityHash({ ...input, x: input.x + 1 })).not.toBe(movementContinuityHash(input));
   });
 });

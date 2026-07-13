@@ -5,6 +5,7 @@ import {
   type GameplayState,
 } from "./gameplay-reducer.js";
 import {
+  movementContinuityHash,
   movementEventHash,
   movementStateHash,
   reduceMovement,
@@ -47,7 +48,9 @@ export interface MovementShadowJournalEntry {
   command: MovementCommand;
   beforeState: MovementState;
   beforeStateHash: string;
+  beforeContinuityHash: string;
   afterStateHash: string;
+  afterContinuityHash: string;
   eventHash: string;
   terminal: boolean;
   previousEntryHash: string | null;
@@ -117,7 +120,9 @@ export function shadowEntryHash(entry: UnsignedShadowJournalEntry): string {
     entry.command.dx,
     entry.command.dy,
     entry.beforeStateHash,
+    entry.beforeContinuityHash,
     entry.afterStateHash,
+    entry.afterContinuityHash,
     entry.eventHash,
     entry.terminal ? 1 : 0,
     entry.previousEntryHash ?? "genesis",
@@ -153,7 +158,9 @@ export function createShadowJournalEntry<T extends ShadowJournalInput>(input: T)
       destination: { ...beforeState.destination },
     },
     beforeStateHash: movementStateHash(beforeState),
+    beforeContinuityHash: movementContinuityHash(beforeState),
     afterStateHash: movementStateHash(transition.state),
+    afterContinuityHash: movementContinuityHash(transition.state),
     eventHash: movementEventHash(transition),
     terminal: !transition.state.alive,
     previousEntryHash: input.previousEntryHash ?? null,
@@ -198,11 +205,14 @@ export function validateShadowJournalEntry(value: unknown): ShadowJournalEntry {
     if (command.type !== "move" || !Number.isSafeInteger(command.dx) || !Number.isSafeInteger(command.dy) ||
         Math.abs(Number(command.dx)) > 1 || Math.abs(Number(command.dy)) > 1 ||
         (command.dx === 0 && command.dy === 0) ||
+        typeof entry.beforeContinuityHash !== "string" || !/^[0-9a-f]{16}$/u.test(entry.beforeContinuityHash) ||
+        typeof entry.afterContinuityHash !== "string" || !/^[0-9a-f]{16}$/u.test(entry.afterContinuityHash) ||
         typeof entry.eventHash !== "string" || !/^[0-9a-f]{16}$/u.test(entry.eventHash)) {
       throw new Error("invalid_entry");
     }
     const state = validateMovementState(entry.beforeState);
     if (entry.beforeStateHash !== movementStateHash(state)) throw new Error("before_state_hash_mismatch");
+    if (entry.beforeContinuityHash !== movementContinuityHash(state)) throw new Error("before_continuity_hash_mismatch");
     // Validate command/state reachability here so a hash-valid hostile envelope
     // cannot defer coordinate overflow into an uncaught Durable Object error.
     reduceMovement(state, command as unknown as MovementCommand);

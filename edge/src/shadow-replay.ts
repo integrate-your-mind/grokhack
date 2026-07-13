@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { gameplayStateHash, reduceGameplay } from "../../src/gameplay-reducer";
-import { movementEventHash, movementStateHash, reduceMovement } from "../../src/movement-reducer";
+import { movementContinuityHash, movementEventHash, movementStateHash, reduceMovement } from "../../src/movement-reducer";
 import {
   MAX_SHADOW_BATCH_BYTES,
   MAX_SHADOW_BATCH_ENTRIES,
@@ -12,6 +12,7 @@ import {
   type ShadowRoute,
 } from "../../src/shadow-journal";
 import type { Env } from "./env";
+import { BoundedBodyError, readBoundedText } from "./bounded-body";
 
 interface CheckpointRow extends Record<string, SqlStorageValue> {
   checkpoint: number;
@@ -20,6 +21,7 @@ interface CheckpointRow extends Record<string, SqlStorageValue> {
   terminal: number;
   entry_version: number | null;
   state_domain: string | null;
+  continuity_hash: string | null;
 }
 
 interface EntryRow extends Record<string, SqlStorageValue> {
@@ -27,6 +29,20 @@ interface EntryRow extends Record<string, SqlStorageValue> {
 }
 
 interface TableColumnRow extends Record<string, SqlStorageValue> { name: string }
+interface VersionRow extends Record<string, SqlStorageValue> { version: number | null }
+interface CountRow extends Record<string, SqlStorageValue> { count: number }
+interface IdentityRow extends Record<string, SqlStorageValue> {
+  realm_id: string;
+  floor_instance_id: string;
+  depth: number;
+  floor_epoch: number;
+  ruleset_version: number;
+  stream_id: string;
+}
+
+const SHADOW_SCHEMA_VERSION = 5;
+const MAX_DIVERGENCES_PER_STREAM = 64;
+const SHADOW_RECEIPT_WINDOW = 256;
 
 type IngestFailure = {
   ok: false;
@@ -60,12 +76,26 @@ function json(body: unknown, status = 200): Response {
 }
 
 export class ShadowReplay extends DurableObject<Env> {
+  private readonly schemaCompatible: boolean;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.initializeSchema();
+    this.schemaCompatible = this.initializeSchema();
   }
 
-  private initializeSchema(): void {
+  private initializeSchema(): boolean {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS _shadow_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+      );
+    `);
+    const maximumVersion = firstRow(this.ctx.storage.sql.exec<VersionRow>(
+      "SELECT MAX(version) AS version FROM _shadow_schema_migrations",
+    ))?.version;
+    if (maximumVersion !== null && maximumVersion !== undefined && maximumVersion > SHADOW_SCHEMA_VERSION) {
+      return false;
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS shadow_checkpoint (
         stream_id TEXT PRIMARY KEY,
@@ -75,8 +105,18 @@ export class ShadowReplay extends DurableObject<Env> {
         terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
         entry_version INTEGER,
         state_domain TEXT CHECK (state_domain IN ('vitals', 'movement')),
+        continuity_hash TEXT,
         updated_at INTEGER NOT NULL
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS shadow_identity (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        realm_id TEXT NOT NULL,
+        floor_instance_id TEXT NOT NULL,
+        depth INTEGER NOT NULL CHECK (depth >= 1),
+        floor_epoch INTEGER NOT NULL CHECK (floor_epoch >= 1),
+        ruleset_version INTEGER NOT NULL CHECK (ruleset_version >= 1),
+        stream_id TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS shadow_entries (
         stream_id TEXT NOT NULL,
         cursor INTEGER NOT NULL,
@@ -84,6 +124,8 @@ export class ShadowReplay extends DurableObject<Env> {
         entry_version INTEGER NOT NULL DEFAULT 1,
         before_state_hash TEXT NOT NULL,
         after_state_hash TEXT NOT NULL,
+        before_continuity_hash TEXT,
+        after_continuity_hash TEXT,
         event_hash TEXT,
         terminal INTEGER NOT NULL CHECK (terminal IN (0, 1)),
         ingested_at INTEGER NOT NULL,
@@ -95,13 +137,12 @@ export class ShadowReplay extends DurableObject<Env> {
         entry_hash TEXT NOT NULL,
         expected_hash TEXT NOT NULL,
         actual_hash TEXT NOT NULL,
+        divergence_kind TEXT NOT NULL DEFAULT 'legacy_unknown',
+        entry_version INTEGER,
+        state_domain TEXT,
         detected_at INTEGER NOT NULL,
         PRIMARY KEY (stream_id, cursor, entry_hash)
       ) WITHOUT ROWID;
-      CREATE TABLE IF NOT EXISTS _shadow_schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at INTEGER NOT NULL
-      );
     `);
     const columns = new Set(this.ctx.storage.sql.exec<TableColumnRow>("PRAGMA table_info(shadow_checkpoint)").toArray().map((row) => row.name));
     const expansions = [
@@ -110,6 +151,7 @@ export class ShadowReplay extends DurableObject<Env> {
       ["terminal", "INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))"],
       ["entry_version", "INTEGER"],
       ["state_domain", "TEXT"],
+      ["continuity_hash", "TEXT"],
       ["updated_at", "INTEGER NOT NULL DEFAULT 0"],
     ] as const;
     for (const [name, definition] of expansions) {
@@ -118,25 +160,45 @@ export class ShadowReplay extends DurableObject<Env> {
     const entryColumns = new Set(this.ctx.storage.sql.exec<TableColumnRow>("PRAGMA table_info(shadow_entries)").toArray().map((row) => row.name));
     const entryExpansions = [
       ["entry_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["before_continuity_hash", "TEXT"],
+      ["after_continuity_hash", "TEXT"],
       ["event_hash", "TEXT"],
     ] as const;
     for (const [name, definition] of entryExpansions) {
       if (!entryColumns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE shadow_entries ADD COLUMN ${name} ${definition}`);
+    }
+    const divergenceColumns = new Set(this.ctx.storage.sql.exec<TableColumnRow>("PRAGMA table_info(shadow_divergences)").toArray().map((row) => row.name));
+    const divergenceExpansions = [
+      ["divergence_kind", "TEXT NOT NULL DEFAULT 'legacy_unknown'"],
+      ["entry_version", "INTEGER"],
+      ["state_domain", "TEXT"],
+    ] as const;
+    for (const [name, definition] of divergenceExpansions) {
+      if (!divergenceColumns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE shadow_divergences ADD COLUMN ${name} ${definition}`);
     }
     // Every nonzero checkpoint created before V2 represents a V1 vitals row.
     // Backfill its domain so duplicate-only catch-up remains interpretable.
     this.ctx.storage.sql.exec(`UPDATE shadow_checkpoint
       SET entry_version = 1, state_domain = 'vitals'
       WHERE checkpoint > 0 AND entry_version IS NULL AND state_domain IS NULL`);
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch())");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch()), (4, unixepoch()), (5, unixepoch())");
+    return true;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname !== "/catch-up") return json({ code: "not_found" }, 404);
     if (request.method !== "POST") return json({ code: "method_not_allowed" }, 405);
-    const text = await request.text();
-    if (new TextEncoder().encode(text).byteLength > MAX_SHADOW_BATCH_BYTES) return json({ code: "batch_too_large" }, 413);
+    if (!this.schemaCompatible) return json({ code: "shadow_schema_incompatible" }, 503);
+    let text: string;
+    try {
+      text = await readBoundedText(request, MAX_SHADOW_BATCH_BYTES);
+    } catch (error) {
+      if (error instanceof BoundedBodyError && error.code === "body_too_large") {
+        return json({ code: "batch_too_large" }, 413);
+      }
+      return json({ code: error instanceof BoundedBodyError ? error.code : "body_read_failed" }, 400);
+    }
     let candidate: unknown;
     try { candidate = JSON.parse(text); } catch { return json({ code: "malformed_json" }, 400); }
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return json({ code: "invalid_batch" }, 400);
@@ -152,6 +214,9 @@ export class ShadowReplay extends DurableObject<Env> {
     }
     const streamId = entries[0]!.streamId;
     if (entries.some((entry) => entry.streamId !== streamId)) return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
+    if (entries.some((entry, index) => index > 0 && entry.cursor <= entries[index - 1]!.cursor)) {
+      return json({ code: "batch_out_of_order", checkpoint: this.checkpoint(streamId).checkpoint }, 409);
+    }
     if (entries.some((entry) => entry.v !== SHADOW_JOURNAL_VERSION && (
       entry.beforeState.authority.realmId !== route.realmId ||
       entry.beforeState.authority.floorInstanceId !== route.floorInstanceId ||
@@ -161,22 +226,84 @@ export class ShadowReplay extends DurableObject<Env> {
     ))) {
       return json({ code: "movement_authority_mismatch", checkpoint: this.checkpoint(streamId).checkpoint }, 409);
     }
-    const result = this.ingest(entries);
+    const result = this.ingest(entries, route);
     if (result.ok) return json(result);
     const status = result.code === "state_hash_divergence" || result.code === "event_hash_divergence" ||
+      result.code === "state_continuity_divergence" || result.code === "continuity_hash_divergence" ||
       result.code === "terminal_mismatch" ? 422 : 409;
     return json(result, status);
   }
 
   private checkpoint(streamId: string): CheckpointRow {
     return firstRow(this.ctx.storage.sql.exec<CheckpointRow>(
-      "SELECT checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain FROM shadow_checkpoint WHERE stream_id = ?", streamId,
-    )) ?? { checkpoint: 0, last_entry_hash: null, state_hash: null, terminal: 0, entry_version: null, state_domain: null };
+      "SELECT checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain, continuity_hash FROM shadow_checkpoint WHERE stream_id = ?", streamId,
+    )) ?? { checkpoint: 0, last_entry_hash: null, state_hash: null, terminal: 0, entry_version: null, state_domain: null, continuity_hash: null };
   }
 
-  private ingest(entries: readonly ShadowJournalEntry[]): IngestSuccess | IngestFailure {
+  private recordDivergence(
+    entry: ShadowJournalEntry,
+    kind: "state" | "event" | "continuity_before" | "continuity_after" | "terminal",
+    expectedHash: string,
+    actualHash: string,
+  ): void {
+    const retained = this.ctx.storage.sql.exec<CountRow>(
+      "SELECT COUNT(*) AS count FROM shadow_divergences WHERE stream_id = ?",
+      entry.streamId,
+    ).one().count;
+    if (retained >= MAX_DIVERGENCES_PER_STREAM) return;
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO shadow_divergences
+        (stream_id, cursor, entry_hash, expected_hash, actual_hash, divergence_kind, entry_version, state_domain, detected_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
+      entry.streamId,
+      entry.cursor,
+      entry.entryHash,
+      expectedHash,
+      actualHash,
+      kind,
+      entry.v,
+      entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+    );
+    console.error(JSON.stringify({
+      event: "shadow_replay_divergence",
+      streamId: entry.streamId,
+      cursor: entry.cursor,
+      kind,
+      entryVersion: entry.v,
+      stateDomain: entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+    }));
+  }
+
+  private bindIdentity(route: ShadowRoute, streamId: string): boolean {
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO shadow_identity
+        (singleton, realm_id, floor_instance_id, depth, floor_epoch, ruleset_version, stream_id)
+        VALUES (1, ?, ?, ?, ?, ?, ?)`,
+      route.realmId,
+      route.floorInstanceId,
+      route.depth,
+      route.floorEpoch,
+      route.rulesetVersion,
+      streamId,
+    );
+    const identity = this.ctx.storage.sql.exec<IdentityRow>(
+      `SELECT realm_id, floor_instance_id, depth, floor_epoch, ruleset_version, stream_id
+       FROM shadow_identity WHERE singleton = 1`,
+    ).one();
+    return identity.realm_id === route.realmId &&
+      identity.floor_instance_id === route.floorInstanceId &&
+      identity.depth === route.depth &&
+      identity.floor_epoch === route.floorEpoch &&
+      identity.ruleset_version === route.rulesetVersion &&
+      identity.stream_id === streamId;
+  }
+
+  private ingest(entries: readonly ShadowJournalEntry[], route: ShadowRoute): IngestSuccess | IngestFailure {
     return this.ctx.storage.transactionSync(() => {
       const streamId = entries[0]!.streamId;
+      if (!this.bindIdentity(route, streamId)) {
+        return { ok: false, code: "shadow_identity_mismatch", checkpoint: this.checkpoint(streamId).checkpoint };
+      }
       let checkpoint = this.checkpoint(streamId);
       let accepted = 0;
       let duplicates = 0;
@@ -190,6 +317,15 @@ export class ShadowReplay extends DurableObject<Env> {
           continue;
         }
         const expectedCursor = checkpoint.checkpoint + 1;
+        if (entry.cursor <= checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW) {
+          return {
+            ok: false,
+            code: "cursor_compacted",
+            checkpoint: checkpoint.checkpoint,
+            expectedCursor,
+            cursor: entry.cursor,
+          };
+        }
         if (entry.cursor !== expectedCursor) return {
           ok: false,
           code: entry.cursor < expectedCursor ? "cursor_out_of_order" : "cursor_gap",
@@ -199,51 +335,88 @@ export class ShadowReplay extends DurableObject<Env> {
         };
         if (checkpoint.terminal === 1) return { ok: false, code: "terminal_state", checkpoint: checkpoint.checkpoint, cursor: entry.cursor };
         if (entry.previousEntryHash !== checkpoint.last_entry_hash) return { ok: false, code: "hash_chain_mismatch", checkpoint: checkpoint.checkpoint, cursor: entry.cursor };
+        if (checkpoint.state_domain === "movement" && entry.v === SHADOW_JOURNAL_VERSION) {
+          return { ok: false, code: "state_domain_regression", checkpoint: checkpoint.checkpoint, cursor: entry.cursor };
+        }
         let actualHash: string;
         let actualTerminal: boolean;
         let actualEventHash: string | null = null;
+        let nextContinuityHash: string | null = null;
         if (entry.v === SHADOW_JOURNAL_VERSION) {
           const transition = reduceGameplay(entry.beforeState, entry.command);
           actualHash = gameplayStateHash(transition.state);
           actualTerminal = !transition.state.alive;
         } else {
+          const actualBeforeContinuityHash = movementContinuityHash(entry.beforeState);
+          if (checkpoint.state_domain === "movement" && checkpoint.continuity_hash !== null &&
+              actualBeforeContinuityHash !== checkpoint.continuity_hash) {
+            this.recordDivergence(entry, "continuity_before", checkpoint.continuity_hash, actualBeforeContinuityHash);
+            return {
+              ok: false,
+              code: "state_continuity_divergence",
+              checkpoint: checkpoint.checkpoint,
+              cursor: entry.cursor,
+              expectedHash: checkpoint.continuity_hash,
+              actualHash: actualBeforeContinuityHash,
+            };
+          }
           const transition = reduceMovement(entry.beforeState, entry.command);
           actualHash = movementStateHash(transition.state);
           actualEventHash = movementEventHash(transition);
           actualTerminal = !transition.state.alive;
+          const actualAfterContinuityHash = movementContinuityHash(transition.state);
+          if (actualAfterContinuityHash !== entry.afterContinuityHash) {
+            this.recordDivergence(entry, "continuity_after", entry.afterContinuityHash, actualAfterContinuityHash);
+            return {
+              ok: false,
+              code: "continuity_hash_divergence",
+              checkpoint: checkpoint.checkpoint,
+              cursor: entry.cursor,
+              expectedHash: entry.afterContinuityHash,
+              actualHash: actualAfterContinuityHash,
+            };
+          }
+          // Turn-consuming decisions hand off to origin-only effects (combat,
+          // traps, room events, vitals and AI). Until those reducers are shared,
+          // only a no-turn decision can safely constrain the next command.
+          nextContinuityHash = transition.turnCost === "none" ? actualAfterContinuityHash : null;
         }
         if (actualHash !== entry.afterStateHash) {
-          this.ctx.storage.sql.exec(
-            "INSERT OR IGNORE INTO shadow_divergences (stream_id, cursor, entry_hash, expected_hash, actual_hash, detected_at) VALUES (?, ?, ?, ?, ?, unixepoch())",
-            streamId, entry.cursor, entry.entryHash, entry.afterStateHash, actualHash,
-          );
+          this.recordDivergence(entry, "state", entry.afterStateHash, actualHash);
           return { ok: false, code: "state_hash_divergence", checkpoint: checkpoint.checkpoint, cursor: entry.cursor, expectedHash: entry.afterStateHash, actualHash };
         }
         if (entry.v !== SHADOW_JOURNAL_VERSION) {
           if (actualEventHash === null) throw new Error("movement replay omitted event hash");
           if (actualEventHash !== entry.eventHash) {
-            this.ctx.storage.sql.exec(
-              "INSERT OR IGNORE INTO shadow_divergences (stream_id, cursor, entry_hash, expected_hash, actual_hash, detected_at) VALUES (?, ?, ?, ?, ?, unixepoch())",
-              streamId, entry.cursor, entry.entryHash, entry.eventHash, actualEventHash,
-            );
+            this.recordDivergence(entry, "event", entry.eventHash, actualEventHash);
             return { ok: false, code: "event_hash_divergence", checkpoint: checkpoint.checkpoint, cursor: entry.cursor, expectedHash: entry.eventHash, actualHash: actualEventHash };
           }
         }
-        if (entry.terminal !== actualTerminal) return { ok: false, code: "terminal_mismatch", checkpoint: checkpoint.checkpoint, cursor: entry.cursor };
+        if (entry.terminal !== actualTerminal) {
+          this.recordDivergence(entry, "terminal", entry.terminal ? "1" : "0", actualTerminal ? "1" : "0");
+          return { ok: false, code: "terminal_mismatch", checkpoint: checkpoint.checkpoint, cursor: entry.cursor };
+        }
         this.ctx.storage.sql.exec(
-          "INSERT INTO shadow_entries (stream_id, cursor, entry_hash, entry_version, before_state_hash, after_state_hash, event_hash, terminal, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())",
+          `INSERT INTO shadow_entries
+            (stream_id, cursor, entry_hash, entry_version, before_state_hash, after_state_hash,
+              before_continuity_hash, after_continuity_hash, event_hash, terminal, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`,
           streamId, entry.cursor, entry.entryHash, entry.v, entry.beforeStateHash, entry.afterStateHash,
-          entry.v === SHADOW_JOURNAL_VERSION ? null : entry.eventHash, entry.terminal ? 1 : 0,
+          entry.v === SHADOW_JOURNAL_VERSION ? null : entry.beforeContinuityHash,
+          entry.v === SHADOW_JOURNAL_VERSION ? null : entry.afterContinuityHash,
+          entry.v === SHADOW_JOURNAL_VERSION ? null : entry.eventHash,
+          entry.terminal ? 1 : 0,
         );
         this.ctx.storage.sql.exec(`INSERT INTO shadow_checkpoint
-          (stream_id, checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+          (stream_id, checkpoint, last_entry_hash, state_hash, terminal, entry_version, state_domain, continuity_hash, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
           ON CONFLICT(stream_id) DO UPDATE SET checkpoint = excluded.checkpoint,
             last_entry_hash = excluded.last_entry_hash, state_hash = excluded.state_hash,
             terminal = excluded.terminal, entry_version = excluded.entry_version,
-            state_domain = excluded.state_domain, updated_at = excluded.updated_at`,
+            state_domain = excluded.state_domain, continuity_hash = excluded.continuity_hash,
+            updated_at = excluded.updated_at`,
           streamId, entry.cursor, entry.entryHash, actualHash, entry.terminal ? 1 : 0,
-          entry.v, entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+          entry.v, entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement", nextContinuityHash,
         );
         checkpoint = {
           checkpoint: entry.cursor,
@@ -252,7 +425,13 @@ export class ShadowReplay extends DurableObject<Env> {
           terminal: entry.terminal ? 1 : 0,
           entry_version: entry.v,
           state_domain: entry.v === SHADOW_JOURNAL_VERSION ? "vitals" : "movement",
+          continuity_hash: nextContinuityHash,
         };
+        this.ctx.storage.sql.exec(
+          "DELETE FROM shadow_entries WHERE stream_id = ? AND cursor <= ?",
+          streamId,
+          entry.cursor - SHADOW_RECEIPT_WINDOW,
+        );
         accepted++;
       }
       return {

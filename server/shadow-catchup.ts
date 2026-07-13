@@ -32,6 +32,36 @@ export class ShadowCatchupError extends Error {
   }
 }
 
+class ShadowCatchupDeadlineError extends Error {
+  constructor() {
+    super("shadow catch-up deadline exceeded");
+    this.name = "ShadowCatchupDeadlineError";
+  }
+}
+
+async function withinDeadline<T>(durationMs: number, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ShadowCatchupDeadlineError());
+    }, Math.max(1, durationMs));
+  });
+  try {
+    try {
+      return await Promise.race([operation(controller.signal), deadline]);
+    } catch (error) {
+      if (controller.signal.aborted && !(error instanceof ShadowCatchupDeadlineError)) {
+        throw new ShadowCatchupDeadlineError();
+      }
+      throw error;
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function parseCheckpoint(value: unknown): ShadowCatchupCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid shadow response");
   const candidate = value as Partial<ShadowCatchupCheckpoint>;
@@ -74,7 +104,17 @@ export async function catchUpOriginJournal(options: {
   const send = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
   const startedAt = now();
-  let checkpoint = options.cursor ?? 0;
+  const requestedCursor = options.cursor ?? 0;
+  if (!Number.isSafeInteger(requestedCursor) || requestedCursor < 0) {
+    throw new RangeError("invalid resume cursor");
+  }
+  if (requestedCursor > 0) {
+    const proof = options.journal.readAfter(options.streamId, requestedCursor - 1, 1);
+    if (proof[0]?.cursor !== requestedCursor) throw new RangeError("invalid resume cursor");
+  }
+  // A caller cursor is only a local hint. Re-submit its immutable entry so the
+  // remote idempotency fence proves ownership before we report caught up.
+  let checkpoint = requestedCursor > 0 ? requestedCursor - 1 : 0;
   let accepted = 0;
   let duplicates = 0;
   let batches = 0;
@@ -88,12 +128,28 @@ export async function catchUpOriginJournal(options: {
     }
     const entries = options.journal.readAfter(options.streamId, checkpoint, limit);
     if (!entries.length) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: true, backpressured: false };
-    const response = await send(options.endpoint, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${options.secret}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ v: 1, route: options.route, entries }),
-    });
-    const body = await response.json() as unknown;
+    const remainingMs = maxDurationMs - (now() - startedAt);
+    if (remainingMs <= 0) {
+      return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: false, backpressured: true };
+    }
+    let response: Response;
+    let body: unknown;
+    try {
+      ({ response, body } = await withinDeadline(remainingMs, async (signal) => {
+        const result = await send(options.endpoint, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${options.secret}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ v: 1, route: options.route, entries }),
+          signal,
+        });
+        return { response: result, body: await result.json() as unknown };
+      }));
+    } catch (error) {
+      if (error instanceof ShadowCatchupDeadlineError) {
+        throw new ShadowCatchupError(504, checkpoint, "shadow_timeout");
+      }
+      throw error;
+    }
     if (response.status === 429) {
       return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, stateHash, entryVersion, stateDomain, batches, caughtUp: false, backpressured: true };
     }

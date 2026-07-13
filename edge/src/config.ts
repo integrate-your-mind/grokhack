@@ -134,6 +134,13 @@ export function readEdgeConfig(env: Env): EdgeConfigResult {
   ) {
     errors.push("REALM_DIRECTORIES binding is missing or invalid");
   }
+  if (
+    !env.SHADOW_REPLAYS ||
+    typeof env.SHADOW_REPLAYS.idFromName !== "function" ||
+    typeof env.SHADOW_REPLAYS.get !== "function"
+  ) {
+    errors.push("SHADOW_REPLAYS binding is missing or invalid");
+  }
   const environment = requiredToken("EDGE_ENVIRONMENT", env.EDGE_ENVIRONMENT, errors);
   const floorSocketCap = strictInteger("FLOOR_SOCKET_CAP", env.FLOOR_SOCKET_CAP, 1, 500, errors);
   const floorMessagesPerMinute = strictInteger(

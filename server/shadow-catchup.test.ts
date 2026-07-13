@@ -34,6 +34,47 @@ describe("catchUpOriginJournal", () => {
     expect(retried).toMatchObject({ checkpoint: 1, accepted: 0, duplicates: 1 });
   });
 
+  it("proves a caller resume cursor remotely before reporting caught up", async () => {
+    let requests = 0;
+    const result = await catchUpOriginJournal({
+      journal: source([entry]),
+      streamId: "copy",
+      route,
+      endpoint: "https://edge.test",
+      secret,
+      cursor: 1,
+      fetchImpl: async (_url, init) => {
+        requests++;
+        const body = JSON.parse(String(init?.body)) as { entries: ShadowJournalEntry[] };
+        expect(body.entries.map((candidate) => candidate.cursor)).toEqual([1]);
+        return Response.json({
+          streamId: "copy",
+          checkpoint: 1,
+          accepted: 0,
+          duplicates: 1,
+          terminal: false,
+          stateHash: entry.afterStateHash,
+          entryVersion: 1,
+          stateDomain: "vitals",
+        });
+      },
+    });
+    expect(requests).toBe(1);
+    expect(result).toMatchObject({ checkpoint: 1, accepted: 0, duplicates: 1, caughtUp: true });
+  });
+
+  it("rejects an unprovable resume cursor before making a request", async () => {
+    const fetchImpl = async () => { throw new Error("unexpected request"); };
+    await expect(catchUpOriginJournal({
+      journal: source([entry]), streamId: "copy", route, endpoint: "https://edge.test", secret,
+      cursor: 2, fetchImpl,
+    })).rejects.toThrow("invalid resume cursor");
+    await expect(catchUpOriginJournal({
+      journal: source([entry]), streamId: "copy", route, endpoint: "https://edge.test", secret,
+      cursor: -1, fetchImpl,
+    })).rejects.toThrow("invalid resume cursor");
+  });
+
   it("returns explicit backpressure and preserves the supplied checkpoint", async () => {
     const result = await catchUpOriginJournal({
       journal: source([entry]), streamId: "copy", route, endpoint: "https://edge.test", secret,
@@ -74,5 +115,17 @@ describe("catchUpOriginJournal", () => {
       maxDurationMs: 1, now: (() => { let value = 0; return () => value++; })(),
     });
     expect(timed).toMatchObject({ checkpoint: 0, caughtUp: false, backpressured: true, batches: 0 });
+  });
+
+  it("turns a blackholed edge request into a bounded explicit timeout", async () => {
+    await expect(catchUpOriginJournal({
+      journal: source([entry]),
+      streamId: "copy",
+      route,
+      endpoint: "https://edge.test",
+      secret,
+      maxDurationMs: 10,
+      fetchImpl: async () => new Promise<Response>(() => { /* deliberate blackhole */ }),
+    })).rejects.toMatchObject({ code: "shadow_timeout", status: 504, checkpoint: 0 });
   });
 });

@@ -5,7 +5,7 @@ import path from "node:path";
 import { createTestHarness } from "../edge/node_modules/wrangler/wrangler-dist/cli.js";
 import { reduceGameplay, type GameplayState } from "../src/gameplay-reducer.js";
 import { reduceMovement, type MovementState } from "../src/movement-reducer.js";
-import { shadowEntryHash } from "../src/shadow-journal.js";
+import { createShadowJournalEntry, shadowEntryHash } from "../src/shadow-journal.js";
 import { OriginGameplayJournal } from "../server/origin-journal.js";
 import { catchUpOriginJournal, ShadowCatchupError } from "../server/shadow-catchup.js";
 
@@ -171,7 +171,75 @@ try {
   if (!eventDivergence || eventDivergence.code !== "event_hash_divergence" || eventDivergence.checkpoint !== 0 || eventDivergence.status !== 422) {
     throw new Error(`event divergence proof failed: ${JSON.stringify(eventDivergence)}`);
   }
-  process.stdout.write(`${JSON.stringify({ ok: true, responseLossObserved, parity, terminalParity, divergence, eventDivergence })}\n`);
+
+  const continuityJournal = new OriginGameplayJournal(path.join(directory, "continuity"));
+  const continuityFirst = continuityJournal.appendTransition({
+    streamId: "origin_continuity_divergence",
+    command: { type: "move", dx: 1, dy: 0 },
+    beforeState: {
+      authority: { ...route },
+      x: 4,
+      y: 5,
+      phase: "playing",
+      alive: true,
+      immobilizedTurns: 0,
+      destination: { tile: "#", occupant: "none", trap: false, stairsDown: false },
+    },
+  }).entry;
+  await catchUpOriginJournal({
+    journal: continuityJournal,
+    streamId: "origin_continuity_divergence",
+    route,
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    fetchImpl: (input, init) => harness.fetch(input, init),
+  });
+  const continuityJump = createShadowJournalEntry({
+    streamId: "origin_continuity_divergence",
+    cursor: 2,
+    previousEntryHash: continuityFirst.entryHash,
+    command: { type: "move", dx: 1, dy: 0 },
+    beforeState: {
+      authority: { ...route },
+      x: 40,
+      y: 5,
+      phase: "playing",
+      alive: true,
+      immobilizedTurns: 0,
+      destination: { tile: ".", occupant: "player", trap: false, stairsDown: false },
+    },
+  });
+  const continuitySource = {
+    readAfter: (_streamId: string, cursor: number) => cursor < 2 ? [continuityJump] : [],
+  };
+  let continuityDivergence: { code: string; checkpoint: number; status: number } | null = null;
+  try {
+    await catchUpOriginJournal({
+      journal: continuitySource,
+      streamId: "origin_continuity_divergence",
+      route,
+      endpoint: "http://worker.local/internal/shadow/catch-up",
+      secret,
+      cursor: 1,
+      fetchImpl: (input, init) => harness.fetch(input, init),
+    });
+  } catch (error) {
+    if (!(error instanceof ShadowCatchupError)) throw error;
+    continuityDivergence = { code: error.code, checkpoint: error.checkpoint, status: error.status };
+  }
+  if (!continuityDivergence || continuityDivergence.code !== "state_continuity_divergence" ||
+      continuityDivergence.checkpoint !== 1 || continuityDivergence.status !== 422) {
+    throw new Error(`continuity divergence proof failed: ${JSON.stringify(continuityDivergence)}`);
+  }
+  process.stdout.write(`${JSON.stringify({
+    ok: true,
+    responseLossObserved,
+    parity,
+    terminalParity,
+    divergence,
+    eventDivergence,
+    continuityDivergence,
+  })}\n`);
 } finally {
   await harness.close();
   fs.rmSync(directory, { recursive: true, force: true });

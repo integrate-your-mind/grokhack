@@ -130,6 +130,27 @@ export function movementStateHash(state: Readonly<MovementState>): string {
   ].join("|"));
 }
 
+/**
+ * Hashes state that must carry from one movement decision to the next. The
+ * destination cell is deliberately excluded because it is a fresh observation
+ * for the next command, not reducer-owned state.
+ */
+export function movementContinuityHash(state: Readonly<MovementState>): string {
+  const validated = validateMovementState(state);
+  return fnv64([
+    validated.authority.realmId,
+    validated.authority.floorInstanceId,
+    validated.authority.depth,
+    validated.authority.floorEpoch,
+    validated.authority.rulesetVersion,
+    validated.x,
+    validated.y,
+    validated.phase,
+    validated.alive ? 1 : 0,
+    validated.immobilizedTurns,
+  ].join("|"));
+}
+
 /** Hashes behavioral output so equal-position wall/player/combat decisions cannot alias. */
 export function movementEventHash(transition: Pick<MovementTransition, "outcome" | "turnCost" | "events">): string {
   const eventCodes = transition.events.map((event) =>

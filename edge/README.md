@@ -41,8 +41,9 @@ The first vertical slice proves final-architecture primitives:
 - a mixed-version isolated shadow-replay namespace that preserves frozen V1
   wait/vitals hashes while independently replaying V2 movement decisions,
   including collision, door, trap-check, transfer, turn-cost, and visibility
-  intents plus a separate behavioral-event hash, floor-authority fencing, and
-  version/domain-qualified checkpoints;
+  intents plus separate observation, carried-state, and behavioral-event hashes,
+  authority-derived stream/floor fencing, classified durable divergences,
+  one-way domain upgrade, and version/domain-qualified checkpoints;
 - opaque, ticket-bound resume-proof grants, canonical UUID identities, durable
   source/target transfer capabilities, 256-command handoff, and bounded saga artifacts;
 - strict runtime readiness/configuration validation and required-secret typegen;

@@ -35,6 +35,8 @@ describe("movement shadow journal envelope", () => {
       beforeState: movementState(),
     });
     expect(movement).toMatchObject({ v: 2, command: { type: "move", dx: 1, dy: 0 }, terminal: false });
+    expect(movement.beforeContinuityHash).toMatch(/^[0-9a-f]{16}$/u);
+    expect(movement.afterContinuityHash).toMatch(/^[0-9a-f]{16}$/u);
     expect(movement.eventHash).toMatch(/^[0-9a-f]{16}$/u);
     expect(validateShadowJournalEntry(JSON.parse(JSON.stringify(movement)) as unknown)).toEqual(movement);
   });
@@ -58,5 +60,7 @@ describe("movement shadow journal envelope", () => {
     expect(validateShadowJournalEntry(rehashedTamper)).toEqual(rehashedTamper);
     const badState = { ...entry, beforeState: { ...entry.beforeState, x: -1 } };
     expect(() => validateShadowJournalEntry(badState)).toThrow("invalid_movement_state");
+    const badContinuity = { ...entry, beforeContinuityHash: "0000000000000000" };
+    expect(() => validateShadowJournalEntry(badContinuity)).toThrow("before_continuity_hash_mismatch");
   });
 });

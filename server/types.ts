@@ -1,5 +1,6 @@
 import type { Dungeon, Entity, FloorTrap, GamePhase, Item, PlayerState } from "../src/types.js";
 import type { FloorEventBook } from "../src/events.js";
+import type { MovementAuthority } from "../src/movement-reducer.js";
 
 export interface GroundItem {
   item: Item;
@@ -27,6 +28,8 @@ export interface FloorState {
   monsters: Entity[];
   items: GroundItem[];
   seed: number;
+  /** Synchronously persisted in the shadow-journal authority sidecar. */
+  movementAuthority?: MovementAuthority;
   /** Floor traps (trap-pressure). Optional for floors loaded pre-traps; ensure via ensureFloorTraps. */
   traps?: FloorTrap[];
   /** Timed reinforcements + env events (world-events ambient). */

@@ -200,23 +200,40 @@ export function startTelnetServer(world: WorldServer, port: number): net.Server 
         const resumeToken = colon > 0 ? rawName.slice(colon + 1).trim() : undefined;
 
         void (async () => {
-          const result = await world.joinPlayer(connId, name, "human", resumeToken);
-          if (typeof result === "string") {
-            socket.write(
-              `\r\n${result}\r\nEnter name or name:resumeToken: `
-            );
-            naming = true;
-            return;
-          }
+          try {
+            const result = await world.joinPlayer(connId, name, "human", resumeToken);
+            if (typeof result === "string") {
+              socket.write(
+                `\r\n${result}\r\nEnter name or name:resumeToken: `
+              );
+              naming = true;
+              return;
+            }
 
-          playerId = result.id;
-          conn.playerId = playerId;
-          if (result.resumeToken) {
-            socket.write(
-              `\r\n[resume] Save this token to reconnect: ${result.name}:${result.resumeToken}\r\n`
-            );
+            playerId = result.id;
+            conn.playerId = playerId;
+            if (result.resumeToken) {
+              socket.write(
+                `\r\n[resume] Save this token to reconnect: ${result.name}:${result.resumeToken}\r\n`
+              );
+            }
+            refresh();
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(JSON.stringify({ event: "telnet_join_failed", sessionId, message }));
+            logEvent("server_error", sessionId, {
+              transport: "telnet",
+              detail: { component: "telnet_join", message },
+            });
+            playerId = null;
+            conn.playerId = null;
+            if (!socket.destroyed && socket.writable) {
+              socket.write(
+                "\r\nUnable to join right now. Retry shortly.\r\nEnter name or name:resumeToken: "
+              );
+              naming = true;
+            }
           }
-          refresh();
         })();
         return;
       }

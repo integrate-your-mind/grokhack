@@ -94,28 +94,45 @@ The first production-shaped slices now journal the shared turn/vitals reducer
 and movement decisions into fsynced, mode-0600, hash-chained 64-entry segments.
 Each bounded segment is written completely (including short-write retries)
 through a mode-0600 temporary file, file
-fsync, atomic rename, and directory fsync. A pre-rename fsync failure leaves the
+fsync, atomic rename, and directory fsync. First-use directory creation is also
+committed by fsyncing each existing parent boundary before an append can be
+acknowledged. A pre-rename fsync failure leaves the
 canonical segment unchanged; a lost post-rename acknowledgement is reconciled
 from the canonical file on retry.
 Frozen V1 vitals entries remain byte-compatible; V2 movement entries add
-position/cell input, a state hash, and a separate behavioral-event hash so wall,
-player, and monster blocks cannot alias merely because position did not change.
+position/cell input, full-observation and carried-state hashes, and a separate
+behavioral-event hash so wall, player, and monster blocks cannot alias merely
+because position did not change. The Worker carries position, phase, liveness,
+immobilization, and authority continuity across no-turn decisions. A
+turn-consuming decision deliberately opens a visible continuity boundary because
+combat, traps, room events, vitals, and monster AI are still origin-only effects;
+those boundaries cannot become strict until their reducers are shared.
+V2 remains undeployed and is establishing its initial merge contract in this
+branch; predecessor feature-branch V2 artifacts without continuity fields are
+not compatible. V1 is the only historical production-shaped format whose bytes
+are frozen.
 The movement decision is recorded before origin mutation so a failed first
 append cannot partially move or pick up an item. Turn-consuming paths retain the
 existing V1 vitals follow-up. These two fsynced records are not yet one atomic
 transaction; the transactional outbox remains required before authority transfer.
 Free wall/player rejections are evidence-sampled with a permanent 64-fingerprint
-budget per player for the origin process lifetime. Repeats and fingerprints
-beyond that cap do not perform another synchronous fsync, so cycling inputs
-cannot turn the sample cache into unbounded writes. Turn-consuming commands
-remain unsampled.
+budget per retained player and a hard global retained-player ceiling for the
+origin process lifetime. Repeats, new fingerprints beyond either cap, and new
+players after the global cap do not perform another synchronous fsync, so cycling
+players or inputs cannot turn the sample cache into unbounded writes or memory.
+Turn-consuming commands remain unsampled. This is bounded migration evidence,
+not an unbiased population sample: once the global cohort is full, later players
+produce no new no-turn samples until the origin process is replaced.
 The bounded copier sends
 at most 64 entries per page through an authenticated internal Worker route to a
 dedicated `ShadowReplay` SQLite Durable Object namespace. Checkpoint, immutable
-entry receipts, terminal state, and divergence evidence are committed
-transactionally. Exact overlap/retry is idempotent; conflict, gap, reorder,
-chain break, corrupt input, post-terminal input, and parity divergence fail
-visibly without silently advancing past the failing cursor.
+entry receipts, terminal state, and version/domain/kind-classified divergence
+evidence are committed transactionally. Batches must be strictly increasing;
+an ordered duplicate prefix remains idempotent, while conflict, gap, reorder,
+chain break, corrupt input, domain downgrade, post-terminal input, continuity
+drift, and parity divergence fail visibly without silently advancing past the
+failing cursor. The copier's duration budget aborts both the request and response
+body read instead of merely checking time between pages.
 
 This proves the ingestion/catch-up mechanism for vitals and movement decisions.
 It does not claim full-floor gameplay parity or edge movement authority: combat,
@@ -123,12 +140,27 @@ monsters, item mutation, trap/room effects, durable position, and transfers must
 enter shared normalized reducers before their journals can satisfy the
 zero-divergence authority-transfer gate.
 
-Movement evidence is partitioned into a floor-scoped origin stream and binds
-realm, floor instance, depth, floor epoch, and ruleset version into its state
-hash. The Worker rejects an entry whose complete authority tuple differs from
-the routed shadow object and rejects unsupported ruleset versions. Checkpoints
-expose both entry version and state domain so a
-movement fingerprint cannot be mistaken for a vitals fingerprint.
+Movement evidence is partitioned into an opaque character-run and
+authority-derived origin stream. A one-way digest of the 256-bit resume
+credential prevents a recycled process-local player ID from reusing an old
+character's stream without putting the credential itself in journal paths.
+Realm, floor instance, depth, floor epoch, and ruleset version also rotate the
+stream and are bound into state hashes. A mode-0600, synchronously fsynced
+authority sidecar reuses the same instance across benign origin restarts and
+advances the epoch before a missing floor is regenerated, even when its
+deterministic seed is unchanged. Rotation retries reconcile a committed rename
+by a request-bound mutating operation ID instead of allocating a second epoch
+after response loss; reusing a persisted mutation ID for another seed or
+rotation mode fails closed. Read-only benign-restart lookups are not recorded as
+idempotency operations.
+Atomic retry of a command that crossed the journal/mutation boundary still
+remains part of the transactional-outbox requirement. The DuckDB floor rows and
+authority sidecar are also one restore set; restoring only one can orphan shadow
+streams and is not accepted as a restore drill. The Worker rejects an entry whose complete authority tuple
+differs from the routed shadow object, rejects unsupported ruleset versions, and
+allows only the explicit one-way V1-vitals to V2-movement upgrade. Checkpoints
+expose entry version and state domain so a movement fingerprint cannot be
+mistaken for a vitals fingerprint.
 
 Exit gate:
 

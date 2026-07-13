@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { gameplayStateHash, reduceGameplay, replayGameplayTrace, type GameplayState } from "./gameplay-reducer.js";
-import { movementEventHash, movementStateHash, reduceMovement, type MovementState } from "./movement-reducer.js";
+import { movementContinuityHash, movementEventHash, movementStateHash, reduceMovement, type MovementState } from "./movement-reducer.js";
 import {
   createShadowJournalEntry,
   validateShadowJournalEntry,
@@ -78,7 +78,9 @@ describe("shadow journal seeded properties", () => {
       expect(validateShadowJournalEntry(JSON.parse(JSON.stringify(entry)) as unknown)).toEqual(entry);
       expect(entry.v).toBe(2);
       expect(entry.beforeStateHash).toBe(movementStateHash(beforeState));
+      expect(entry.beforeContinuityHash).toBe(movementContinuityHash(beforeState));
       expect(entry.afterStateHash).toBe(movementStateHash(transition.state));
+      expect(entry.afterContinuityHash).toBe(movementContinuityHash(transition.state));
       expect(entry.eventHash).toBe(movementEventHash(transition));
     }
   });

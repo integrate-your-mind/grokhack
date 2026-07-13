@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { BoundedBodyError, readBoundedBytes, readBoundedText } from "./bounded-body";
 import {
   MAX_CONTROL_BODY_BYTES,
   directoryBucketFor,
@@ -144,58 +145,6 @@ async function secretsEqual(left: string, right: string): Promise<boolean> {
   return difference === 0;
 }
 
-async function readBoundedText(request: Request, maximumBytes: number): Promise<string> {
-  const declared = request.headers.get("Content-Length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) throw new Error("batch_too_large");
-  if (!request.body) return "";
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let bytes = 0;
-  let text = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > maximumBytes) throw new Error("batch_too_large");
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    text += decoder.decode();
-    return text;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-async function readBoundedBytes(request: Request, maximumBytes: number): Promise<Uint8Array> {
-  const declared = request.headers.get("Content-Length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) {
-    throw new Error("batch_too_large");
-  }
-  if (!request.body) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > maximumBytes) throw new Error("batch_too_large");
-      chunks.push(chunk.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const body = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
-}
-
 async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig): Promise<Response> {
   if (request.method !== "POST") return json({ code: "method_not_allowed" }, 405, { Allow: "POST" });
   const authorization = request.headers.get("Authorization") ?? "";
@@ -203,7 +152,12 @@ async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig
   if (!(await secretsEqual(supplied, config.shadowIngestSecret))) return json({ code: "unauthorized" }, 401);
   let text: string;
   try { text = await readBoundedText(request, MAX_SHADOW_BATCH_BYTES); }
-  catch { return json({ code: "batch_too_large" }, 413); }
+  catch (error) {
+    if (error instanceof BoundedBodyError && error.code === "body_too_large") {
+      return json({ code: "batch_too_large" }, 413);
+    }
+    return json({ code: error instanceof BoundedBodyError ? error.code : "body_read_failed" }, 400);
+  }
   let candidate: unknown;
   try { candidate = JSON.parse(text); } catch { return json({ code: "malformed_json" }, 400); }
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return json({ code: "invalid_batch" }, 400);
@@ -219,13 +173,37 @@ async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig
     return json({ code: error instanceof Error ? error.message : "invalid_batch", checkpoint: 0 }, 400);
   }
   if (entries.some((entry) => entry.streamId !== entries[0]!.streamId)) return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
-  const name = `shadow:v1:${floorObjectName(route)}:s${entries[0]!.streamId}`;
+  const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${entries[0]!.streamId}`;
   const replay = env.SHADOW_REPLAYS.get(env.SHADOW_REPLAYS.idFromName(name));
-  return replay.fetch("https://shadow.internal/catch-up", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ route, entries }),
-  });
+  try {
+    return await replay.fetch("https://shadow.internal/catch-up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ route, entries }),
+    });
+  } catch (error) {
+    const failure = durableObjectFailure(error);
+    const retryable = failure.retryable || failure.overloaded;
+    console.error(JSON.stringify({
+      event: "shadow_replay_route_failed",
+      realmId: route.realmId,
+      floorInstanceId: route.floorInstanceId,
+      depth: route.depth,
+      floorEpoch: route.floorEpoch,
+      rulesetVersion: route.rulesetVersion,
+      overloaded: failure.overloaded,
+      retryable: failure.retryable,
+      remote: failure.remote,
+    }));
+    return json(
+      {
+        code: failure.overloaded ? "shadow_replay_overloaded" : "shadow_replay_unavailable",
+        retryable,
+      },
+      503,
+      retryable ? { "Retry-After": failure.overloaded ? "3" : "1" } : undefined,
+    );
+  }
 }
 
 function controlStatus(result: AllocationResult | RetirementResult): number {
@@ -263,8 +241,11 @@ async function routeAllocationControl(
   let bodyBytes: Uint8Array;
   try {
     bodyBytes = await readBoundedBytes(request, MAX_CONTROL_BODY_BYTES);
-  } catch {
-    return json({ code: "request_too_large" }, 413);
+  } catch (error) {
+    if (error instanceof BoundedBodyError && error.code === "body_too_large") {
+      return json({ code: "request_too_large" }, 413);
+    }
+    return json({ code: "body_read_failed" }, 400);
   }
   const authorized = await verifyControlSignature({
     method: request.method,

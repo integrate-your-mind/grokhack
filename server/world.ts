@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   generateDungeon,
   isWalkable,
@@ -92,7 +94,7 @@ import {
   reduceMovement,
   type MovementState,
 } from "../src/movement-reducer.js";
-import { movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
+import { movementJournalRunId, movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
 import { logEvent } from "./audit.js";
 import {
   attachPlayer,
@@ -157,15 +159,23 @@ const MAX_DEPTH = 15;
 const FOV_RADIUS = 8;
 const MAX_PLAYERS = 500;
 const MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER = 64;
+const MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS = 2_048;
 export const SHUTDOWN_RETRY_MESSAGE = "Server is restarting. Retry shortly.";
 
 export function shouldRecordMovementNoopEvidence(
-  evidence: ReadonlyMap<string, true>,
+  evidenceByPlayer: ReadonlyMap<string, ReadonlyMap<string, true>>,
+  playerId: string,
   fingerprint: string,
-  limit = MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+  perPlayerLimit = MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+  playerLimit = MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS,
 ): boolean {
-  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("invalid movement evidence limit");
-  return !evidence.has(fingerprint) && evidence.size < limit;
+  if (!Number.isSafeInteger(perPlayerLimit) || perPlayerLimit < 1 ||
+      !Number.isSafeInteger(playerLimit) || playerLimit < 1) {
+    throw new RangeError("invalid movement evidence limit");
+  }
+  const evidence = evidenceByPlayer.get(playerId);
+  if (!evidence && evidenceByPlayer.size >= playerLimit) return false;
+  return !evidence?.has(fingerprint) && (evidence?.size ?? 0) < perPlayerLimit;
 }
 
 export interface WorldServerOptions {
@@ -174,7 +184,10 @@ export interface WorldServerOptions {
   /** Maximum resident characters admitted by the legacy single-origin runtime. */
   maxPlayers?: number;
   /** Null disables shadow journaling in narrow tests; production uses the append-only journal. */
-  originJournal?: Pick<OriginGameplayJournal, "appendTransition"> | null;
+  originJournal?: (
+    Pick<OriginGameplayJournal, "appendTransition"> &
+    Partial<Pick<OriginGameplayJournal, "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+  ) | null;
 }
 /** Hide from map if no input this long — still listed in :who as [away] */
 const MAP_IDLE_MS = 30 * 60 * 1000;
@@ -256,16 +269,21 @@ export class WorldServer {
   private chatLog: string[] = [];
   /** playerId → timestamps of recent social/chat posts (spam guard) */
   private chatHits = new Map<string, number[]>();
-  /** Bounded sampler: repeated free/no-op collisions must not fsync on the hot path. */
+  /** Globally and per-player bounded sampler for free/no-op collision evidence. */
   private movementNoopEvidence = new Map<string, Map<string, true>>();
   private startedAt = Date.now();
   private totalTurns = 0;
   private worldSeed = Date.now();
+  private readonly movementAuthorityBootstrapId = randomUUID();
+  private readonly pendingMovementAuthorityRotations = new Map<number, string>();
   /** FIFO admission mutex: capacity/name checks and commits must be one atomic decision. */
   private joinAdmissionTail: Promise<void> = Promise.resolve();
   private readonly loadResumablePlayer: (name: string) => Promise<OnlinePlayer | null>;
   private readonly maxPlayers: number;
-  private readonly originJournal: Pick<OriginGameplayJournal, "appendTransition"> | null;
+  private readonly originJournal: (
+    Pick<OriginGameplayJournal, "appendTransition"> &
+    Partial<Pick<OriginGameplayJournal, "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+  ) | null;
   private shuttingDown = false;
 
   constructor(options: WorldServerOptions = {}) {
@@ -278,6 +296,7 @@ export class WorldServer {
   }
 
   async hydrateFromDatabase(): Promise<void> {
+    this.originJournal?.validateMovementAuthorityRegistry?.call(this.originJournal);
     const data = await loadWorld();
     if (!data) {
       await this.persistMeta();
@@ -289,6 +308,7 @@ export class WorldServer {
     this.startedAt = data.meta.startedAt;
 
     for (const floor of data.floors) {
+      floor.movementAuthority = this.resolveMovementAuthority(floor.depth, floor.seed, false);
       const compacted = this.enforceFloorMonsterInvariant(floor, "hydrate");
       // trap-pressure handoff
       floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
@@ -704,6 +724,9 @@ export class WorldServer {
   ): OnlinePlayer | string {
     const auth = this.authorizeResume(trimmed, resumeToken);
     if (auth !== true) return auth;
+    // Re-establish a missing floor authority before detaching an existing
+    // connection. A failed preflight must leave the current owner online.
+    this.getOrCreateFloor(sameName.floorDepth);
     if (sameName.connected) {
       const oldConnId = this.playerConnIds.get(sameName.id);
       if (oldConnId === connId) {
@@ -752,6 +775,8 @@ export class WorldServer {
     if (resumable) {
       const auth = this.authorizeResume(trimmed, resumeToken);
       if (auth !== true) return auth;
+      // Preflight floor authority before making the durable player resident.
+      this.getOrCreateFloor(resumable.floorDepth);
       this.players.set(resumable.id, resumable);
       return this.reconnectPlayer(connId, resumable);
     }
@@ -772,10 +797,13 @@ export class WorldServer {
     // owners must be able to reconnect when the legacy origin is full.
     if (this.players.size >= this.maxPlayers) return "World is full. Try again later.";
 
+    // Establish durable floor authority before issuing a character credential.
+    // A sidecar failure must not leave a new resume secret for a rejected join.
+    const floor = this.getOrCreateFloor(1);
+
     // Fresh character — rotate token so a prior owner's secret cannot claim the new run.
     const token = issueResumeToken(trimmed);
     const glyph = this.allocateGlyph(trimmed);
-    const floor = this.getOrCreateFloor(1);
     const spawn = this.findPlayerSpawn(floor, null);
 
     const entity = createPlayer(spawn.x, spawn.y);
@@ -864,6 +892,8 @@ export class WorldServer {
     player: OnlinePlayer,
     opts?: { silent?: boolean }
   ): OnlinePlayer {
+    // Authority durability is a precondition for every reconnect mutation.
+    const floor = this.getOrCreateFloor(player.floorDepth);
     const wasGrace = this.inGrace(player.id);
     const silent = opts?.silent === true || wasGrace;
     this.cancelGrace(player.id);
@@ -898,7 +928,6 @@ export class WorldServer {
       attachPlayer(conn.sessionId, player.id, player.name, player.kind, player.floorDepth);
     }
 
-    const floor = this.getOrCreateFloor(player.floorDepth);
     // Grace / supersede: fully silent. Cold resume after grace: personal only.
     if (!silent) {
       this.addMessage(player, `Welcome back, ${player.name}! (depth ${player.floorDepth})`);
@@ -1460,13 +1489,7 @@ export class WorldServer {
     const plannedTraps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
     const tile = (floor.dungeon.tiles[ny]?.[nx] ?? null) as Tile | null;
     const movementState: MovementState = {
-      authority: {
-        realmId: "legacy-1",
-        floorInstanceId: `legacy-depth-${floor.depth}`,
-        depth: floor.depth,
-        floorEpoch: 1,
-        rulesetVersion: 1,
-      },
+      authority: floor.movementAuthority ?? this.resolveMovementAuthority(floor.depth, floor.seed, false),
       x: player.state.entity.x,
       y: player.state.entity.y,
       phase: player.phase,
@@ -1484,13 +1507,22 @@ export class WorldServer {
     const noopFingerprint = movement.turnCost === "none"
       ? [movementStateHash(movementState), command.dx, command.dy, movementEventHash(movement)].join("|")
       : null;
-    const existingNoopEvidence = this.movementNoopEvidence.get(player.id) ?? new Map<string, true>();
     const sampledNoop = noopFingerprint !== null &&
-      !shouldRecordMovementNoopEvidence(existingNoopEvidence, noopFingerprint);
+      !shouldRecordMovementNoopEvidence(
+        this.movementNoopEvidence,
+        player.id,
+        noopFingerprint,
+        MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+        Math.min(this.maxPlayers, MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS),
+      );
     if (!sampledNoop) {
       try {
         this.originJournal?.appendTransition({
-          streamId: movementJournalStreamId(player.id, floor.depth),
+          streamId: movementJournalStreamId(
+            player.id,
+            movementJournalRunId(player.resumeToken ?? ""),
+            movementState.authority,
+          ),
           command,
           beforeState: movementState,
         });
@@ -1505,8 +1537,12 @@ export class WorldServer {
         return;
       }
       if (noopFingerprint !== null) {
-        existingNoopEvidence.set(noopFingerprint, true);
-        this.movementNoopEvidence.set(player.id, existingNoopEvidence);
+        let evidence = this.movementNoopEvidence.get(player.id);
+        if (!evidence) {
+          evidence = new Map<string, true>();
+          this.movementNoopEvidence.set(player.id, evidence);
+        }
+        evidence.set(noopFingerprint, true);
       }
     }
 
@@ -2213,6 +2249,7 @@ export class WorldServer {
   private getOrCreateFloor(depth: number): FloorState {
     let floor = this.floors.get(depth);
     if (floor) {
+      floor.movementAuthority ??= this.resolveMovementAuthority(floor.depth, floor.seed, false);
       this.enforceFloorMonsterInvariant(floor, "runtime");
       // trap-pressure handoff — regenerate traps if floor loaded pre-traps
       floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
@@ -2226,12 +2263,14 @@ export class WorldServer {
     const rng = new RNG(this.worldSeed + depth * 7919);
     const dungeon = generateDungeon(rng, depth);
     const seed = this.worldSeed + depth * 7919;
+    const movementAuthority = this.resolveMovementAuthority(depth, seed, true);
     floor = {
       depth,
       dungeon,
       monsters: [],
       items: [],
       seed,
+      movementAuthority,
       traps: [],
       eventState: createFloorEventState(),
     };
@@ -2253,8 +2292,39 @@ export class WorldServer {
     }
 
     this.floors.set(depth, floor);
+    this.pendingMovementAuthorityRotations.delete(depth);
     this.touchFloor(floor);
     return floor;
+  }
+
+  private resolveMovementAuthority(depth: number, floorSeed: number, rotate: boolean): MovementState["authority"] {
+    let rotationId = `${this.movementAuthorityBootstrapId}-d${depth}`;
+    if (rotate) {
+      const pending = this.pendingMovementAuthorityRotations.get(depth);
+      rotationId = pending ?? `${randomUUID()}-d${depth}`;
+      if (!pending) this.pendingMovementAuthorityRotations.set(depth, rotationId);
+    }
+    const durable = this.originJournal?.movementAuthorityForFloor;
+    if (durable) {
+      const authority = durable.call(this.originJournal, {
+        realmId: "legacy-1",
+        depth,
+        floorSeed,
+        rotate,
+        rotationId,
+      });
+      return authority;
+    }
+    // Narrow injected-journal tests do not own a sidecar. Keep their authority
+    // process-scoped; production always uses OriginGameplayJournal above.
+    const fallback: MovementState["authority"] = {
+      realmId: "legacy-1",
+      floorInstanceId: rotationId,
+      depth,
+      floorEpoch: 1,
+      rulesetVersion: 1,
+    };
+    return fallback;
   }
 
   private spawnMonsters(floor: FloorState, rng: RNG): void {
