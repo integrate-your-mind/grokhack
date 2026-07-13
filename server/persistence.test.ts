@@ -149,6 +149,70 @@ describe("duckdb persistence", () => {
     expect(await hasMovementTurnCommit(identity)).toBe(true);
   });
 
+  it("opens the original schema-v2 receipt table without rewriting its shape", async () => {
+    await closePersistence();
+    const previousV2 = await DuckDBInstance.create(testDbPath());
+    const previousV2Connection = await previousV2.connect();
+    await previousV2Connection.run(`DROP TABLE movement_turn_commits`);
+    await previousV2Connection.run(`
+      CREATE TABLE movement_turn_commits (
+        stream_id VARCHAR NOT NULL,
+        operation_id VARCHAR NOT NULL,
+        player_id VARCHAR NOT NULL,
+        floor_depth_1 INTEGER NOT NULL,
+        floor_depth_2 INTEGER,
+        snapshot_hash VARCHAR NOT NULL,
+        committed_at BIGINT NOT NULL,
+        PRIMARY KEY (stream_id, operation_id)
+      )
+    `);
+    previousV2Connection.closeSync();
+
+    await initPersistence();
+    expect(await getSchemaVersion()).toBe(2);
+    const player = samplePlayer("PreviousV2Receipt");
+    const floor = {
+      depth: 2,
+      seed: 408,
+      dungeon: generateDungeon(new RNG(408), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000a");
+    await expect(saveMovementTurnNow(player, [floor], identity)).resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
+  it("keeps the schema-v2 table writable by the previous receipt column list", async () => {
+    await closePersistence();
+    const previousWriter = await DuckDBInstance.create(testDbPath());
+    const previousWriterConnection = await previousWriter.connect();
+    await expect(previousWriterConnection.run(`
+      INSERT INTO movement_turn_commits (
+        stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      ) VALUES (
+        'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        '00000000-0000-4000-8000-00000000000b',
+        'previous-writer-player', 1, NULL,
+        'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 1
+      )
+    `)).resolves.toBeDefined();
+    previousWriterConnection.closeSync();
+
+    await initPersistence();
+    const player = samplePlayer("PreviousWriterReceipt");
+    const floor = {
+      depth: 2,
+      seed: 409,
+      dungeon: generateDungeon(new RNG(409), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000c");
+    await saveMovementTurnNow(player, [floor], identity);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
   it("rejects a future schema before recreating or writing any table", async () => {
     await closePersistence();
     const future = await DuckDBInstance.create(testDbPath());
@@ -192,7 +256,7 @@ describe("duckdb persistence", () => {
       const crashPoint = process.argv[2] ?? "none";
       const identity = {
         streamId: "turn_${"a".repeat(48)}",
-        operationId: "00000000-0000-4000-8000-000000000001",
+        operationId: process.argv[3] ?? "00000000-0000-4000-8000-000000000001",
       };
       await initPersistence();
       if (mode === "seed_state") {
@@ -282,19 +346,28 @@ describe("duckdb persistence", () => {
         await closePersistence();
       }
     `;
-    const runChild = (database: string, mode: string, crashPoint = "none") => spawnSync(process.execPath, [
+    const runChild = (
+      database: string,
+      mode: string,
+      crashPoint = "none",
+      operationId = "00000000-0000-4000-8000-000000000001",
+    ) => spawnSync(process.execPath, [
       "--import", "tsx", "--input-type=module", "-e",
       child,
       mode,
       crashPoint,
+      operationId,
     ], {
       cwd: process.cwd(),
       env: { ...process.env, GROKHACK_DB_PATH: database },
       encoding: "utf8",
       timeout: 20_000,
     });
-    const inspect = (database: string) => {
-      const inspected = runChild(database, "read_state");
+    const inspect = (
+      database: string,
+      operationId = "00000000-0000-4000-8000-000000000001",
+    ) => {
+      const inspected = runChild(database, "read_state", "none", operationId);
       expect(inspected.status, inspected.stderr).toBe(0);
       const resultLine = inspected.stdout.split("\n").find((line) => line.startsWith("ATOMIC_RESULT="));
       expect(resultLine).toBeDefined();
@@ -350,6 +423,26 @@ describe("duckdb persistence", () => {
     const retried = runChild(retryDatabase, "move_state");
     expect(retried.status, retried.stderr).toBe(0);
     expect(inspect(retryDatabase)).toEqual(committed);
+
+    const staleReceiptDatabase = path.join(tmpDir, "stale-receipt-after-prune.duckdb");
+    const staleOperationId = "00000000-0000-4000-8000-000000000001";
+    const replacementOperationId = "00000000-0000-4000-8000-000000000010";
+    expect(runChild(staleReceiptDatabase, "seed_state").status).toBe(0);
+    const firstCommit = runChild(staleReceiptDatabase, "move_state", "none", staleOperationId);
+    expect(firstCommit.status, firstCommit.stderr).toBe(0);
+    expect(inspect(staleReceiptDatabase, staleOperationId)).toEqual(committed);
+    const prunedThenCrashed = runChild(
+      staleReceiptDatabase,
+      "move_state",
+      "after_prune",
+      replacementOperationId,
+    );
+    expect(prunedThenCrashed.status, prunedThenCrashed.stderr).toBe(71);
+    expect(inspect(staleReceiptDatabase, staleOperationId)).toEqual(committed);
+    expect(inspect(staleReceiptDatabase, replacementOperationId)).toEqual({
+      ...committed,
+      receipt: false,
+    });
   }, 30_000);
 
   it("rejects missing, duplicate, and oversized movement floor sets before writing", async () => {
@@ -421,19 +514,13 @@ describe("duckdb persistence", () => {
     expect(await hasMovementTurnCommit(second)).toBe(true);
 
     await closePersistence();
-    const constrained = await DuckDBInstance.create(testDbPath());
-    const constrainedConnection = await constrained.connect();
-    await expect(constrainedConnection.run(`
-      INSERT INTO movement_turn_commits (
-        slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
-      )
-      SELECT
-        2, 'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        '00000000-0000-4000-8000-000000000009', player_id,
-        floor_depth_1, floor_depth_2, snapshot_hash, committed_at
-      FROM movement_turn_commits WHERE slot = 1
-    `)).rejects.toThrow();
-    constrainedConnection.closeSync();
+    const bounded = await DuckDBInstance.create(testDbPath());
+    const boundedConnection = await bounded.connect();
+    const receiptCount = await boundedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count FROM movement_turn_commits`,
+    );
+    expect(receiptCount.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    boundedConnection.closeSync();
     await initPersistence();
     expect(await hasMovementTurnCommit(second)).toBe(true);
 

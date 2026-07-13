@@ -268,7 +268,6 @@ async function applyMigrations(): Promise<void> {
   if (!applied.has(2)) {
     await run(`
       CREATE TABLE IF NOT EXISTS movement_turn_commits (
-        slot INTEGER PRIMARY KEY CHECK (slot = 1),
         stream_id VARCHAR NOT NULL,
         operation_id VARCHAR NOT NULL,
         player_id VARCHAR NOT NULL,
@@ -276,7 +275,7 @@ async function applyMigrations(): Promise<void> {
         floor_depth_2 INTEGER,
         snapshot_hash VARCHAR NOT NULL,
         committed_at BIGINT NOT NULL,
-        UNIQUE (stream_id, operation_id)
+        PRIMARY KEY (stream_id, operation_id)
       );
     `);
     await run(
@@ -623,8 +622,9 @@ export async function saveMovementTurnNow(
       // The filesystem journal admits only one global prepared movement. A
       // different receipt is stale cleanup residue from an already completed
       // marker. Prune it inside the new transaction so the table remains in
-      // its physically constrained single slot even when cleanup repeatedly
-      // fails after marker removal.
+      // one application-managed slot even when cleanup repeatedly fails after
+      // marker removal. enqueueDb serializes every writer around this delete
+      // and replacement insert.
       await connection.run(`DELETE FROM movement_turn_commits`);
       crashHooks.afterStaleCommitReceiptPrune?.();
       await connection.run(UPSERT_PLAYER_SQL, playerRow);
@@ -636,9 +636,9 @@ export async function saveMovementTurnNow(
       }
       await connection.run(
         `INSERT INTO movement_turn_commits (
-           slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
          ) VALUES (
-           1, $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
          )`,
         { ...expectedReceipt, committed_at: Date.now() },
       );
