@@ -132,21 +132,21 @@ turn so a retry cannot grant a free action, emits the evidence error, and keeps
 restart. A latched origin continues legacy gameplay but emits no later movement
 shadow envelopes and is ineligible for parity promotion even if catch-up would
 otherwise appear clean. The fence remains until the player and every persistable
-source/destination floor snapshot acknowledge; it does not replay or roll back a
-partial persistence failure. Graceful shutdown joins the in-flight durability
-chain and fails its durability barrier if the marker remains unresolved.
+source/destination floor snapshot commit in one DuckDB transaction. Graceful
+shutdown joins the in-flight durability chain and fails its durability barrier
+if the marker remains unresolved.
 
 This envelope is atomic at the shadow-evidence publication and edge-ingest
 boundaries. Player and every affected source/destination floor snapshot are
-committed before cleanup, and all queued writes must settle before the phase can
-advance. These separate DuckDB autocommits are not one database transaction; a
-partial failure therefore stays fenced. Floor persistence currently serializes
-the dungeon, monsters, and items, not transient trap/event runtime state. The
+committed before cleanup in the persistence module's serialized queue. A crash
+or exception before `COMMIT` rolls back all three rows; a post-commit crash is
+reconciled by `persistence_committed`. Floor persistence serializes the dungeon,
+monsters, items, traps, timed event state, and mechanical event book. The
 boundary is not one transaction with score/chat,
 world metadata, the authority sidecar, or every legacy side effect, and it does
 not make edge movement authoritative. Combat, item, trap, room, monster, and
-transfer effects still need complete shared reducers and a state transaction
-with a transactional outbox. The route and schema are undeployed; omitting a
+transfer effects still need complete shared reducers before authority transfer.
+The route and schema are undeployed; omitting a
 namespace migration is safe only after exact account/environment evidence proves
 that no earlier V2 or envelope-capable namespace was deployed.
 

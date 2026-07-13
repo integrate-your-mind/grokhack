@@ -79,6 +79,15 @@ async function queryRows<T extends Record<string, unknown>>(sql: string, values?
   });
 }
 
+/** @internal Process-crash seams for the movement snapshot transaction proof. */
+export interface MovementTurnPersistenceCrashHooks {
+  afterBegin?: () => void;
+  afterPlayerWrite?: () => void;
+  afterFloorWrite?: (depth: number, index: number) => void;
+  beforeCommit?: () => void;
+  afterCommit?: () => void;
+}
+
 export async function initPersistence(): Promise<void> {
   const file = dbPath();
   if (ready && currentPath === file) return;
@@ -247,16 +256,51 @@ function serializeFloor(floor: FloorState) {
       dungeon: floor.dungeon,
       monsters: floor.monsters,
       items: floor.items,
+      traps: floor.traps,
+      eventState: floor.eventState,
+      eventBook: floor.eventBook,
     }),
     updated_at: Date.now(),
   };
 }
+
+const UPSERT_PLAYER_SQL = `INSERT INTO players (
+    id, player_name, name_lower, glyph, player_kind, floor_depth, game_phase, connected,
+    last_active, score_recorded, state_json, explored_json, messages_json, updated_at
+  ) VALUES (
+    $id, $player_name, $name_lower, $glyph, $player_kind, $floor_depth, $game_phase, $connected,
+    $last_active, $score_recorded, $state_json, $explored_json, $messages_json, $updated_at
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    player_name = excluded.player_name,
+    name_lower = excluded.name_lower,
+    glyph = excluded.glyph,
+    player_kind = excluded.player_kind,
+    floor_depth = excluded.floor_depth,
+    game_phase = excluded.game_phase,
+    connected = excluded.connected,
+    last_active = excluded.last_active,
+    score_recorded = excluded.score_recorded,
+    state_json = excluded.state_json,
+    explored_json = excluded.explored_json,
+    messages_json = excluded.messages_json,
+    updated_at = excluded.updated_at`;
+
+const UPSERT_FLOOR_SQL = `INSERT INTO floors (depth, seed, state_json, updated_at)
+  VALUES ($depth, $seed, $state_json, $updated_at)
+  ON CONFLICT (depth) DO UPDATE SET
+    seed = excluded.seed,
+    state_json = excluded.state_json,
+    updated_at = excluded.updated_at`;
 
 function deserializeFloor(row: Record<string, unknown>): FloorState {
   const parsed = parseJsonColumn<{
     dungeon: FloorState["dungeon"];
     monsters: FloorState["monsters"];
     items: FloorState["items"];
+    traps?: FloorState["traps"];
+    eventState?: FloorState["eventState"];
+    eventBook?: FloorState["eventBook"];
   }>(row.state_json);
   return {
     depth: Number(row.depth),
@@ -264,6 +308,9 @@ function deserializeFloor(row: Record<string, unknown>): FloorState {
     dungeon: parsed.dungeon,
     monsters: parsed.monsters,
     items: parsed.items,
+    traps: parsed.traps,
+    eventState: parsed.eventState,
+    eventBook: parsed.eventBook,
   };
 }
 
@@ -271,30 +318,7 @@ export async function savePlayerNow(player: OnlinePlayer): Promise<void> {
   if (!ready || closing) return;
   pendingPlayers.delete(player.id);
   const row = serializePlayer(player);
-  await run(
-    `INSERT INTO players (
-      id, player_name, name_lower, glyph, player_kind, floor_depth, game_phase, connected,
-      last_active, score_recorded, state_json, explored_json, messages_json, updated_at
-    ) VALUES (
-      $id, $player_name, $name_lower, $glyph, $player_kind, $floor_depth, $game_phase, $connected,
-      $last_active, $score_recorded, $state_json, $explored_json, $messages_json, $updated_at
-    )
-    ON CONFLICT (id) DO UPDATE SET
-      player_name = excluded.player_name,
-      name_lower = excluded.name_lower,
-      glyph = excluded.glyph,
-      player_kind = excluded.player_kind,
-      floor_depth = excluded.floor_depth,
-      game_phase = excluded.game_phase,
-      connected = excluded.connected,
-      last_active = excluded.last_active,
-      score_recorded = excluded.score_recorded,
-      state_json = excluded.state_json,
-      explored_json = excluded.explored_json,
-      messages_json = excluded.messages_json,
-      updated_at = excluded.updated_at`,
-    row
-  );
+  await run(UPSERT_PLAYER_SQL, row);
 }
 
 export async function countPlayers(): Promise<number> {
@@ -327,15 +351,71 @@ export async function saveFloorNow(floor: FloorState): Promise<void> {
   if (!ready || closing) return;
   pendingFloors.delete(floor.depth);
   const row = serializeFloor(floor);
-  await run(
-    `INSERT INTO floors (depth, seed, state_json, updated_at)
-     VALUES ($depth, $seed, $state_json, $updated_at)
-     ON CONFLICT (depth) DO UPDATE SET
-       seed = excluded.seed,
-       state_json = excluded.state_json,
-       updated_at = excluded.updated_at`,
-    row
-  );
+  await run(UPSERT_FLOOR_SQL, row);
+}
+
+/**
+ * Commits the movement player plus its source/destination floor snapshots as
+ * one DuckDB transaction. Row values are captured before entering the shared
+ * database queue, and matching debounced writes are cancelled so no older
+ * timer can interleave with the atomic snapshot.
+ */
+export async function saveMovementTurnNow(
+  player: OnlinePlayer,
+  floors: readonly FloorState[],
+  crashHooks: MovementTurnPersistenceCrashHooks = {},
+): Promise<void> {
+  if (!ready || closing) throw new Error("movement_turn_persistence_unavailable");
+  if (floors.length < 1 || floors.length > 2 || new Set(floors.map((floor) => floor.depth)).size !== floors.length) {
+    throw new Error("invalid_movement_turn_persistence_floors");
+  }
+
+  const playerTimer = playerTimers.get(player.id);
+  if (playerTimer) clearTimeout(playerTimer);
+  playerTimers.delete(player.id);
+  pendingPlayers.delete(player.id);
+  for (const floor of floors) {
+    const floorTimer = floorTimers.get(floor.depth);
+    if (floorTimer) clearTimeout(floorTimer);
+    floorTimers.delete(floor.depth);
+    pendingFloors.delete(floor.depth);
+  }
+
+  const playerRow = serializePlayer(player);
+  const floorRows = floors.map(serializeFloor);
+  const connection = conn;
+  if (!connection) throw new Error("persistence not initialized");
+  await enqueueDb(async () => {
+    let committed = false;
+    try {
+      await connection.run("BEGIN TRANSACTION");
+      crashHooks.afterBegin?.();
+      await connection.run(UPSERT_PLAYER_SQL, playerRow);
+      crashHooks.afterPlayerWrite?.();
+      for (let index = 0; index < floorRows.length; index += 1) {
+        const floor = floors[index]!;
+        await connection.run(UPSERT_FLOOR_SQL, floorRows[index]!);
+        crashHooks.afterFloorWrite?.(floor.depth, index);
+      }
+      crashHooks.beforeCommit?.();
+      await connection.run("COMMIT");
+      committed = true;
+      crashHooks.afterCommit?.();
+    } catch (error) {
+      if (!committed) {
+        try {
+          await connection.run("ROLLBACK");
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            "movement turn transaction rollback failed",
+            { cause: rollbackError },
+          );
+        }
+      }
+      throw error;
+    }
+  });
 }
 
 export async function loadFloorByDepth(depth: number): Promise<FloorState | null> {

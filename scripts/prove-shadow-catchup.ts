@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { createTestHarness } from "../edge/node_modules/wrangler/wrangler-dist/cli.js";
 import { isWalkable } from "../src/dungeon.js";
 import { createMonster } from "../src/entities.js";
-import { reduceGameplay, type GameplayState } from "../src/gameplay-reducer.js";
+import { gameplayStateHash, reduceGameplay, type GameplayState } from "../src/gameplay-reducer.js";
 import { reduceMovement, type MovementState } from "../src/movement-reducer.js";
 import {
   createShadowJournalEntry,
@@ -106,13 +106,18 @@ function findOrdinaryStep(floor: FloorState): MovementStep | undefined {
     .find(({ x, y, dx, dy }) => {
       const targetX = x + dx;
       const targetY = y + dy;
+      const sourceSpecial = floor.dungeon.rooms.some((room) => room.special &&
+        x >= room.x && x < room.x + room.w &&
+        y >= room.y && y < room.y + room.h);
       const special = floor.dungeon.rooms.some((room) => room.special &&
         targetX >= room.x && targetX < room.x + room.w &&
         targetY >= room.y && targetY < room.y + room.h);
       return isWalkable(floor.dungeon.tiles, x, y) &&
         isWalkable(floor.dungeon.tiles, targetX, targetY) &&
+        floor.dungeon.tiles[y]?.[x] !== "+" &&
         floor.dungeon.tiles[targetY]?.[targetX] !== "+" &&
-        !special &&
+        !sourceSpecial && !special &&
+        (x !== floor.dungeon.stairsDown.x || y !== floor.dungeon.stairsDown.y) &&
         (targetX !== floor.dungeon.stairsDown.x || targetY !== floor.dungeon.stairsDown.y);
     });
 }
@@ -431,11 +436,13 @@ try {
   player.state.hunger = 2_000;
   player.state.entity.hp = 999;
   player.state.entity.maxHp = 999;
+  player.state.statuses = [{ kind: "poison", turnsLeft: 2, power: 2 }];
   const originBefore = {
     x: player.state.entity.x,
     y: player.state.entity.y,
     turns: player.state.turns,
     hunger: player.state.hunger,
+    hp: player.state.entity.hp,
   };
   world.handleInput(player.id, ordinaryStep.key);
   const movementRunId = movementJournalRunId(player.resumeToken);
@@ -461,11 +468,13 @@ try {
     y: player.state.entity.y,
     turns: player.state.turns,
     hunger: player.state.hunger,
+    hp: player.state.entity.hp,
   };
   if (originAfter.x !== originBefore.x + ordinaryStep.dx ||
       originAfter.y !== originBefore.y + ordinaryStep.dy ||
       originAfter.turns !== originBefore.turns + 1 ||
-      originAfter.hunger >= originBefore.hunger || world.getStats().shadowEvidenceDegraded) {
+      originAfter.hunger >= originBefore.hunger || originAfter.hp !== originBefore.hp - 2 ||
+      world.getStats().shadowEvidenceDegraded) {
     throw new Error(`real WorldServer movement did not roll forward exactly once: ${JSON.stringify({ originBefore, originAfter })}`);
   }
 
@@ -501,6 +510,36 @@ try {
       movementTurnFirstAck.turnStateHash !== movementTurnEnvelope.turn.afterStateHash) {
     throw new Error(`movement-turn response-loss commit was not observed: ${JSON.stringify(movementTurnFirstAck)}`);
   }
+  const movementTurnRetry = await catchUpMovementTurnJournal({
+    journal: worldJournal,
+    streamId: movementTurnStreamId,
+    route: validateShadowRoute(movementTurnEnvelope.movement.beforeState.authority),
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    fetchImpl: harnessFetch,
+  });
+  if (!movementTurnRetry.caughtUp || movementTurnRetry.checkpoint !== 1 ||
+      movementTurnRetry.accepted !== 0 || movementTurnRetry.duplicates !== 1 ||
+      movementTurnRetry.lastEnvelopeHash !== movementTurnEnvelope.envelopeHash ||
+      movementTurnRetry.movementStateHash !== movementTurnEnvelope.movement.afterStateHash ||
+      movementTurnRetry.turnStateHash !== movementTurnEnvelope.turn.afterStateHash) {
+    throw new Error(`movement-turn response-loss retry failed: ${JSON.stringify(movementTurnRetry)}`);
+  }
+
+  const reverseStep = directions.find((direction) =>
+    direction.dx === -ordinaryStep.dx && direction.dy === -ordinaryStep.dy);
+  if (!reverseStep) throw new Error("ordinary movement reverse step is unavailable");
+  world.handleInput(player.id, reverseStep.key);
+  const [originEffectsEnvelope, ...unexpectedOriginEffectsEnvelopes] = worldJournal.readMovementTurnsAfter(
+    movementTurnStreamId,
+    1,
+    64,
+  );
+  if (!originEffectsEnvelope || unexpectedOriginEffectsEnvelopes.length > 0 || !originEffectsEnvelope.turn ||
+      originEffectsEnvelope.cursor !== 2 || originEffectsEnvelope.turn.beforeState.hp !== originAfter.hp ||
+      gameplayStateHash(originEffectsEnvelope.turn.beforeState) === movementTurnEnvelope.turn.afterStateHash) {
+    throw new Error("real consecutive World turns did not expose the authenticated origin-effects boundary");
+  }
   const movementTurnParity = await catchUpMovementTurnJournal({
     journal: worldJournal,
     streamId: movementTurnStreamId,
@@ -510,13 +549,13 @@ try {
     fetchImpl: harnessFetch,
   });
   const replayObjectsAfter = await worker.listDurableObjectIds("SHADOW_REPLAYS");
-  if (!movementTurnParity.caughtUp || movementTurnParity.checkpoint !== 1 ||
-      movementTurnParity.accepted !== 0 || movementTurnParity.duplicates !== 1 ||
-      movementTurnParity.lastEnvelopeHash !== movementTurnEnvelope.envelopeHash ||
-      movementTurnParity.movementStateHash !== movementTurnEnvelope.movement.afterStateHash ||
-      movementTurnParity.turnStateHash !== movementTurnEnvelope.turn.afterStateHash ||
+  if (!movementTurnParity.caughtUp || movementTurnParity.checkpoint !== 2 ||
+      movementTurnParity.accepted !== 1 || movementTurnParity.duplicates !== 1 ||
+      movementTurnParity.lastEnvelopeHash !== originEffectsEnvelope.envelopeHash ||
+      movementTurnParity.movementStateHash !== originEffectsEnvelope.movement.afterStateHash ||
+      movementTurnParity.turnStateHash !== originEffectsEnvelope.turn.afterStateHash ||
       replayObjectsAfter.length !== replayObjectsBefore.length + 1) {
-    throw new Error(`movement-turn Worker parity failed: ${JSON.stringify(movementTurnParity)}`);
+    throw new Error(`movement-turn origin-effects parity failed: ${JSON.stringify(movementTurnParity)}`);
   }
 
   const failureDirectory = path.join(directory, "world-failure-journal");
@@ -1043,7 +1082,13 @@ try {
     movementEntryHash: movementTurnEnvelope.movement.entryHash,
     turnEntryHash: movementTurnEnvelope.turn.entryHash,
     firstHiddenAcknowledgement: movementTurnFirstAck,
-    retryAcknowledgement: movementTurnParity,
+    retryAcknowledgement: movementTurnRetry,
+    originEffectsBoundary: {
+      priorReducerTurnStateHash: movementTurnEnvelope.turn.afterStateHash,
+      nextOriginTurnBeforeStateHash: gameplayStateHash(originEffectsEnvelope.turn.beforeState),
+      nextEnvelopeHash: originEffectsEnvelope.envelopeHash,
+      acknowledgement: movementTurnParity,
+    },
     durableObjectDelta: replayObjectsAfter.length - replayObjectsBefore.length,
     failure: {
       originBefore: failureBefore,

@@ -187,16 +187,16 @@ acknowledgement recovery, not automatic gameplay replay or rollback.
 This publication unit closes the V2-movement/V1-vitals shadow-evidence split and
 does not clear its durable fence until the movement's player and affected-floor
 snapshots commit. A transfer may therefore wait for the player, source floor,
-and destination floor rows. Those separate autocommits are ordered before
-cleanup but are not one DuckDB transaction: a partial failure remains visible
-and fenced rather than being declared clean. The floor serializer covers the
-dungeon, monsters, and items; trap/event runtime state is not yet durable. The
-unit is not atomic with score/chat effects, world
+and destination floor rows. `saveMovementTurnNow` writes those rows in one
+queued DuckDB transaction: every pre-commit crash/failure rolls back the whole
+snapshot, while a post-commit crash is recovered from the durable
+`persistence_committed` marker. The floor serializer covers the dungeon,
+monsters, items, traps, timed event state, and mechanical event book. The unit
+is not atomic with score/chat effects, world
 metadata, the authority sidecar, or every other origin persistence side effect.
 Combat, monsters, item mutation, traps, room effects, and floor transfers are
-not yet complete shared-authority reducers. A transactional state/outbox
-boundary, recovery drills, and shared reducers for those effects remain required
-before authority transfer.
+not yet complete shared-authority reducers. Recovery drills and shared reducers
+for those effects remain required before authority transfer.
 Free wall/player rejections are evidence-sampled with a permanent 64-fingerprint
 budget per retained player and a hard global retained-player ceiling for the
 origin process lifetime. Repeats, new fingerprints beyond either cap, and new

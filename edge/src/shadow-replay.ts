@@ -619,19 +619,6 @@ export class ShadowReplay extends DurableObject<Env> {
         let nextTurnEntryHash = checkpoint.last_turn_entry_hash;
         let nextTurnStateHash = checkpoint.turn_state_hash;
         if (envelope.turn) {
-          const actualTurnBeforeStateHash = gameplayStateHash(envelope.turn.beforeState);
-          if (checkpoint.turn_state_hash !== null &&
-              actualTurnBeforeStateHash !== checkpoint.turn_state_hash) {
-            return this.movementTurnDivergence(
-              envelope,
-              "envelope_turn_state_before",
-              "vitals",
-              "turn_state_continuity_divergence",
-              committedCheckpoint,
-              checkpoint.turn_state_hash,
-              actualTurnBeforeStateHash,
-            );
-          }
           const turnTransition = reduceGameplay(envelope.turn.beforeState, envelope.turn.command);
           const actualTurnStateHash = gameplayStateHash(turnTransition.state);
           const actualTurnTerminal = !turnTransition.state.alive;

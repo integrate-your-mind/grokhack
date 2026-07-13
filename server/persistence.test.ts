@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createMonster, createPlayer, createStarterItems, nextId, resetEntityCounterForTests } from "../src/entities.js";
 import type { OnlinePlayer } from "./types.js";
@@ -20,6 +21,7 @@ import {
   loadWorld,
   resetPersistenceForTests,
   saveFloorNow,
+  saveMovementTurnNow,
   savePlayerNow,
   saveWorldMeta,
   scheduleSaveFloor,
@@ -69,6 +71,8 @@ function samplePlayer(name: string): OnlinePlayer {
       inventory: createStarterItems(),
       equippedWeapon: null,
       equippedArmor: null,
+      equippedRing: null,
+      statuses: [],
       gold: 12,
       turns: 9,
       depth: 2,
@@ -109,6 +113,191 @@ describe("duckdb persistence", () => {
   it("applies schema migrations and indexes base version", async () => {
     expect(await getSchemaVersion()).toBe(SCHEMA_VERSION);
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(1);
+  });
+
+  it("commits the movement snapshot atomically across process-crash boundaries", async () => {
+    const child = `
+      import {
+        closePersistence,
+        flushPersistence,
+        initPersistence,
+        loadWorld,
+        saveFloorNow,
+        saveMovementTurnNow,
+        savePlayerNow,
+        saveWorldMeta,
+      } from "./server/persistence.ts";
+      const mode = process.argv[1];
+      const crashPoint = process.argv[2] ?? "none";
+      await initPersistence();
+      if (mode === "seed_state") {
+        const player = {
+          id: "atomic-player", name: "AtomicMover", glyph: "@", kind: "human",
+          state: { depth: 1, entity: { x: 1, y: 1 }, alive: true },
+          explored: [[true]], messages: [], phase: "playing", floorDepth: 1,
+          connected: false, lastActive: 1, scoreRecorded: false,
+        };
+        const item = { id: "atomic-item", char: "%", name: "atomic ration", type: "food", identified: true, power: 0 };
+        await saveWorldMeta({ worldSeed: 42, totalTurns: 0, startedAt: 1 });
+        await savePlayerNow(player);
+        await saveFloorNow({
+          depth: 1,
+          seed: 101,
+          dungeon: {},
+          monsters: [],
+          items: [{ x: 1, y: 1, item }],
+          traps: [{ id: "atomic-trap", kind: "bear", x: 1, y: 1, revealed: false, sprung: false }],
+          eventState: {
+            turnCounter: 0, lastReinforcementTurn: 0, lastEnvEventTurn: 0, lastAmbientTurn: 0,
+            enteredSpecials: [], discoveredSpecials: [], packSpotted: [], floorEnterDone: false,
+          },
+          eventBook: { lastEventTurn: 0, pollution: 0, lastReinforceCheckTurn: 0, migrationCooldownTurn: 0 },
+        });
+        await saveFloorNow({ depth: 2, seed: 202, dungeon: {}, monsters: [], items: [] });
+        await flushPersistence();
+        await closePersistence();
+      } else if (mode === "move_state") {
+        const world = await loadWorld();
+        if (!world) throw new Error("missing world");
+        const player = world.players.find((candidate) => candidate.name === "AtomicMover");
+        const source = world.floors.find((floor) => floor.depth === 1);
+        const destination = world.floors.find((floor) => floor.depth === 2);
+        if (!player || !source || !destination) throw new Error("missing movement snapshot");
+        player.floorDepth = 2;
+        player.state.depth = 2;
+        const [movedItem] = source.items.splice(0, 1);
+        if (movedItem) destination.items.push(movedItem);
+        source.traps[0].revealed = true;
+        source.traps[0].sprung = true;
+        source.eventState.turnCounter = 1;
+        source.eventBook.pollution = 1;
+        const crash = (point) => {
+          if (crashPoint === point) process.exit(71);
+        };
+        try {
+          await saveMovementTurnNow(player, [source, destination], {
+            afterBegin() { crash("after_begin"); },
+            afterPlayerWrite() { crash("after_player"); },
+            afterFloorWrite(_depth, index) {
+              crash(index === 0 ? "after_source" : "after_destination");
+              if (crashPoint === "throw_after_source" && index === 0) {
+                throw new Error("injected movement transaction failure");
+              }
+            },
+            beforeCommit() { crash("before_commit"); },
+            afterCommit() { crash("after_commit"); },
+          });
+        } catch (error) {
+          if (crashPoint !== "throw_after_source" ||
+              !(error instanceof Error) || error.message !== "injected movement transaction failure") {
+            throw error;
+          }
+          await closePersistence();
+          process.exit(72);
+        }
+        await flushPersistence();
+        await closePersistence();
+      } else {
+        const world = await loadWorld();
+        if (!world) throw new Error("missing world");
+        const player = world.players.find((candidate) => candidate.name === "AtomicMover");
+        const source = world.floors.find((floor) => floor.depth === 1);
+        const destination = world.floors.find((floor) => floor.depth === 2);
+        console.log("ATOMIC_RESULT=" + JSON.stringify({
+          playerDepth: player?.floorDepth,
+          sourceItems: source?.items.length,
+          destinationItems: destination?.items.length,
+          sourceTrapSprung: source?.traps?.[0]?.sprung,
+          sourceEventTurn: source?.eventState?.turnCounter,
+          sourcePollution: source?.eventBook?.pollution,
+        }));
+        await closePersistence();
+      }
+    `;
+    const runChild = (database: string, mode: string, crashPoint = "none") => spawnSync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      child,
+      mode,
+      crashPoint,
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, GROKHACK_DB_PATH: database },
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    const inspect = (database: string) => {
+      const inspected = runChild(database, "read_state");
+      expect(inspected.status, inspected.stderr).toBe(0);
+      const resultLine = inspected.stdout.split("\n").find((line) => line.startsWith("ATOMIC_RESULT="));
+      expect(resultLine).toBeDefined();
+      return JSON.parse(resultLine!.slice("ATOMIC_RESULT=".length)) as Record<string, number>;
+    };
+    const baseline = {
+      playerDepth: 1,
+      sourceItems: 1,
+      destinationItems: 0,
+      sourceTrapSprung: false,
+      sourceEventTurn: 0,
+      sourcePollution: 0,
+    };
+    const committed = {
+      playerDepth: 2,
+      sourceItems: 0,
+      destinationItems: 1,
+      sourceTrapSprung: true,
+      sourceEventTurn: 1,
+      sourcePollution: 1,
+    };
+
+    for (const crashPoint of [
+      "after_begin",
+      "after_player",
+      "after_source",
+      "after_destination",
+      "before_commit",
+    ]) {
+      const database = path.join(tmpDir, `${crashPoint}.duckdb`);
+      const seeded = runChild(database, "seed_state");
+      expect(seeded.status, seeded.stderr).toBe(0);
+      const crashed = runChild(database, "move_state", crashPoint);
+      expect(crashed.status, `${crashPoint}: ${crashed.stderr}`).toBe(71);
+      expect(inspect(database), crashPoint).toEqual(baseline);
+    }
+
+    const committedDatabase = path.join(tmpDir, "after_commit.duckdb");
+    expect(runChild(committedDatabase, "seed_state").status).toBe(0);
+    const afterCommit = runChild(committedDatabase, "move_state", "after_commit");
+    expect(afterCommit.status, afterCommit.stderr).toBe(71);
+    expect(inspect(committedDatabase)).toEqual(committed);
+
+    const retryDatabase = path.join(tmpDir, "failure-retry.duckdb");
+    expect(runChild(retryDatabase, "seed_state").status).toBe(0);
+    const failed = runChild(retryDatabase, "move_state", "throw_after_source");
+    expect(failed.status, failed.stderr).toBe(72);
+    expect(inspect(retryDatabase)).toEqual(baseline);
+    const retried = runChild(retryDatabase, "move_state");
+    expect(retried.status, retried.stderr).toBe(0);
+    expect(inspect(retryDatabase)).toEqual(committed);
+  }, 30_000);
+
+  it("rejects missing, duplicate, and oversized movement floor sets before writing", async () => {
+    const player = samplePlayer("AtomicFloorValidation");
+    const floor = {
+      depth: 1,
+      seed: 303,
+      dungeon: generateDungeon(new RNG(303), 1),
+      monsters: [],
+      items: [],
+    };
+    await expect(saveMovementTurnNow(player, [])).rejects.toThrow("invalid_movement_turn_persistence_floors");
+    await expect(saveMovementTurnNow(player, [floor, floor])).rejects.toThrow(
+      "invalid_movement_turn_persistence_floors",
+    );
+    await expect(saveMovementTurnNow(player, [
+      floor,
+      { ...floor, depth: 2 },
+      { ...floor, depth: 3 },
+    ])).rejects.toThrow("invalid_movement_turn_persistence_floors");
   });
 
   it("coalesces turn metadata and flushes the latest snapshot", async () => {
@@ -174,7 +363,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "!",
       name: "proof gem",
-      type: "misc",
+      type: "ring",
       identified: true,
       power: 0,
     });
@@ -251,7 +440,7 @@ describe("duckdb persistence", () => {
             id: nextId("item"),
             char: "*",
             name: "crash-recovery gem",
-            type: "misc",
+            type: "ring",
             identified: true,
             power: 0,
           },
@@ -291,7 +480,7 @@ describe("duckdb persistence", () => {
             id: nextId("item"),
             char: "*",
             name: "close-drain gem",
-            type: "misc",
+            type: "ring",
             identified: true,
             power: 0,
           },
@@ -331,7 +520,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "/",
       name: "bob wand",
-      type: "misc",
+      type: "wand",
       identified: true,
       power: 1,
     });
@@ -421,7 +610,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "=",
       name: "ring of proof",
-      type: "misc",
+      type: "ring",
       identified: true,
       power: 0,
     });
@@ -433,7 +622,7 @@ describe("duckdb persistence", () => {
         id: nextId("item"),
         char: "*",
         name: "floor diamond",
-        type: "misc",
+        type: "ring",
         identified: true,
         power: 0,
       },

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 
-import { gameplayStateHash, reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
+import { reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
 import { reduceMovement, type MovementState } from "../../src/movement-reducer";
 import {
   MAX_SHADOW_BATCH_BYTES,
@@ -327,7 +327,7 @@ describe("ShadowReplay catch-up", () => {
     expect((await ingestMovementTurns([first!], { extra: { entries: [first!.movement] } })).status).toBe(400);
   });
 
-  it("rejects a hash-valid envelope that resets the durable turn state", async () => {
+  it("accepts an authenticated origin-only vitals effect between reducer turns", async () => {
     const streamId = `turn_${"8".repeat(48)}`;
     const correct = movementTurnTrace(streamId, 2);
     await expect((await ingestMovementTurns([correct[0]!])).json()).resolves.toMatchObject({
@@ -335,44 +335,25 @@ describe("ShadowReplay catch-up", () => {
       accepted: 1,
     });
 
-    const resetBeforeState = initial({ hp: 1_000 });
-    const resetTurn = createMovementTurnEnvelope({
+    const reducerAfter = reduceGameplay(correct[0]!.turn!.beforeState, correct[0]!.turn!.command).state;
+    const afterOriginOnlyPoison = { ...reducerAfter, hp: reducerAfter.hp - 1 };
+    const nextTurn = createMovementTurnEnvelope({
       streamId,
       cursor: 2,
       operationId: "00000000-0000-4000-8000-000000000802",
       command: correct[1]!.movement.command,
       beforeState: correct[1]!.movement.beforeState,
-      turn: { command: correct[1]!.turn!.command, beforeState: resetBeforeState },
+      turn: { command: correct[1]!.turn!.command, beforeState: afterOriginOnlyPoison },
       previousEnvelopeHash: correct[0]!.envelopeHash,
       previousMovementEntryHash: correct[0]!.movement.entryHash,
       previousTurnEntryHash: correct[0]!.turn!.entryHash,
     });
-    const response = await ingestMovementTurns([resetTurn]);
-    expect(response.status).toBe(422);
+    const response = await ingestMovementTurns([nextTurn]);
+    expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      code: "turn_state_continuity_divergence",
-      checkpoint: 1,
-      cursor: 2,
-      expectedHash: correct[0]!.turn!.afterStateHash,
-      actualHash: gameplayStateHash(resetBeforeState),
-    });
-    await expect(runInDurableObject(stubFor(streamId), (_instance, state) => ({
-      checkpoint: state.storage.sql.exec<{ checkpoint: number }>(
-        "SELECT checkpoint FROM movement_turn_checkpoint WHERE stream_id = ?",
-        streamId,
-      ).one().checkpoint,
-      receipts: state.storage.sql.exec<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM movement_turn_receipts WHERE stream_id = ?",
-        streamId,
-      ).one().count,
-      divergence: state.storage.sql.exec<{ divergence_kind: string; state_domain: string }>(
-        "SELECT divergence_kind, state_domain FROM shadow_divergences WHERE stream_id = ? AND cursor = 2",
-        streamId,
-      ).one(),
-    }))).resolves.toEqual({
-      checkpoint: 1,
-      receipts: 1,
-      divergence: { divergence_kind: "envelope_turn_state_before", state_domain: "vitals" },
+      checkpoint: 2,
+      accepted: 1,
+      turnStateHash: nextTurn.turn!.afterStateHash,
     });
   });
 

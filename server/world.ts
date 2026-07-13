@@ -134,6 +134,7 @@ import {
   loadResumablePlayerByName,
   loadWorld,
   saveFloorNow,
+  saveMovementTurnNow,
   savePlayerNow,
   saveWorldMeta,
   scheduleSaveFloor,
@@ -1965,16 +1966,7 @@ export class WorldServer {
     }
 
     const persist = this.persistMovementTurn ?? (isPersistenceReady()
-      ? async (currentPlayer: OnlinePlayer, affectedFloors: readonly FloorState[]) => {
-          // Every serializer captures its row synchronously before entering
-          // DuckDB's ordered queue. Cleanup is allowed only after every commit.
-          const results = await Promise.allSettled([
-            savePlayerNow(currentPlayer),
-            ...affectedFloors.map((affectedFloor) => saveFloorNow(affectedFloor)),
-          ]);
-          const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-          if (failure) throw failure.reason;
-        }
+      ? saveMovementTurnNow
       : null);
     if (!persist) {
       this.completeMovementTurnEvidence(player, identity);

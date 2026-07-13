@@ -16,6 +16,7 @@
 | `SCHEMA_VERSION` / `getSchemaVersion()` | Migration epoch |
 | `savePlayerNow` / `scheduleSavePlayer` | Upsert player row |
 | `saveFloorNow` / `scheduleSaveFloor` / `loadFloorByDepth` | Shared floor durability |
+| `saveMovementTurnNow` | Atomic player plus one/two-floor movement snapshot transaction |
 | `saveWorldMeta` | World seed / turn counter |
 | `appendChatMessages` / `loadRecentChat` | Durable chat_log |
 | `loadPlayerByName` | Lookup by display name (indexed `name_lower`) |
@@ -38,6 +39,7 @@
 6. **Debounced saves** — respect `closing` flag; `closePersistence()` force-drains pending maps.
 7. **Await pattern in tests** — `(await loadPlayerByName("x"))?.id`, not `await loadPlayerByName("x")?.id`.
 8. **Shared floors** — multi-player mutations on a depth must `saveFloorNow` / disconnect-save so cold start does not re-generate.
+9. **Movement transaction** — player, source floor, and destination floor snapshots commit or roll back together; do not replace `saveMovementTurnNow` with independent row saves.
 
 ## Resume + reconnect contract
 
