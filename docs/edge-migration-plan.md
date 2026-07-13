@@ -92,13 +92,20 @@ edge result is discarded; it must not serve player state or mutate legacy data.
 
 The first production-shaped slices now journal the shared turn/vitals reducer
 and movement decisions into fsynced, mode-0600, hash-chained 64-entry segments.
-Each bounded segment is written completely (including short-write retries)
-through a mode-0600 temporary file, file
-fsync, atomic rename, and directory fsync. First-use directory creation is also
-committed by fsyncing each existing parent boundary before an append can be
-acknowledged. A pre-rename fsync failure leaves the
-canonical segment unchanged; a lost post-rename acknowledgement is reconciled
-from the canonical file on retry.
+Each record is appended with a complete short-write loop and file fsync, then a
+one-byte per-segment commit sidecar is appended and fsynced. The write cost is
+therefore proportional to the new bounded record rather than the accumulated
+segment, and a separate online catch-up process reads only the committed prefix
+without taking writer ownership or repairing files. The odd writer sequence is
+fsynced (and its first directory entry committed) before evidence mutation; an
+even token is published only after commit durability or successful recovery.
+This fence keeps pre-fsync commit bytes and failed durability recovery invisible;
+readers rebuild their bounded head inside one stable sequence snapshot and retry
+transient cross-process writer contention for up to one second. New segment, sidecar, and
+movement-evidence directory entries are committed with directory fsyncs. A
+trailing or newline-complete record whose commit did not finish is truncated and
+fsynced before retry; a complete commit acknowledgement-loss record is re-synced
+and deduplicated, while committed corruption still fails closed.
 Frozen V1 vitals entries remain byte-compatible; V2 movement entries add
 position/cell input, full-observation and carried-state hashes, and a separate
 behavioral-event hash so wall, player, and monster blocks cannot alias merely
@@ -123,6 +130,29 @@ players or inputs cannot turn the sample cache into unbounded writes or memory.
 Turn-consuming commands remain unsampled. This is bounded migration evidence,
 not an unbiased population sample: once the global cohort is full, later players
 produce no new no-turn samples until the origin process is replaced.
+V1 vitals and V2 movement each have a separate origin-wide ceiling of 4,096
+entries, and every serialized entry is limited to 8 KiB. New retained shadow
+payload is therefore capped at 32 MiB per domain across every player, run
+credential, floor, and authority rotation, plus at most 4 KiB of commit bytes per
+domain. Canonical committed segments are the only capacity ledger: the single
+origin writer inventories and structurally validates their filenames, cursors,
+hash chains, terminal boundaries, and domain continuity before its first
+mutation, then reconciles them after an ambiguous append failure. No separately
+rewritten counter can drift from retained evidence or add growing writes to the
+public movement path. A mode-0600 hard-link owner record rejects a second live
+origin writer. Dead-process ownership is reclaimed through a hard-link recovery
+claim that admits one contender, survives reclaimer crashes, and can itself be
+reclaimed only after its recorded process exits. Linux process start ticks (or
+the platform process-start identity where available) prevent PID reuse from
+pinning a dead owner; platforms that cannot prove start identity fail closed.
+Public movement stream discovery performs at most 64 fixed segment probes
+instead of rescanning unrelated journal filenames for each rotated run.
+At saturation the journal preserves one contiguous immutable prefix, emits one
+capacity audit signal per domain and process, and returns before stream discovery
+or filesystem work. Authoritative origin gameplay continues even when either
+shadow domain is full; catch-up completeness intentionally ends at that visible
+capacity boundary. Other I/O, corruption, and continuity failures remain
+fail-closed.
 The bounded copier sends
 at most 64 entries per page through an authenticated internal Worker route to a
 dedicated `ShadowReplay` SQLite Durable Object namespace. Checkpoint, immutable

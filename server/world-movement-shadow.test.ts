@@ -290,6 +290,47 @@ describe("WorldServer movement shadow journal", () => {
     });
   });
 
+  it("keeps origin movement available after V1 and V2 shadow evidence reach capacity", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-capacity-"));
+    directories.push(directory);
+    const journal = new OriginGameplayJournal(directory, {
+      maxMovementEntries: 1,
+      maxGameplayEntries: 1,
+    });
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("capacity-walker"));
+    const player = await world.joinPlayer("capacity-walker", "CapacityWalker");
+    if (typeof player === "string") throw new Error(player);
+
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    const reverseKey = ({ l: "h", h: "l", j: "k", k: "j" } as Record<string, string>)[step.key];
+    if (!reverseKey) throw new Error("ordinary step has no reverse key");
+    for (const monster of floor.monsters) monster.hp = 0;
+    floor.items = floor.items.filter((item) =>
+      (item.x !== step.x || item.y !== step.y) &&
+      (item.x !== step.x + step.dx || item.y !== step.y + step.dy));
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = 999;
+    player.state.entity.maxHp = 999;
+
+    world.handleInput(player.id, step.key);
+    for (const monster of floor.monsters) monster.hp = 0;
+    world.handleInput(player.id, reverseKey);
+
+    expect(player.state).toMatchObject({
+      turns: 2,
+      entity: { x: step.x, y: step.y },
+    });
+    expect(journal.readAfter(movementStream(player, floor), 0, 64)).toHaveLength(1);
+    expect(journal.readAfter(player.id, 0, 64)).toHaveLength(1);
+    expect((world as unknown as { evidenceCapacityReported: Set<string> }).evidenceCapacityReported)
+      .toEqual(new Set(["movement", "vitals"]));
+  });
+
   it("journals terrain and player collision decisions without charging a turn", async () => {
     const journal = createJournal();
     const world = new WorldServer({ originJournal: journal });

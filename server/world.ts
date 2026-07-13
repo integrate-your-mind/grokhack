@@ -94,7 +94,12 @@ import {
   reduceMovement,
   type MovementState,
 } from "../src/movement-reducer.js";
-import { movementJournalRunId, movementJournalStreamId, OriginGameplayJournal } from "./origin-journal.js";
+import {
+  movementJournalRunId,
+  movementJournalStreamId,
+  OriginGameplayJournal,
+  type JournalAppendResult,
+} from "./origin-journal.js";
 import { logEvent } from "./audit.js";
 import {
   attachPlayer,
@@ -271,6 +276,8 @@ export class WorldServer {
   private chatHits = new Map<string, number[]>();
   /** Globally and per-player bounded sampler for free/no-op collision evidence. */
   private movementNoopEvidence = new Map<string, Map<string, true>>();
+  /** Avoids turning full non-authoritative shadow journals into log amplification. */
+  private evidenceCapacityReported = new Set<"vitals" | "movement">();
   private startedAt = Date.now();
   private totalTurns = 0;
   private worldSeed = Date.now();
@@ -1517,7 +1524,7 @@ export class WorldServer {
       );
     if (!sampledNoop) {
       try {
-        this.originJournal?.appendTransition({
+        const journalResult = this.originJournal?.appendTransition({
           streamId: movementJournalStreamId(
             player.id,
             movementJournalRunId(player.resumeToken ?? ""),
@@ -1526,6 +1533,16 @@ export class WorldServer {
           command,
           beforeState: movementState,
         });
+        if (journalResult?.status === "dropped_capacity") {
+          this.reportEvidenceCapacity(player, journalResult);
+        } else if (noopFingerprint !== null) {
+          let evidence = this.movementNoopEvidence.get(player.id);
+          if (!evidence) {
+            evidence = new Map<string, true>();
+            this.movementNoopEvidence.set(player.id, evidence);
+          }
+          evidence.set(noopFingerprint, true);
+        }
       } catch (error) {
         const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
         logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
@@ -1535,14 +1552,6 @@ export class WorldServer {
         });
         this.addMessage(player, "Turn journal unavailable — retry shortly.");
         return;
-      }
-      if (noopFingerprint !== null) {
-        let evidence = this.movementNoopEvidence.get(player.id);
-        if (!evidence) {
-          evidence = new Map<string, true>();
-          this.movementNoopEvidence.set(player.id, evidence);
-        }
-        evidence.set(noopFingerprint, true);
       }
     }
 
@@ -1708,6 +1717,24 @@ export class WorldServer {
     void saveFloorNow(newFloor);
   }
 
+  private reportEvidenceCapacity(
+    player: OnlinePlayer,
+    result: Extract<JournalAppendResult, { status: "dropped_capacity" }>,
+  ): void {
+    if (this.evidenceCapacityReported.has(result.domain)) return;
+    const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
+    logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
+      playerId: player.id,
+      playerName: player.name,
+      detail: {
+        component: result.domain === "movement" ? "origin_movement_journal" : "origin_gameplay_journal",
+        message: `${result.domain}_evidence_capacity`,
+        maxEntries: result.maxEntries,
+      },
+    });
+    this.evidenceCapacityReported.add(result.domain);
+  }
+
   private endPlayerTurn(player: OnlinePlayer, action: "wait" | "other" = "other"): void {
     const floor = this.getOrCreateFloor(player.floorDepth);
     const beforeState: GameplayState = {
@@ -1722,7 +1749,10 @@ export class WorldServer {
     const command = { type: "advance_turn", action } as const;
     const transition = reduceGameplay(beforeState, command);
     try {
-      this.originJournal?.appendTransition({ streamId: player.id, command, beforeState });
+      const journalResult = this.originJournal?.appendTransition({ streamId: player.id, command, beforeState });
+      if (journalResult?.status === "dropped_capacity") {
+        this.reportEvidenceCapacity(player, journalResult);
+      }
     } catch (error) {
       const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
       logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
