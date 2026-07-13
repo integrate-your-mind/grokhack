@@ -164,7 +164,10 @@ remaining synchronous origin turn effects. Only then does it durably rewrite the
 marker to `origin_applied` and immediately enqueue snapshots of the player and
 every affected source/destination floor through DuckDB's ordered persistence
 queue. The player, one/two floor snapshots, and a bounded operation receipt are
-written in one transaction. The receipt binds the journal identity to a SHA-256
+written in one transaction. Schema v2 constrains receipts to one physical slot;
+each later transaction prunes any stale prior receipt before inserting its own,
+so repeated post-marker cleanup failures cannot accumulate rows. The receipt
+binds the journal identity to a SHA-256
 of the exact stored player/floor rows; an exact retry is idempotent, while a
 conflicting or subsequently overwritten snapshot fails closed. After COMMIT,
 the handler durably advances the filesystem marker to `persistence_committed`;
@@ -199,7 +202,10 @@ queued DuckDB transaction: every pre-commit crash/failure rolls back the whole
 snapshot, while a crash after COMMIT but before the filesystem phase advance is
 recovered from the in-transaction operation receipt. Schema v2 adds only the
 receipt table; older rows need no rewrite and the table is safe to leave in
-place during code rollback after any in-flight preparation is resolved. The
+place during code rollback after any in-flight preparation is resolved. Before
+performing any DDL, startup reads the migration ceiling and rejects a database
+whose maximum version is newer than the binary's `SCHEMA_VERSION`; a downgrade
+therefore cannot silently write through an unknown future schema. The
 floor serializer covers the dungeon,
 monsters, items, traps, timed event state, and mechanical event book. The unit
 is not atomic with score/chat effects, world

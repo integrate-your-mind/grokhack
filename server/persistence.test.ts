@@ -33,6 +33,7 @@ import {
   SCHEMA_VERSION,
 } from "./persistence.js";
 import { WorldServer } from "./world.js";
+import { OriginGameplayJournal } from "./origin-journal.js";
 import type { ClientConnection } from "./types.js";
 import { generateDungeon } from "../src/dungeon.js";
 import { RNG } from "../src/rng.js";
@@ -148,6 +149,32 @@ describe("duckdb persistence", () => {
     expect(await hasMovementTurnCommit(identity)).toBe(true);
   });
 
+  it("rejects a future schema before recreating or writing any table", async () => {
+    await closePersistence();
+    const future = await DuckDBInstance.create(testDbPath());
+    const futureConnection = await future.connect();
+    await futureConnection.run(`DROP TABLE movement_turn_commits`);
+    await futureConnection.run(
+      `INSERT INTO schema_migrations (version, applied_at) VALUES ($version, $applied_at)`,
+      { version: SCHEMA_VERSION + 1, applied_at: Date.now() },
+    );
+    futureConnection.closeSync();
+
+    await expect(initPersistence()).rejects.toThrow("unsupported_persistence_schema_version");
+    expect(isPersistenceReady()).toBe(false);
+    await resetPersistenceForTests();
+
+    const inspected = await DuckDBInstance.create(testDbPath());
+    const inspectedConnection = await inspected.connect();
+    const reader = await inspectedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count
+         FROM information_schema.tables
+        WHERE table_name = 'movement_turn_commits'`,
+    );
+    expect(reader.getRowObjectsJson()).toEqual([{ count: 0 }]);
+    inspectedConnection.closeSync();
+  });
+
   it("commits the movement snapshot atomically across process-crash boundaries", async () => {
     const child = `
       import {
@@ -215,6 +242,7 @@ describe("duckdb persistence", () => {
         try {
           await saveMovementTurnNow(player, [source, destination], identity, {
             afterBegin() { crash("after_begin"); },
+            afterStaleCommitReceiptPrune() { crash("after_prune"); },
             afterPlayerWrite() { crash("after_player"); },
             afterFloorWrite(_depth, index) {
               crash(index === 0 ? "after_source" : "after_destination");
@@ -293,6 +321,7 @@ describe("duckdb persistence", () => {
 
     for (const crashPoint of [
       "after_begin",
+      "after_prune",
       "after_player",
       "after_source",
       "after_destination",
@@ -369,6 +398,48 @@ describe("duckdb persistence", () => {
     await expect(saveMovementTurnNow(player, [floor], identity))
       .rejects.toThrow("movement_turn_persistence_receipt_conflict");
     expect(await hasMovementTurnCommit(identity)).toBe(false);
+  });
+
+  it("keeps commit receipts in one slot across cleanup loss, later movement, and boot", async () => {
+    const player = samplePlayer("AtomicReceiptCeiling");
+    const floor = {
+      depth: 2,
+      seed: 407,
+      dungeon: generateDungeon(new RNG(407), 2),
+      monsters: [],
+      items: [],
+    };
+    const first = movementPersistenceIdentity("00000000-0000-4000-8000-000000000007");
+    const second = movementPersistenceIdentity("00000000-0000-4000-8000-000000000008");
+
+    // Leaving the first receipt simulates marker cleanup succeeding while its
+    // best-effort receipt DELETE fails.
+    await saveMovementTurnNow(player, [floor], first);
+    expect(await hasMovementTurnCommit(first)).toBe(true);
+    await saveMovementTurnNow(player, [floor], second);
+    expect(await hasMovementTurnCommit(first)).toBe(false);
+    expect(await hasMovementTurnCommit(second)).toBe(true);
+
+    await closePersistence();
+    const constrained = await DuckDBInstance.create(testDbPath());
+    const constrainedConnection = await constrained.connect();
+    await expect(constrainedConnection.run(`
+      INSERT INTO movement_turn_commits (
+        slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      )
+      SELECT
+        2, 'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        '00000000-0000-4000-8000-000000000009', player_id,
+        floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      FROM movement_turn_commits WHERE slot = 1
+    `)).rejects.toThrow();
+    constrainedConnection.closeSync();
+    await initPersistence();
+    expect(await hasMovementTurnCommit(second)).toBe(true);
+
+    const journal = new OriginGameplayJournal(path.join(tmpDir, "receipt-cleanup-journal"));
+    await new WorldServer({ originJournal: journal }).hydrateFromDatabase();
+    expect(await hasMovementTurnCommit(second)).toBe(false);
   });
 
   it("fails the shared connection closed when transaction rollback fails", async () => {

@@ -110,6 +110,7 @@ export interface MovementTurnPersistenceCrashHooks {
   afterBegin?: () => void;
   afterPlayerWrite?: () => void;
   afterFloorWrite?: (depth: number, index: number) => void;
+  afterStaleCommitReceiptPrune?: () => void;
   afterCommitReceiptWrite?: () => void;
   beforeCommit?: () => void;
   afterCommit?: () => void;
@@ -142,6 +143,15 @@ export async function initPersistence(): Promise<void> {
 
   instance = await DuckDBInstance.create(file);
   conn = await instance.connect();
+  try {
+    await assertSupportedSchemaVersionBeforeWrites(conn);
+  } catch (error) {
+    conn.closeSync();
+    conn = null;
+    instance = null;
+    currentPath = null;
+    throw error;
+  }
 
   await run(`
     CREATE TABLE IF NOT EXISTS world_meta (
@@ -217,12 +227,34 @@ async function appliedMigrationVersions(): Promise<Set<number>> {
   return new Set(rows.map((r) => Number(r.version)));
 }
 
+async function assertSupportedSchemaVersionBeforeWrites(
+  connection: DuckDBConnection,
+): Promise<void> {
+  const tableRows = await readConnectionRows<{ count: number }>(
+    connection,
+    `SELECT COUNT(*)::INTEGER AS count
+       FROM information_schema.tables
+      WHERE table_schema = 'main' AND table_name = 'schema_migrations'`,
+  );
+  if (Number(tableRows[0]?.count ?? 0) === 0) return;
+  const versionRows = await readConnectionRows<{ version: number }>(
+    connection,
+    `SELECT COALESCE(MAX(version), 0)::INTEGER AS version FROM main.schema_migrations`,
+  );
+  if (Number(versionRows[0]?.version ?? 0) > SCHEMA_VERSION) {
+    throw new Error("unsupported_persistence_schema_version");
+  }
+}
+
 /**
  * Idempotent migrations. Version 1 = base tables/indexes (created above).
  * Version 2 = movement snapshot commit receipts used for cross-store recovery.
  */
 async function applyMigrations(): Promise<void> {
   const applied = await appliedMigrationVersions();
+  if (Math.max(0, ...applied) > SCHEMA_VERSION) {
+    throw new Error("unsupported_persistence_schema_version");
+  }
   const now = Date.now();
 
   if (!applied.has(1)) {
@@ -236,6 +268,7 @@ async function applyMigrations(): Promise<void> {
   if (!applied.has(2)) {
     await run(`
       CREATE TABLE IF NOT EXISTS movement_turn_commits (
+        slot INTEGER PRIMARY KEY CHECK (slot = 1),
         stream_id VARCHAR NOT NULL,
         operation_id VARCHAR NOT NULL,
         player_id VARCHAR NOT NULL,
@@ -243,7 +276,7 @@ async function applyMigrations(): Promise<void> {
         floor_depth_2 INTEGER,
         snapshot_hash VARCHAR NOT NULL,
         committed_at BIGINT NOT NULL,
-        PRIMARY KEY (stream_id, operation_id)
+        UNIQUE (stream_id, operation_id)
       );
     `);
     await run(
@@ -576,11 +609,24 @@ export async function saveMovementTurnNow(
             !(await movementTurnReceiptMatchesStoredSnapshot(connection, existing))) {
           throw new Error("movement_turn_persistence_receipt_conflict");
         }
+        await connection.run(
+          `DELETE FROM movement_turn_commits
+            WHERE stream_id <> $stream_id OR operation_id <> $operation_id`,
+          { stream_id: identity.streamId, operation_id: identity.operationId },
+        );
+        crashHooks.afterStaleCommitReceiptPrune?.();
         await connection.run("COMMIT");
         committed = true;
         crashHooks.afterCommit?.();
         return;
       }
+      // The filesystem journal admits only one global prepared movement. A
+      // different receipt is stale cleanup residue from an already completed
+      // marker. Prune it inside the new transaction so the table remains in
+      // its physically constrained single slot even when cleanup repeatedly
+      // fails after marker removal.
+      await connection.run(`DELETE FROM movement_turn_commits`);
+      crashHooks.afterStaleCommitReceiptPrune?.();
       await connection.run(UPSERT_PLAYER_SQL, playerRow);
       crashHooks.afterPlayerWrite?.();
       for (let index = 0; index < floorRows.length; index += 1) {
@@ -590,9 +636,9 @@ export async function saveMovementTurnNow(
       }
       await connection.run(
         `INSERT INTO movement_turn_commits (
-           stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
          ) VALUES (
-           $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           1, $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
          )`,
         { ...expectedReceipt, committed_at: Date.now() },
       );
