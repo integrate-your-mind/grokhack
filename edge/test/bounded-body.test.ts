@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { BoundedBodyError, readBoundedBytes, readBoundedText } from "../src/bounded-body";
+import { readBoundedBytes, readBoundedText } from "../src/bounded-body";
 
 function requestWithBody(body: ReadableStream<Uint8Array>): Request {
   return new Request("https://edge.test/internal", { method: "POST", body });
@@ -32,7 +32,7 @@ describe("bounded request bodies", () => {
         cancelReason = reason;
       },
     });
-    await expect(readBoundedBytes(requestWithBody(body), 4)).rejects.toMatchObject<BoundedBodyError>({
+    await expect(readBoundedBytes(requestWithBody(body), 4)).rejects.toMatchObject({
       code: "body_too_large",
     });
     expect(pulls).toBe(1);
@@ -46,7 +46,7 @@ describe("bounded request bodies", () => {
         controller.close();
       },
     });
-    await expect(readBoundedText(requestWithBody(body), 2)).rejects.toMatchObject<BoundedBodyError>({
+    await expect(readBoundedText(requestWithBody(body), 2)).rejects.toMatchObject({
       code: "invalid_utf8",
     });
   });

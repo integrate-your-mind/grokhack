@@ -92,7 +92,7 @@ describe("Telnet admission", () => {
 
     const socket = net.createConnection({ host: "127.0.0.1", port });
     sockets.push(socket);
-    await waitForText(socket, /Enter your name/i);
+    await waitForText(socket, /Enter thy name, adventurer/i);
     socket.write("TelnetFence\r\n");
     const rejected = await waitForText(socket, /Unable to join right now/);
     expect(rejected).not.toContain("authority disk unavailable");

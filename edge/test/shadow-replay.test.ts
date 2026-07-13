@@ -14,6 +14,8 @@ import {
   type ShadowRoute,
 } from "../../src/shadow-journal";
 import type { Env } from "../src/env";
+import { readEdgeConfig } from "../src/config";
+import { routeShadowCatchup } from "../src/index";
 import { floorObjectName } from "../src/protocol";
 
 const SECRET = "local-shadow-ingest-test-key-2026-07-11";
@@ -533,18 +535,32 @@ describe("ShadowReplay catch-up", () => {
     }))).resolves.toEqual({ entryCount: 1, versions: [1, 2, 3, 4, 5, 999] });
   });
 
-  it("maps an unexpected replay-object failure to a structured unavailable response", async () => {
-    const streamId = "route-failure";
-    const stub = stubFor(streamId);
-    await runInDurableObject(stub, (_instance, state) => {
-      state.storage.sql.exec("DROP TABLE shadow_checkpoint");
+  it("maps a retryable replay-object failure without leaking an uncaught exception", async () => {
+    const runtimeEnv = env as Env;
+    const configured = readEdgeConfig(runtimeEnv);
+    if (!configured.ok) throw new Error(configured.errors.join(", "));
+    const failingEnv = Object.create(runtimeEnv) as Env;
+    Object.defineProperty(failingEnv, "SHADOW_REPLAYS", {
+      value: {
+        idFromName: () => ({}),
+        get: () => ({
+          fetch: async () => {
+            throw Object.assign(new Error("injected replay failure"), { retryable: true, remote: true });
+          },
+        }),
+      },
     });
-    const response = await ingest(trace(streamId, 1));
+    const entries = trace("route-failure", 1);
+    const response = await routeShadowCatchup(new Request("https://edge.test/internal/shadow/catch-up", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${SECRET}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ v: 1, route, entries }),
+    }), failingEnv, configured.value);
     expect(response.status).toBe(503);
-    expect(response.headers.get("Retry-After")).toBeNull();
+    expect(response.headers.get("Retry-After")).toBe("1");
     await expect(response.json()).resolves.toEqual({
       code: "shadow_replay_unavailable",
-      retryable: false,
+      retryable: true,
     });
   });
 
@@ -600,9 +616,10 @@ describe("ShadowReplay catch-up", () => {
 
   it("retains a bounded exact-idempotency window and rejects compacted retries", async () => {
     const streamId = "receipt-window";
-    const entries = trace(streamId, 300);
+    const entries = trace(streamId, 300, initial({ hp: 1_000 }));
     for (let offset = 0; offset < entries.length; offset += 64) {
-      expect((await ingest(entries.slice(offset, offset + 64))).status).toBe(200);
+      const response = await ingest(entries.slice(offset, offset + 64));
+      expect(response.status, `offset ${offset}: ${await response.clone().text()}`).toBe(200);
     }
     await expect(runInDurableObject(stubFor(streamId), (_instance, state) =>
       state.storage.sql.exec<{ count: number; minimum: number; maximum: number }>(

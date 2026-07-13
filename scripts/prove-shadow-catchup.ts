@@ -210,7 +210,8 @@ try {
     },
   });
   const continuitySource = {
-    readAfter: (_streamId: string, cursor: number) => cursor < 2 ? [continuityJump] : [],
+    readAfter: (_streamId: string, cursor: number, limit: number) =>
+      [continuityFirst, continuityJump].filter((entry) => entry.cursor > cursor).slice(0, limit),
   };
   let continuityDivergence: { code: string; checkpoint: number; status: number } | null = null;
   try {

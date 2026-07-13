@@ -145,7 +145,7 @@ async function secretsEqual(left: string, right: string): Promise<boolean> {
   return difference === 0;
 }
 
-async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig): Promise<Response> {
+export async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig): Promise<Response> {
   if (request.method !== "POST") return json({ code: "method_not_allowed" }, 405, { Allow: "POST" });
   const authorization = request.headers.get("Authorization") ?? "";
   const supplied = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
