@@ -56,6 +56,27 @@ npm run test:coverage    # 59 files, 737 tests
 The coverage run reported 72.26% statements, 66.94% branches, 80.64%
 functions, and 74.70% lines across the root source inventory.
 
+## Combat data crash boundaries — `aaf7e72caa490af53ddd72ad09687d9a0eb6e7d9`
+
+The combat-journal cold-crash regression now covers the data-side boundaries
+as well as the existing commit barrier. The isolated child writer is stopped
+before the data write, immediately after the data-file `fsync`, before the
+one-byte commit write, and immediately after commit `fsync`. After each
+restart, the first three cases expose no combat envelope and the original
+operation appends cleanly; the post-commit case exposes exactly one envelope
+and retries as a duplicate. This verifies that data is never externally
+visible before the durable commit marker, without claiming automatic recovery
+of an origin process crash after a committed combat envelope but before the
+separate legacy monster mutation.
+
+```sh
+node scripts/run-tests-isolated.mjs server/origin-journal.test.ts src/combat.test.ts src/combat-reducer.test.ts src/combat-turn-envelope.test.ts
+# 4 files, 122 tests passed
+npm run lint
+npm run build
+npm run check:server-types
+```
+
 ## Exact local proof
 
 | Command | Result |
@@ -83,6 +104,9 @@ node scripts/run-tests-isolated.mjs server/origin-journal.test.ts -t 'segments m
   supplied transcript before mutating the monster.
 - Journal-write failure leaves combat state unchanged and retains the existing
   durable movement preparation fence.
+- Combat data-write/data-fsync/commit-write/commit-fsync cold crashes preserve
+  the committed-prefix rule: retry appends only before commit and deduplicates
+  only after commit.
 - Combat envelopes reject malformed authority, stale/reordered/gapped cursors,
   terminal continuation, operation conflicts, and unprovable acknowledgement.
 - Response loss, timeout/abort, restart, empty pre-commit segment cleanup,
