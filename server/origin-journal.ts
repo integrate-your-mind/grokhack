@@ -709,6 +709,7 @@ export class OriginGameplayJournal {
       if (retry.envelopeHash === last.envelopeHash) return { status: "duplicate", envelope: last };
       throw new Error("combat_turn_operation_conflict");
     }
+    if (head.cursor >= MAX_MOVEMENT_EVIDENCE_ENTRIES) throw new Error("combat_turn_evidence_capacity_exceeded");
     const envelope = createCombatTurnEnvelopeV1({
       ...input,
       cursor: head.cursor + 1,
@@ -896,20 +897,32 @@ export class OriginGameplayJournal {
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new RangeError("invalid cursor");
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new RangeError("invalid limit");
     this.assertCombatTurnStreamId(streamId);
-    const head = this.combatTurnHead(streamId);
-    if (cursor >= head.cursor) return [];
-    const result: CombatTurnEnvelopeV1[] = [];
-    for (let segment = this.segmentFor(cursor + 1); result.length < limit; segment++) {
-      const envelopes = this.readCombatTurnSegment(streamId, segment, false);
-      for (const envelope of envelopes) {
-        if (envelope.cursor > cursor && envelope.cursor <= head.cursor) result.push(envelope);
-        if (result.length === limit) return result;
+    // A cold reader may be the first process to observe a writer that died
+    // after publishing an odd sequence token. Acquire/reconcile before taking
+    // a snapshot so that a durable committed prefix becomes readable, while a
+    // live foreign owner is still rejected by the ownership fence.
+    this.ensureEvidenceState();
+    let lastError: unknown;
+    for (let attempt = 0; attempt < JOURNAL_READER_RETRY_ATTEMPTS; attempt++) {
+      const before = this.readWriteSequenceToken();
+      if (before?.active) {
+        if (before.ownerId === PROCESS_WRITER_ID) throw new Error("journal_writer_busy");
+        this.waitForWriter();
+        continue;
       }
-      if (envelopes.length < SEGMENT_ENTRIES) break;
+      this.combatTurnHeads.delete(streamId);
+      try {
+        const result = this.readCombatTurnsAfterSnapshot(streamId, cursor, limit);
+        const after = this.readWriteSequenceToken();
+        if (before?.token === after?.token && !after?.active) return result;
+      } catch (error) {
+        lastError = error;
+        const after = this.readWriteSequenceToken();
+        if (before?.token === after?.token && !after?.active) throw error;
+      }
+      this.waitForWriter();
     }
-    const expected = Math.min(limit, head.cursor - cursor);
-    if (result.length !== expected) throw new Error("combat_turn_missing_segment");
-    return result;
+    throw new Error("journal_writer_busy", { cause: lastError });
   }
 
   private readAfterSnapshot(streamId: string, cursor: number, limit: number): ShadowJournalEntry[] {
@@ -951,6 +964,29 @@ export class OriginGameplayJournal {
     }
     const expected = Math.min(limit, head.cursor - cursor);
     if (result.length !== expected) throw new Error("movement_turn_missing_segment");
+    return result;
+  }
+
+  private readCombatTurnsAfterSnapshot(
+    streamId: string,
+    cursor: number,
+    limit: number,
+  ): CombatTurnEnvelopeV1[] {
+    const head = this.combatTurnHead(streamId, false);
+    if (cursor >= head.cursor) return [];
+    const result: CombatTurnEnvelopeV1[] = [];
+    let segment = this.segmentFor(cursor + 1);
+    while (result.length < limit) {
+      const envelopes = this.readCombatTurnSegment(streamId, segment, false);
+      for (const envelope of envelopes) {
+        if (envelope.cursor > cursor && envelope.cursor <= head.cursor) result.push(envelope);
+        if (result.length === limit) return result;
+      }
+      if (envelopes.length < SEGMENT_ENTRIES) break;
+      segment++;
+    }
+    const expected = Math.min(limit, head.cursor - cursor);
+    if (result.length !== expected) throw new Error("combat_turn_missing_segment");
     return result;
   }
 
@@ -1028,18 +1064,28 @@ export class OriginGameplayJournal {
     return this.readCombatTurnSegment(streamId, this.segmentFor(cursor)).find((entry) => entry.cursor === cursor);
   }
 
-  private combatTurnHead(streamId: string): CombatTurnHead {
+  private combatTurnHead(streamId: string, repair = true): CombatTurnHead {
     this.assertCombatTurnStreamId(streamId);
     const cached = this.combatTurnHeads.get(streamId);
     if (cached) return cached;
     this.ensureCombatTurnDirectory();
-    const all: CombatTurnEnvelopeV1[] = [];
-    for (let segment = 0; ; segment++) {
-      const entries = this.readCombatTurnSegment(streamId, segment);
-      if (!entries.length) break;
-      all.push(...entries);
-      if (entries.length < SEGMENT_ENTRIES) break;
+    const segments = this.boundedCombatTurnSegments(streamId);
+    if (!segments.length) {
+      const empty = { cursor: 0, envelopeHash: "", turnEntryHash: null, terminal: false };
+      this.combatTurnHeads.set(streamId, empty);
+      return empty;
     }
+    const latestSegment = segments.at(-1)!;
+    if (segments.some((value, index) => value !== index)) throw new Error("combat_turn_missing_segment");
+    const latest = this.readCombatTurnSegment(streamId, latestSegment, repair);
+    if (!latest.length) {
+      if (repair) throw new Error("combat_turn_empty_segment");
+      if (latestSegment === 0) return { cursor: 0, envelopeHash: "", turnEntryHash: null, terminal: false };
+      throw new Error("combat_turn_empty_segment");
+    }
+    if (repair) this.syncCombatTurnSegmentFiles(streamId, latestSegment);
+    const all = segments.flatMap((segment) =>
+      segment === latestSegment ? latest : this.readCombatTurnSegment(streamId, segment, false));
     let previous: CombatTurnEnvelopeV1 | undefined;
     for (const envelope of all) {
       if (envelope.cursor !== (previous?.cursor ?? 0) + 1 ||
@@ -2272,6 +2318,27 @@ export class OriginGameplayJournal {
     return segments;
   }
 
+  private boundedCombatTurnSegments(streamId: string): number[] {
+    this.assertCombatTurnStreamId(streamId);
+    const maxSegments = Math.ceil(MAX_MOVEMENT_EVIDENCE_ENTRIES / SEGMENT_ENTRIES);
+    const segments: number[] = [];
+    let missing = false;
+    for (let segment = 0; segment < maxSegments; segment++) {
+      const file = this.combatTurnFileFor(streamId, segment);
+      const exists = fs.existsSync(file);
+      if (!exists) {
+        const commitFile = this.commitFileFor(file);
+        if (fs.existsSync(commitFile) && this.readCommitCount(commitFile) > 0) throw new Error("combat_turn_missing_segment");
+        missing = true;
+        continue;
+      }
+      if (missing) throw new Error("combat_turn_missing_segment");
+      segments.push(segment);
+    }
+    if (fs.existsSync(this.combatTurnFileFor(streamId, maxSegments))) throw new Error("combat_turn_evidence_capacity_exceeded");
+    return segments;
+  }
+
   private syncSegmentFiles(streamId: string, segment: number): void {
     const files = this.segmentFilesFor(streamId, segment);
     for (const file of files) {
@@ -2299,6 +2366,20 @@ export class OriginGameplayJournal {
       }
     }
     if (files.length) this.syncDirectory(this.movementTurnDirectory());
+  }
+
+  private syncCombatTurnSegmentFiles(streamId: string, segment: number): void {
+    const file = this.combatTurnFileFor(streamId, segment);
+    const files = [file, this.commitFileFor(file)].filter((candidate) => fs.existsSync(candidate));
+    for (const candidate of files) {
+      const descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      try {
+        this.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    }
+    if (files.length) this.syncDirectory(this.combatTurnDirectory());
   }
 
   private removeEmptySegmentFiles(streamId: string, segment: number): boolean {

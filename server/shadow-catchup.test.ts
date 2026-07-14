@@ -243,6 +243,63 @@ describe("catchUpCombatTurnJournal", () => {
         turnStateHash: combatTurn.turn.afterStateHash }),
     })).rejects.toThrow("invalid combat-turn shadow checkpoint advance");
   });
+
+  it("does not advance on response loss and accepts the exact duplicate retry", async () => {
+    let attempts = 0;
+    const source = { readCombatTurnsAfter: (_streamId: string, cursor: number, limit: number) => [combatTurn].filter((entry) => entry.cursor > cursor).slice(0, limit) };
+    const fetchImpl = async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("combat response lost");
+      return Response.json({ streamId: combatTurn.streamId, checkpoint: 1, accepted: 0, duplicates: 1,
+        terminal: false, lastEnvelopeHash: combatTurn.envelopeHash, combatStateHash: combatTurn.afterStateHash,
+        turnStateHash: combatTurn.turn.afterStateHash });
+    };
+    await expect(catchUpCombatTurnJournal({ journal: source, streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret, fetchImpl }))
+      .rejects.toMatchObject({ code: "combat response lost", checkpoint: 0 });
+    await expect(catchUpCombatTurnJournal({ journal: source, streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret, fetchImpl }))
+      .resolves.toMatchObject({ checkpoint: 1, accepted: 0, duplicates: 1, caughtUp: true });
+  });
+
+  it("reconstructs a locally provable combat prefix after receipt compaction", async () => {
+    let requests = 0;
+    const result = await catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: (_streamId, cursor, limit) => [combatTurn].filter((entry) => entry.cursor > cursor).slice(0, limit) },
+      streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret,
+      fetchImpl: async () => {
+        requests++;
+        return Response.json({ code: "cursor_compacted", streamId: combatTurn.streamId, checkpoint: 1, accepted: 0, duplicates: 0,
+          terminal: false, lastEnvelopeHash: combatTurn.envelopeHash, combatStateHash: combatTurn.afterStateHash,
+          turnStateHash: combatTurn.turn.afterStateHash }, { status: 409 });
+      },
+    });
+    expect(requests).toBe(1);
+    expect(result).toMatchObject({ checkpoint: 1, accepted: 0, duplicates: 0, caughtUp: true, backpressured: false });
+  });
+
+  it("rejects an unprovable combat resume cursor before making a request", async () => {
+    const fetchImpl = async () => { throw new Error("unexpected request"); };
+    await expect(catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: () => [] }, streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret, cursor: 1, fetchImpl,
+    })).rejects.toThrow("invalid resume cursor");
+  });
+
+  it("bounds blackholed combat shadow requests and passes an abort signal", async () => {
+    let aborted = false;
+    await expect(catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: (_streamId, cursor, limit) => [combatTurn].filter((entry) => entry.cursor > cursor).slice(0, limit) },
+      streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret, maxDurationMs: 10,
+      fetchImpl: async (_url, init) => new Promise<Response>((_resolve) => {
+        init?.signal?.addEventListener("abort", () => { aborted = true; });
+      }),
+    })).rejects.toMatchObject({ code: "shadow_timeout", status: 504, checkpoint: 0 });
+    expect(aborted).toBe(true);
+  });
+
+  it("rejects invalid combat timeout budgets before sending", async () => {
+    await expect(catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: () => [] }, streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret, maxDurationMs: 0,
+    })).rejects.toThrow("invalid duration");
+  });
 });
 
 describe("catchUpMovementTurnJournal", () => {

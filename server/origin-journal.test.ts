@@ -95,6 +95,21 @@ describe("OriginGameplayJournal", () => {
       .toThrow("combat_turn_operation_conflict");
   });
 
+  it("fails closed when a combat segment exists beyond a missing segment", () => {
+    const { directory, value } = journal();
+    const input = combatTurnInput();
+    expect(value.appendCombatTurn(input).status).toBe("appended");
+    const combatDirectory = path.join(directory, "combat-turn-v1");
+    // A later segment must never be silently stranded behind a hole. The old
+    // incremental scanner stopped at the short segment zero and admitted it.
+    fs.writeFileSync(path.join(combatDirectory, `${input.streamId}.00000002.jsonl`), "", { mode: 0o600 });
+    fs.writeFileSync(path.join(combatDirectory, `${input.streamId}.00000002.jsonl.commits`), "", { mode: 0o600 });
+    const restarted = new OriginGameplayJournal(directory);
+    expect(() => restarted.readCombatTurnsAfter(input.streamId, 0, 64)).toThrow("combat_turn_missing_segment");
+    expect(() => restarted.appendCombatTurn({ ...input, operationId: "00000000-0000-4000-8000-000000000010" }))
+      .toThrow("combat_turn_missing_segment");
+  });
+
   it("creates a bounded floor-fenced movement stream identity", () => {
     const stream = movementJournalStreamId("player-1", movementRunId, movementAuthority);
     expect(stream).toMatch(/^movement_[0-9a-f]{48}$/u);
@@ -853,6 +868,47 @@ describe("OriginGameplayJournal", () => {
     expect(new OriginGameplayJournal(commitDirectory).readMovementTurnsAfter(commitInput.streamId, 0, 64))
       .toHaveLength(1);
     expect(commitJournal.appendMovementTurn(commitInput).status).toBe("duplicate");
+  });
+
+  it("recovers combat envelopes across data, commit, and cold-crash boundaries", () => {
+    const crashWriter = `
+      import fs from "node:fs";
+      import { OriginGameplayJournal } from "./server/origin-journal.ts";
+      const value = new OriginGameplayJournal(process.env.JOURNAL_DIR, {
+        writeSync: (descriptor, buffer, offset, length) => {
+          if (process.env.CRASH_POINT === "before_commit_write" && buffer.byteLength === 1) process.exit(85);
+          return fs.writeSync(descriptor, buffer, offset, length);
+        },
+        fsyncSync: (descriptor) => {
+          fs.fsyncSync(descriptor);
+          if (process.env.CRASH_POINT === "after_commit_fsync" && fs.fstatSync(descriptor).isFile() &&
+              fs.fstatSync(descriptor).size === 1) process.exit(86);
+        },
+      });
+      value.appendCombatTurn(JSON.parse(process.env.COMBAT_TURN_INPUT));
+    `;
+    const runCrash = (directory: string, crashPoint: string, input: ReturnType<typeof combatTurnInput>) =>
+      spawnSync(process.execPath, ["--import", "tsx", "-e", crashWriter], {
+        cwd: process.cwd(),
+        env: { ...process.env, CRASH_POINT: crashPoint, JOURNAL_DIR: directory, COMBAT_TURN_INPUT: JSON.stringify(input) },
+        encoding: "utf8",
+      });
+
+    const preCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-combat-turn-precommit-crash-"));
+    directories.push(preCommitDirectory);
+    const preCommitInput = combatTurnInput("00000000-0000-4000-8000-000000000008");
+    expect(runCrash(preCommitDirectory, "before_commit_write", preCommitInput).status).toBe(85);
+    const preCommitRestart = new OriginGameplayJournal(preCommitDirectory);
+    expect(preCommitRestart.readCombatTurnsAfter(preCommitInput.streamId, 0, 64)).toEqual([]);
+    expect(preCommitRestart.appendCombatTurn(preCommitInput).status).toBe("appended");
+
+    const postCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-combat-turn-postcommit-crash-"));
+    directories.push(postCommitDirectory);
+    const postCommitInput = combatTurnInput("00000000-0000-4000-8000-000000000009");
+    expect(runCrash(postCommitDirectory, "after_commit_fsync", postCommitInput).status).toBe(86);
+    const postCommitRestart = new OriginGameplayJournal(postCommitDirectory);
+    expect(postCommitRestart.readCombatTurnsAfter(postCommitInput.streamId, 0, 64)).toHaveLength(1);
+    expect(postCommitRestart.appendCombatTurn(postCommitInput).status).toBe("duplicate");
   });
 
   it("recovers atomically when the writer process crashes around the movement-turn commit barrier", () => {

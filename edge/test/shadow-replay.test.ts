@@ -219,6 +219,40 @@ describe("ShadowReplay catch-up", () => {
     await expect(response.json()).resolves.toEqual({ code: "combat_authority_mismatch", checkpoint: 0 });
   });
 
+  it("retains a bounded combat receipt window and returns the durable head after eviction", async () => {
+    const streamId = `combat_${"4".repeat(48)}`;
+    const envelopes = combatTurnTrace(streamId, 300);
+    for (let offset = 0; offset < envelopes.length; offset += 64) {
+      const response = await ingestCombatTurns(envelopes.slice(offset, offset + 64));
+      expect(response.status, `offset ${offset}: ${await response.clone().text()}`).toBe(200);
+    }
+    await expect(runInDurableObject(stubFor(streamId), (_instance, state) =>
+      state.storage.sql.exec<{ count: number; minimum: number; maximum: number }>(
+        `SELECT COUNT(*) AS count, MIN(cursor) AS minimum, MAX(cursor) AS maximum
+         FROM combat_turn_receipts WHERE stream_id = ?`, streamId,
+      ).one(),
+    )).resolves.toEqual({ count: 256, minimum: 45, maximum: 300 });
+    const compacted = await ingestCombatTurns([envelopes[0]!]);
+    expect(compacted.status).toBe(409);
+    await expect(compacted.json()).resolves.toMatchObject({
+      code: "cursor_compacted", streamId, checkpoint: 300, cursor: 1,
+      accepted: 0, duplicates: 0, terminal: false,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      combatStateHash: envelopes.at(-1)!.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn.afterStateHash,
+    });
+    await evictDurableObject(stubFor(streamId));
+    const afterEviction = await ingestCombatTurns([envelopes[0]!]);
+    expect(afterEviction.status).toBe(409);
+    await expect(afterEviction.json()).resolves.toMatchObject({
+      code: "cursor_compacted", streamId, checkpoint: 300,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      combatStateHash: envelopes.at(-1)!.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn.afterStateHash,
+    });
+    await expect((await ingestCombatTurns([envelopes.at(-1)!])).json()).resolves.toMatchObject({ checkpoint: 300, accepted: 0, duplicates: 1 });
+  });
+
   it("atomically replays movement-turn envelopes and deduplicates an exact retry across eviction", async () => {
     const streamId = `turn_${"1".repeat(48)}`;
     const envelopes = movementTurnTrace(streamId, 2);

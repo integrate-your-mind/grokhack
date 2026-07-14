@@ -509,7 +509,7 @@ export class ShadowReplay extends DurableObject<Env> {
         if (reusedOperation) return { ok: false, code: "operation_reused", checkpoint: committedCheckpoint, cursor: envelope.cursor };
         const expectedCursor = checkpoint.checkpoint + 1;
         if (envelope.cursor <= checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW) {
-          return { ok: false, code: "cursor_compacted", checkpoint: committedCheckpoint, expectedCursor, cursor: envelope.cursor };
+          return this.combatTurnCompactedCheckpoint(streamId, envelope.cursor);
         }
         if (envelope.cursor !== expectedCursor) {
           return { ok: false, code: envelope.cursor < expectedCursor ? "cursor_out_of_order" : "cursor_gap", checkpoint: committedCheckpoint, expectedCursor, cursor: envelope.cursor };
@@ -594,6 +594,28 @@ export class ShadowReplay extends DurableObject<Env> {
       terminal: checkpoint.terminal === 1,
       lastEnvelopeHash: checkpoint.last_envelope_hash,
       movementStateHash: checkpoint.movement_state_hash,
+      turnStateHash: checkpoint.turn_state_hash,
+    };
+  }
+
+  // As with movement envelopes, a compacted receipt cannot establish whether
+  // an arbitrary old combat retry was the committed payload. Expose only the
+  // authenticated durable head so the origin can reconstruct and compare its
+  // own prefix before advancing its local send cursor.
+  private combatTurnCompactedCheckpoint(streamId: string, cursor: number): CombatTurnIngestFailure {
+    const checkpoint = this.combatTurnCheckpoint(streamId);
+    return {
+      ok: false,
+      code: "cursor_compacted",
+      streamId,
+      checkpoint: checkpoint.checkpoint,
+      expectedCursor: checkpoint.checkpoint + 1,
+      cursor,
+      accepted: 0,
+      duplicates: 0,
+      terminal: checkpoint.terminal === 1,
+      lastEnvelopeHash: checkpoint.last_envelope_hash,
+      combatStateHash: checkpoint.combat_state_hash,
       turnStateHash: checkpoint.turn_state_hash,
     };
   }
