@@ -22,6 +22,7 @@ import {
   validateShadowJournalEntry,
   validateShadowRoute,
 } from "../../src/shadow-journal";
+import { validateCombatTurnEnvelopeV1 } from "../../src/combat-turn-envelope";
 import {
   EDGE_PROTOCOL_VERSION,
   MAX_ROUTE_TICKET_BYTES,
@@ -167,15 +168,20 @@ export async function routeShadowCatchup(request: Request, env: Env, config: Edg
   let candidate: unknown;
   try { candidate = JSON.parse(text); } catch { return json({ code: "malformed_json" }, 400); }
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return json({ code: "invalid_batch" }, 400);
-  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown; envelopes?: unknown };
+  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown; envelopes?: unknown; combatEnvelopes?: unknown };
   const hasEntries = Array.isArray(batch.entries);
   const hasEnvelopes = Array.isArray(batch.envelopes);
-  if (batch.v !== 1 || hasEntries === hasEnvelopes ||
+  const hasCombatEnvelopes = Array.isArray(batch.combatEnvelopes);
+  if (batch.v !== 1 || Number(hasEntries) + Number(hasEnvelopes) + Number(hasCombatEnvelopes) !== 1 ||
       (hasEntries && batch.envelopes !== undefined) ||
-      (hasEnvelopes && batch.entries !== undefined)) {
+      (hasEntries && batch.combatEnvelopes !== undefined) ||
+      (hasEnvelopes && (batch.entries !== undefined || batch.combatEnvelopes !== undefined)) ||
+      (hasCombatEnvelopes && (batch.entries !== undefined || batch.envelopes !== undefined))) {
     return json({ code: "invalid_batch" }, 400);
   }
-  const rawRecords = hasEnvelopes ? batch.envelopes as unknown[] : batch.entries as unknown[];
+  const rawRecords = hasCombatEnvelopes
+    ? batch.combatEnvelopes as unknown[]
+    : hasEnvelopes ? batch.envelopes as unknown[] : batch.entries as unknown[];
   if (rawRecords.length < 1) return json({ code: "invalid_batch" }, 400);
   if (rawRecords.length > MAX_SHADOW_BATCH_ENTRIES) {
     return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429, { "Retry-After": "1" });
@@ -184,9 +190,9 @@ export async function routeShadowCatchup(request: Request, env: Env, config: Edg
   let records;
   try {
     route = validateShadowRoute(batch.route);
-    records = hasEnvelopes
-      ? rawRecords.map(validateMovementTurnEnvelope)
-      : rawRecords.map(validateShadowJournalEntry);
+    records = hasCombatEnvelopes
+      ? rawRecords.map(validateCombatTurnEnvelopeV1)
+      : hasEnvelopes ? rawRecords.map(validateMovementTurnEnvelope) : rawRecords.map(validateShadowJournalEntry);
   } catch (error) {
     return json({ code: error instanceof Error ? error.message : "invalid_batch", checkpoint: 0 }, 400);
   }
@@ -199,7 +205,9 @@ export async function routeShadowCatchup(request: Request, env: Env, config: Edg
     return await replay.fetch("https://shadow.internal/catch-up", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(hasEnvelopes ? { route, envelopes: records } : { route, entries: records }),
+      body: JSON.stringify(hasCombatEnvelopes
+        ? { route, combatEnvelopes: records }
+        : hasEnvelopes ? { route, envelopes: records } : { route, entries: records }),
     });
   } catch (error) {
     const failure = durableObjectFailure(error);

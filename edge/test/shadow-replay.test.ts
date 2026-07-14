@@ -16,6 +16,7 @@ import {
   type ShadowJournalEntry,
   type ShadowRoute,
 } from "../../src/shadow-journal";
+import { createCombatTurnEnvelopeV1, type CombatTurnEnvelopeV1 } from "../../src/combat-turn-envelope";
 import type { Env } from "../src/env";
 import { readEdgeConfig } from "../src/config";
 import { routeShadowCatchup } from "../src/index";
@@ -115,6 +116,32 @@ function movementTurnTrace(streamId: string, count: number): MovementTurnEnvelop
   return envelopes;
 }
 
+function combatTurnTrace(streamId: string, count: number): CombatTurnEnvelopeV1[] {
+  const envelopes: CombatTurnEnvelopeV1[] = [];
+  let gameplay = initial({ hp: 1_000 });
+  let previousEnvelopeHash: string | null = null;
+  let previousTurnEntryHash: string | null = null;
+  for (let cursor = 1; cursor <= count; cursor++) {
+    const envelope = createCombatTurnEnvelopeV1({
+      streamId,
+      cursor,
+      operationId: `00000000-0000-4000-8000-${cursor.toString(16).padStart(12, "0")}`,
+      attacker: { id: "player", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+      defender: { id: `rat-${cursor}`, name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+      options: { weaponName: "short sword", hitPenalty: 0, critChance: 0 },
+      transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+      turn: { command: { type: "advance_turn", action: "other" }, beforeState: gameplay },
+      previousEnvelopeHash,
+      previousTurnEntryHash,
+    });
+    envelopes.push(envelope);
+    gameplay = reduceGameplay(gameplay, envelope.turn.command).state;
+    previousEnvelopeHash = envelope.envelopeHash;
+    previousTurnEntryHash = envelope.turn.entryHash;
+  }
+  return envelopes;
+}
+
 async function ingest(entries: readonly ShadowJournalEntry[], options: { secret?: string; batchRoute?: ShadowRoute; extra?: Record<string, unknown> } = {}): Promise<Response> {
   return SELF.fetch("https://edge.test/internal/shadow/catch-up", {
     method: "POST",
@@ -134,6 +161,17 @@ async function ingestMovementTurns(
   });
 }
 
+async function ingestCombatTurns(
+  combatEnvelopes: readonly CombatTurnEnvelopeV1[],
+  options: { secret?: string; batchRoute?: ShadowRoute; extra?: Record<string, unknown> } = {},
+): Promise<Response> {
+  return SELF.fetch("https://edge.test/internal/shadow/catch-up", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${options.secret ?? SECRET}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ v: 1, route: options.batchRoute ?? route, combatEnvelopes, ...options.extra }),
+  });
+}
+
 function stubFor(streamId: string) {
   const runtimeEnv = env as Env;
   const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${streamId}`;
@@ -141,6 +179,23 @@ function stubFor(streamId: string) {
 }
 
 describe("ShadowReplay catch-up", () => {
+  it("replays combat turns without making monster death terminal and deduplicates after eviction", async () => {
+    const streamId = `combat_${"2".repeat(48)}`;
+    const envelopes = combatTurnTrace(streamId, 2);
+    const first = await ingestCombatTurns([envelopes[0]!]);
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      streamId, checkpoint: 1, accepted: 1, duplicates: 0, terminal: false,
+      lastEnvelopeHash: envelopes[0]!.envelopeHash,
+      combatStateHash: envelopes[0]!.afterStateHash,
+      turnStateHash: envelopes[0]!.turn.afterStateHash,
+    });
+    await evictDurableObject(stubFor(streamId));
+    const retried = await ingestCombatTurns(envelopes);
+    expect(retried.status).toBe(200);
+    await expect(retried.json()).resolves.toMatchObject({ checkpoint: 2, accepted: 1, duplicates: 1, terminal: false });
+  });
+
   it("atomically replays movement-turn envelopes and deduplicates an exact retry across eviction", async () => {
     const streamId = `turn_${"1".repeat(48)}`;
     const envelopes = movementTurnTrace(streamId, 2);
@@ -769,7 +824,7 @@ describe("ShadowReplay catch-up", () => {
       state.storage.sql.exec<{ version: number }>(
         "SELECT version FROM _shadow_schema_migrations ORDER BY version",
       ).toArray().map((row) => row.version),
-    )).resolves.toEqual([1, 2, 3, 4, 5, 6]);
+    )).resolves.toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("fails closed instead of mutating a newer unknown replay schema", async () => {
@@ -796,7 +851,7 @@ describe("ShadowReplay catch-up", () => {
       versions: state.storage.sql.exec<{ version: number }>(
         "SELECT version FROM _shadow_schema_migrations ORDER BY version",
       ).toArray().map((row) => row.version),
-    }))).resolves.toEqual({ entryCount: 1, versions: [1, 2, 3, 4, 5, 6, 999] });
+    }))).resolves.toEqual({ entryCount: 1, versions: [1, 2, 3, 4, 5, 6, 7, 999] });
   });
 
   it("maps a retryable replay-object failure without leaking an uncaught exception", async () => {

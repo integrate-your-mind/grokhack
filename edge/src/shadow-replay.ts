@@ -2,6 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 
 import { gameplayStateHash, reduceGameplay } from "../../src/gameplay-reducer";
 import { movementContinuityHash, movementEventHash, movementStateHash, reduceMovement } from "../../src/movement-reducer";
+import { reducePlayerMeleeV1 } from "../../src/combat-reducer";
+import { validateCombatTurnEnvelopeV1, type CombatTurnEnvelopeV1 } from "../../src/combat-turn-envelope";
 import {
   MAX_SHADOW_BATCH_BYTES,
   MAX_SHADOW_BATCH_ENTRIES,
@@ -47,6 +49,21 @@ interface MovementTurnReceiptRow extends Record<string, SqlStorageValue> {
   envelope_hash: string;
 }
 
+interface CombatTurnCheckpointRow extends Record<string, SqlStorageValue> {
+  checkpoint: number;
+  last_envelope_hash: string | null;
+  last_turn_entry_hash: string | null;
+  combat_state_hash: string | null;
+  turn_state_hash: string | null;
+  terminal: number;
+}
+
+interface CombatTurnReceiptRow extends Record<string, SqlStorageValue> {
+  cursor: number;
+  operation_id: string;
+  envelope_hash: string;
+}
+
 interface TableColumnRow extends Record<string, SqlStorageValue> { name: string }
 interface VersionRow extends Record<string, SqlStorageValue> { version: number | null }
 interface CountRow extends Record<string, SqlStorageValue> { count: number }
@@ -59,7 +76,7 @@ interface IdentityRow extends Record<string, SqlStorageValue> {
   stream_id: string;
 }
 
-const SHADOW_SCHEMA_VERSION = 6;
+const SHADOW_SCHEMA_VERSION = 7;
 const MAX_DIVERGENCES_PER_STREAM = 64;
 const SHADOW_RECEIPT_WINDOW = 256;
 
@@ -104,6 +121,28 @@ type MovementTurnIngestFailure = IngestFailure & {
   terminal?: boolean;
   lastEnvelopeHash?: string | null;
   movementStateHash?: string | null;
+  turnStateHash?: string | null;
+};
+
+type CombatTurnIngestSuccess = {
+  ok: true;
+  streamId: string;
+  checkpoint: number;
+  accepted: number;
+  duplicates: number;
+  terminal: boolean;
+  lastEnvelopeHash: string | null;
+  combatStateHash: string | null;
+  turnStateHash: string | null;
+};
+
+type CombatTurnIngestFailure = IngestFailure & {
+  streamId?: string;
+  accepted?: number;
+  duplicates?: number;
+  terminal?: boolean;
+  lastEnvelopeHash?: string | null;
+  combatStateHash?: string | null;
   turnStateHash?: string | null;
 };
 
@@ -205,6 +244,25 @@ export class ShadowReplay extends DurableObject<Env> {
         PRIMARY KEY (stream_id, cursor),
         UNIQUE (stream_id, operation_id)
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS combat_turn_checkpoint (
+        stream_id TEXT PRIMARY KEY,
+        checkpoint INTEGER NOT NULL CHECK (checkpoint >= 0),
+        last_envelope_hash TEXT,
+        last_turn_entry_hash TEXT,
+        combat_state_hash TEXT,
+        turn_state_hash TEXT,
+        terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+        updated_at INTEGER NOT NULL
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS combat_turn_receipts (
+        stream_id TEXT NOT NULL,
+        cursor INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        envelope_hash TEXT NOT NULL,
+        ingested_at INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, cursor),
+        UNIQUE (stream_id, operation_id)
+      ) WITHOUT ROWID;
     `);
     const columns = new Set(this.ctx.storage.sql.exec<TableColumnRow>("PRAGMA table_info(shadow_checkpoint)").toArray().map((row) => row.name));
     const expansions = [
@@ -243,7 +301,7 @@ export class ShadowReplay extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE shadow_checkpoint
       SET entry_version = 1, state_domain = 'vitals'
       WHERE checkpoint > 0 AND entry_version IS NULL AND state_domain IS NULL`);
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch()), (4, unixepoch()), (5, unixepoch()), (6, unixepoch())");
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _shadow_schema_migrations (version, applied_at) VALUES (1, unixepoch()), (2, unixepoch()), (3, unixepoch()), (4, unixepoch()), (5, unixepoch()), (6, unixepoch()), (7, unixepoch())");
     return true;
   }
 
@@ -267,8 +325,32 @@ export class ShadowReplay extends DurableObject<Env> {
     let route: ShadowRoute;
     try { route = validateShadowRoute((candidate as { route?: unknown }).route); }
     catch (error) { return json({ code: error instanceof Error ? error.message : "invalid_route" }, 400); }
+    const rawCombatEnvelopes = (candidate as { combatEnvelopes?: unknown }).combatEnvelopes;
     const rawEnvelopes = (candidate as { envelopes?: unknown }).envelopes;
     const rawEntries = (candidate as { entries?: unknown }).entries;
+    if (Array.isArray(rawCombatEnvelopes)) {
+      if (rawEntries !== undefined || rawEnvelopes !== undefined || rawCombatEnvelopes.length < 1) {
+        return json({ code: "invalid_batch" }, 400);
+      }
+      if (rawCombatEnvelopes.length > MAX_SHADOW_BATCH_ENTRIES) {
+        return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429);
+      }
+      let envelopes: CombatTurnEnvelopeV1[];
+      try { envelopes = rawCombatEnvelopes.map(validateCombatTurnEnvelopeV1); } catch (error) {
+        return json({ code: error instanceof Error ? error.message : "invalid_combat_turn_envelope", checkpoint: 0 }, 400);
+      }
+      const streamId = envelopes[0]!.streamId;
+      if (envelopes.some((envelope) => envelope.streamId !== streamId)) {
+        return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
+      }
+      if (envelopes.some((envelope, index) => index > 0 && envelope.cursor <= envelopes[index - 1]!.cursor)) {
+        return json({ code: "batch_out_of_order", checkpoint: this.combatTurnCheckpoint(streamId).checkpoint }, 409);
+      }
+      const result = this.ingestCombatTurns(envelopes, route);
+      if (result.ok) return json(result);
+      const status = result.code.endsWith("_divergence") || result.code === "terminal_mismatch" ? 422 : 409;
+      return json(result, status);
+    }
     if (Array.isArray(rawEnvelopes)) {
       if (rawEntries !== undefined || rawEnvelopes.length < 1) return json({ code: "invalid_batch" }, 400);
       if (rawEnvelopes.length > MAX_SHADOW_BATCH_ENTRIES) {
@@ -359,6 +441,135 @@ export class ShadowReplay extends DurableObject<Env> {
       movement_continuity_hash: null,
       terminal: 0,
     };
+  }
+
+  private combatTurnCheckpoint(streamId: string): CombatTurnCheckpointRow {
+    return firstRow(this.ctx.storage.sql.exec<CombatTurnCheckpointRow>(
+      `SELECT checkpoint, last_envelope_hash, last_turn_entry_hash, combat_state_hash, turn_state_hash, terminal
+       FROM combat_turn_checkpoint WHERE stream_id = ?`,
+      streamId,
+    )) ?? {
+      checkpoint: 0,
+      last_envelope_hash: null,
+      last_turn_entry_hash: null,
+      combat_state_hash: null,
+      turn_state_hash: null,
+      terminal: 0,
+    };
+  }
+
+  private ingestCombatTurns(
+    envelopes: readonly CombatTurnEnvelopeV1[],
+    route: ShadowRoute,
+  ): CombatTurnIngestSuccess | CombatTurnIngestFailure {
+    return this.ctx.storage.transactionSync(() => {
+      const streamId = envelopes[0]!.streamId;
+      if (!this.bindIdentity(route, streamId)) {
+        return { ok: false, code: "shadow_identity_mismatch", checkpoint: this.combatTurnCheckpoint(streamId).checkpoint };
+      }
+      let checkpoint = this.combatTurnCheckpoint(streamId);
+      const committedCheckpoint = checkpoint.checkpoint;
+      let accepted = 0;
+      let duplicates = 0;
+      const planned: CombatTurnEnvelopeV1[] = [];
+      const plannedByCursor = new Map<number, CombatTurnEnvelopeV1>();
+      const plannedByOperation = new Map<string, CombatTurnEnvelopeV1>();
+      for (const envelope of envelopes) {
+        const pendingAtCursor = plannedByCursor.get(envelope.cursor);
+        if (pendingAtCursor) {
+          if (pendingAtCursor.envelopeHash !== envelope.envelopeHash || pendingAtCursor.operationId !== envelope.operationId) {
+            return { ok: false, code: "idempotency_conflict", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+          }
+          duplicates++;
+          continue;
+        }
+        if (plannedByOperation.has(envelope.operationId)) {
+          return { ok: false, code: "operation_reused", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        const existing = firstRow(this.ctx.storage.sql.exec<CombatTurnReceiptRow>(
+          `SELECT cursor, operation_id, envelope_hash FROM combat_turn_receipts
+           WHERE stream_id = ? AND cursor = ?`, streamId, envelope.cursor,
+        ));
+        if (existing) {
+          if (existing.envelope_hash !== envelope.envelopeHash || existing.operation_id !== envelope.operationId) {
+            return { ok: false, code: "idempotency_conflict", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+          }
+          duplicates++;
+          continue;
+        }
+        const reusedOperation = firstRow(this.ctx.storage.sql.exec<CombatTurnReceiptRow>(
+          `SELECT cursor, operation_id, envelope_hash FROM combat_turn_receipts
+           WHERE stream_id = ? AND operation_id = ?`, streamId, envelope.operationId,
+        ));
+        if (reusedOperation) return { ok: false, code: "operation_reused", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        const expectedCursor = checkpoint.checkpoint + 1;
+        if (envelope.cursor <= checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW) {
+          return { ok: false, code: "cursor_compacted", checkpoint: committedCheckpoint, expectedCursor, cursor: envelope.cursor };
+        }
+        if (envelope.cursor !== expectedCursor) {
+          return { ok: false, code: envelope.cursor < expectedCursor ? "cursor_out_of_order" : "cursor_gap", checkpoint: committedCheckpoint, expectedCursor, cursor: envelope.cursor };
+        }
+        if (checkpoint.terminal === 1) return { ok: false, code: "terminal_state", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        if (envelope.previousEnvelopeHash !== checkpoint.last_envelope_hash) {
+          return { ok: false, code: "envelope_hash_chain_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        if (envelope.turn.previousEntryHash !== checkpoint.last_turn_entry_hash) {
+          return { ok: false, code: "turn_hash_chain_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        const combat = reducePlayerMeleeV1(envelope.attacker, envelope.defender, envelope.options, envelope.transcript);
+        if (combat.killed !== envelope.targetKilled) {
+          return { ok: false, code: "combat_state_divergence", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        const turnTransition = reduceGameplay(envelope.turn.beforeState, envelope.turn.command);
+        const turnStateHash = gameplayStateHash(turnTransition.state);
+        if (turnStateHash !== envelope.turn.afterStateHash) {
+          return { ok: false, code: "turn_state_divergence", checkpoint: committedCheckpoint, cursor: envelope.cursor,
+            expectedHash: envelope.turn.afterStateHash, actualHash: turnStateHash };
+        }
+        if (!turnTransition.state.alive !== envelope.terminal) {
+          return { ok: false, code: "terminal_mismatch", checkpoint: committedCheckpoint, cursor: envelope.cursor };
+        }
+        planned.push(envelope);
+        plannedByCursor.set(envelope.cursor, envelope);
+        plannedByOperation.set(envelope.operationId, envelope);
+        checkpoint = {
+          checkpoint: envelope.cursor,
+          last_envelope_hash: envelope.envelopeHash,
+          last_turn_entry_hash: envelope.turn.entryHash,
+          combat_state_hash: envelope.afterStateHash,
+          turn_state_hash: turnStateHash,
+          terminal: envelope.terminal ? 1 : 0,
+        };
+        accepted++;
+      }
+      for (const envelope of planned) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO combat_turn_receipts (stream_id, cursor, operation_id, envelope_hash, ingested_at)
+           VALUES (?, ?, ?, ?, unixepoch())`,
+          streamId, envelope.cursor, envelope.operationId, envelope.envelopeHash,
+        );
+      }
+      if (planned.length > 0) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO combat_turn_checkpoint
+            (stream_id, checkpoint, last_envelope_hash, last_turn_entry_hash, combat_state_hash, turn_state_hash, terminal, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+           ON CONFLICT(stream_id) DO UPDATE SET checkpoint = excluded.checkpoint,
+             last_envelope_hash = excluded.last_envelope_hash, last_turn_entry_hash = excluded.last_turn_entry_hash,
+             combat_state_hash = excluded.combat_state_hash, turn_state_hash = excluded.turn_state_hash,
+             terminal = excluded.terminal, updated_at = excluded.updated_at`,
+          streamId, checkpoint.checkpoint, checkpoint.last_envelope_hash, checkpoint.last_turn_entry_hash,
+          checkpoint.combat_state_hash, checkpoint.turn_state_hash, checkpoint.terminal,
+        );
+        this.ctx.storage.sql.exec("DELETE FROM combat_turn_receipts WHERE stream_id = ? AND cursor <= ?", streamId, checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW);
+      }
+      const durableCheckpoint = this.combatTurnCheckpoint(streamId);
+      return {
+        ok: true, streamId, checkpoint: durableCheckpoint.checkpoint, accepted, duplicates,
+        terminal: durableCheckpoint.terminal === 1, lastEnvelopeHash: durableCheckpoint.last_envelope_hash,
+        combatStateHash: durableCheckpoint.combat_state_hash, turnStateHash: durableCheckpoint.turn_state_hash,
+      };
+    });
   }
 
   // A compacted receipt cannot prove an old retry by itself. Return the
