@@ -6,6 +6,23 @@
 - Scope: deterministic player melee reducer, origin combat envelope journaling,
   durable-object replay, bounded receipt recovery, and failure fencing.
 
+## Runtime addendum — `8e80e748d4a8aeef6c676477ef725830e17c7321`
+
+The isolated proof runner now sends the **actual combat stream** produced by a
+real `WorldServer` into the persistent local Worker harness. On a clean
+worktree, the following passed:
+
+```sh
+GROKHACK_REQUIRE_CLEAN_PROOF=1 npx tsx scripts/prove-shadow-catchup.ts
+```
+
+The runner asserted that the origin-generated `combat_*` envelope was accepted
+at checkpoint 1 with matching envelope, combat-state, and vitals-state hashes.
+It then deliberately discarded the successful HTTP response and retried the
+same source stream; the Worker reported zero new accepts and exactly one
+duplicate. This proves the committed-envelope/response-loss boundary without
+granting the Worker authority over monster AI or origin mutation.
+
 ## Exact local proof
 
 | Command | Result |
@@ -40,7 +57,8 @@ node scripts/run-tests-isolated.mjs server/origin-journal.test.ts -t 'segments m
 - A 300-envelope combat prefix reconstructs against an evicted Durable Object
   only after the remote compacted checkpoint matches the local hash/state head.
 - The isolated Worker harness exercises real WorldServer bounds, doors, combat
-  intent, traps, transfer, terminal state, response loss, and 300-entry
+  intent, durable combat-envelope response-loss retry, traps, transfer,
+  terminal state, response loss, and 300-entry
   compacted-checkpoint recovery against persistent Worker storage.
 
 ## Deliberate non-proofs / release blockers
