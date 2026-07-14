@@ -23,6 +23,18 @@ same source stream; the Worker reported zero new accepts and exactly one
 duplicate. This proves the committed-envelope/response-loss boundary without
 granting the Worker authority over monster AI or origin mutation.
 
+## Cold-restart admission fence — `4796147fa4b1a0d501fe2ec48afff2249018eb4f`
+
+An unresolved durable movement preparation now initializes the WorldServer's
+input-admission latch on cold start. The regression first demonstrated that a
+fresh process could otherwise move a player while the old marker remained
+poisoned. It now proves that the retry preserves position and turns and returns
+`Movement persistence is still committing — retry shortly.` The same head
+passed the isolated origin suites (110 tests), property suite (88 tests), root
+production build, and `npm --prefix edge run verify` (107 tests, 82.13%
+statement coverage, seeded shuffle/property, and three Worker dry-runs), plus
+the clean isolated Worker runtime proof above.
+
 ## Exact local proof
 
 | Command | Result |
