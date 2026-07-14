@@ -977,6 +977,76 @@ try {
     Worker: combatKillReplay,
   };
 
+  const combatMissScenario = await createWorldScenario("combat-miss");
+  const combatMissStep = findOrdinaryStep(combatMissScenario.floor);
+  if (!combatMissStep) throw new Error("combat miss scenario has no ordinary step");
+  const combatMissTarget = { x: combatMissStep.x + combatMissStep.dx, y: combatMissStep.y + combatMissStep.dy };
+  const missMonster = createMonster("rat", combatMissTarget.x, combatMissTarget.y, combatMissScenario.floor.depth);
+  missMonster.hp = missMonster.maxHp = 999;
+  missMonster.attack = 1;
+  missMonster.traits = [];
+  missMonster.ai = "wander";
+  combatMissScenario.floor.monsters = [missMonster];
+  combatMissScenario.player.state.entity.x = combatMissStep.x;
+  combatMissScenario.player.state.entity.y = combatMissStep.y;
+  const combatMissBefore = originSnapshot(combatMissScenario.player);
+  const savedMissRandom = Math.random;
+  try {
+    Math.random = () => 0.99;
+    combatMissScenario.world.handleInput(combatMissScenario.player.id, combatMissStep.key);
+  } finally {
+    Math.random = savedMissRandom;
+  }
+  const combatMissAfter = originSnapshot(combatMissScenario.player);
+  const combatMissStreamId = combatTurnJournalStreamId(
+    combatMissScenario.player.id,
+    movementJournalRunId(combatMissScenario.player.resumeToken!),
+    combatMissScenario.floor.movementAuthority!,
+  );
+  const [combatMissEnvelope, ...unexpectedCombatMissEnvelopes] = combatMissScenario.journal.readCombatTurnsAfter(
+    combatMissStreamId,
+    0,
+    64,
+  );
+  if (!combatMissEnvelope || unexpectedCombatMissEnvelopes.length > 0 ||
+      combatMissEnvelope.targetKilled || combatMissEnvelope.transcript.missFlavor === undefined ||
+      combatMissEnvelope.transcript.crit !== undefined || missMonster.hp !== 999 ||
+      combatMissAfter.turns !== combatMissBefore.turns + 1 ||
+      combatMissAfter.x !== combatMissBefore.x || combatMissAfter.y !== combatMissBefore.y) {
+    throw new Error(`combat miss origin result mismatch: ${JSON.stringify({
+      combatMissBefore,
+      combatMissAfter,
+      missMonster,
+      combatMissEnvelope,
+      unexpectedCount: unexpectedCombatMissEnvelopes.length,
+    })}`);
+  }
+  const combatMissReplay = await catchUpCombatTurnJournal({
+    journal: combatMissScenario.journal,
+    streamId: combatMissStreamId,
+    route: combatMissEnvelope.route,
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    fetchImpl: harnessFetch,
+  });
+  if (!combatMissReplay.caughtUp || combatMissReplay.backpressured ||
+      combatMissReplay.checkpoint !== 1 || combatMissReplay.accepted !== 1 ||
+      combatMissReplay.duplicates !== 0 || combatMissReplay.terminal ||
+      combatMissReplay.lastEnvelopeHash !== combatMissEnvelope.envelopeHash ||
+      combatMissReplay.combatStateHash !== combatMissEnvelope.afterStateHash ||
+      combatMissReplay.turnStateHash !== combatMissEnvelope.turn.afterStateHash) {
+    throw new Error(`combat miss Worker parity failed: ${JSON.stringify(combatMissReplay)}`);
+  }
+  const combatMissProof = {
+    streamId: combatMissStreamId,
+    envelopeHash: combatMissEnvelope.envelopeHash,
+    targetKilled: combatMissEnvelope.targetKilled,
+    monsterHpAfter: missMonster.hp,
+    originBefore: combatMissBefore,
+    originAfter: combatMissAfter,
+    Worker: combatMissReplay,
+  };
+
   const trapScenario = await createWorldScenario("trap");
   const trapStep = findOrdinaryStep(trapScenario.floor);
   if (!trapStep) throw new Error("trap scenario has no ordinary step");
@@ -1277,6 +1347,7 @@ try {
       door: doorProof,
       combat: combatProof,
       combatKill: combatKillProof,
+      combatMiss: combatMissProof,
       trap: trapProof,
       transfer: transferProof,
       terminal: terminalMovementProof,
