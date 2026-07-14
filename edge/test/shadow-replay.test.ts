@@ -198,6 +198,27 @@ describe("ShadowReplay catch-up", () => {
     await expect(retried.json()).resolves.toMatchObject({ checkpoint: 2, accepted: 1, duplicates: 1, terminal: false });
   });
 
+  it("rejects a combat envelope replayed through a different floor authority", async () => {
+    const streamId = `combat_${"3".repeat(48)}`;
+    const [envelope] = combatTurnTrace(streamId, 1);
+    const mismatched = createCombatTurnEnvelopeV1({
+      streamId,
+      route: { ...route, floorEpoch: route.floorEpoch + 1 },
+      cursor: envelope!.cursor,
+      operationId: envelope!.operationId,
+      attacker: envelope!.attacker,
+      defender: envelope!.defender,
+      options: envelope!.options,
+      transcript: envelope!.transcript,
+      turn: { command: envelope!.turn.command, beforeState: envelope!.turn.beforeState },
+      previousEnvelopeHash: envelope!.previousEnvelopeHash,
+      previousTurnEntryHash: envelope!.turn.previousEntryHash,
+    });
+    const response = await ingestCombatTurns([mismatched]);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ code: "combat_authority_mismatch", checkpoint: 0 });
+  });
+
   it("atomically replays movement-turn envelopes and deduplicates an exact retry across eviction", async () => {
     const streamId = `turn_${"1".repeat(48)}`;
     const envelopes = movementTurnTrace(streamId, 2);
