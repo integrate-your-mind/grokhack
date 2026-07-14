@@ -42,4 +42,24 @@ describe("reducePlayerMeleeV1", () => {
       { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
     )).toThrow("invalid_combat_transcript_swift");
   });
+
+  it("preserves deterministic reducer output across seeded combat transcripts", () => {
+    let seed = 0x636f6d62;
+    const random = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+    for (let run = 0; run < 256; run++) {
+      const sourceAttacker = { ...attacker, attack: 1 + Math.floor(random() * 30) };
+      const sourceDefender = { ...defender, hp: 1 + Math.floor(random() * 80), maxHp: 80, defense: Math.floor(random() * 10) };
+      const damage = Math.max(1, sourceAttacker.attack - sourceDefender.defense + 1);
+      const transcript: CombatRollTranscriptV1 = sourceDefender.hp <= damage
+        ? { hit: 0, crit: 0.99, variance: 0.5, severityFlavor: random(), killFlavor: random() }
+        : { hit: 0, crit: 0.99, variance: 0.5, severityFlavor: random() };
+      const before = structuredClone({ sourceAttacker, sourceDefender, transcript });
+      const first = reducePlayerMeleeV1(sourceAttacker, sourceDefender, options, transcript);
+      expect(reducePlayerMeleeV1(sourceAttacker, sourceDefender, options, transcript)).toEqual(first);
+      expect({ sourceAttacker, sourceDefender, transcript }).toEqual(before);
+      expect(first.defender.hp).toBeGreaterThanOrEqual(0);
+      expect(first.defender.hp).toBeLessThanOrEqual(sourceDefender.maxHp);
+      expect(first.killed).toBe(first.defender.hp === 0);
+    }
+  });
 });
