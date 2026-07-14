@@ -88,7 +88,12 @@ function severityVerb(damage: number, maxHp: number, roll: number): string {
 }
 
 function weaponVerb(weaponName: string | null): string {
-  return weaponName && /sword/i.test(weaponName) ? "slash" : "strike";
+  if (!weaponName) return "strike";
+  const name = weaponName.toLowerCase();
+  if (name.includes("dagger") || name.includes("sword")) return "slash";
+  if (name.includes("mace") || name.includes("hammer")) return "crush";
+  if (name.includes("axe")) return "cleave";
+  return "strike";
 }
 
 /**

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   meleeAttack,
   conjugateVerb,
@@ -103,6 +103,30 @@ describe("conjugateVerb", () => {
 });
 
 describe("melee combat", () => {
+  it("routes player attacks through the deterministic reducer without changing lazy RNG draws", () => {
+    const attacker = createPlayer(0, 0);
+    attacker.attack = 8;
+    const defender = createMonster("rat", 1, 0, 1);
+    defender.defense = 1;
+    defender.hp = defender.maxHp = 8;
+    const random = vi.spyOn(Math, "random").mockReturnValueOnce(0).mockReturnValueOnce(0.9)
+      .mockReturnValueOnce(0.5).mockReturnValueOnce(0).mockReturnValueOnce(0);
+    const result = meleeAttack(attacker, defender, { critChance: 0 });
+    expect(result).toMatchObject({ hit: true, damage: 8, killed: true, critical: false });
+    expect(defender.hp).toBe(0);
+    expect(random).toHaveBeenCalledTimes(5);
+    random.mockRestore();
+  });
+
+  it("consumes only hit and flavor rolls for a player miss", () => {
+    const attacker = createPlayer(0, 0);
+    const defender = createMonster("rat", 1, 0, 1);
+    const random = vi.spyOn(Math, "random").mockReturnValueOnce(0.99).mockReturnValueOnce(0);
+    expect(meleeAttack(attacker, defender)).toMatchObject({ hit: false, damage: 0 });
+    expect(random).toHaveBeenCalledTimes(2);
+    random.mockRestore();
+  });
+
   it("monster hit messages conjugate multi-word verbs (no strike hards)", () => {
     const mon = createMonster("orc", 1, 0, 1);
     mon.attack = 80;

@@ -20,6 +20,7 @@ import {
   WAND_TRUE_NAMES,
   weaponVerb,
 } from "./entities";
+import { reducePlayerMeleeV1, type CombatantSnapshotV1, type CombatRollTranscriptV1 } from "./combat-reducer";
 
 export interface CombatResult {
   hit: boolean;
@@ -94,6 +95,46 @@ export interface MeleeOptions {
   critChance?: number;
 }
 
+function combatSnapshot(entity: Entity): CombatantSnapshotV1 {
+  return {
+    id: entity.id,
+    name: entity.name,
+    hp: entity.hp,
+    maxHp: entity.maxHp,
+    attack: entity.attack,
+    defense: entity.defense,
+    isPlayer: entity.isPlayer,
+    traits: entity.traits ?? [],
+    enraged: entity.enraged === true,
+  };
+}
+
+function playerHitChance(attacker: Entity, defender: Entity, options: MeleeOptions): number {
+  let chance = 0.62 + (attacker.attack - defender.defense) * 0.04;
+  if (attacker.traits?.includes("pack")) chance += 0.04;
+  if (attacker.traits?.includes("swift")) chance += 0.06;
+  if (attacker.enraged) chance += 0.08;
+  return Math.min(0.92, Math.max(0.15, chance - (options.hitPenalty ?? 0)));
+}
+
+function legacyPlayerTranscript(attacker: Entity, defender: Entity, options: MeleeOptions): CombatRollTranscriptV1 {
+  const transcript: CombatRollTranscriptV1 = { hit: Math.random() };
+  if (transcript.hit > playerHitChance(attacker, defender, options)) {
+    transcript.missFlavor = Math.random();
+    return transcript;
+  }
+  transcript.crit = Math.random();
+  transcript.variance = Math.random();
+  if (attacker.traits?.includes("swift")) transcript.swiftSpike = Math.random();
+  transcript.severityFlavor = Math.random();
+  const crit = transcript.crit < (options.critChance ?? (attacker.enraged ? 0.16 : 0.1));
+  let damage = Math.max(1, attacker.attack - defender.defense + Math.floor(transcript.variance * 4) - 1);
+  if (attacker.traits?.includes("swift") && transcript.swiftSpike! < 0.2) damage++;
+  if (crit) damage = Math.max(2, Math.floor(damage * 1.85));
+  if (!crit && defender.hp - damage <= 0) transcript.killFlavor = Math.random();
+  return transcript;
+}
+
 /**
  * Core melee resolution — shared by client game and multiplayer world.
  * Hit formula is NetHack-adjacent: attack vs defense moves a 15–92% band.
@@ -103,6 +144,20 @@ export function meleeAttack(
   defender: Entity,
   options: MeleeOptions = {}
 ): CombatResult {
+  // Player attacks now resolve through the pure, transcript-bound reducer. The
+  // adapter samples only rolls consumed by the old branch, then applies HP once.
+  // Monster-initiated combat remains origin-only in this P0 slice.
+  if (attacker.isPlayer && !defender.isPlayer) {
+    const transcript = legacyPlayerTranscript(attacker, defender, options);
+    const transition = reducePlayerMeleeV1(
+      combatSnapshot(attacker),
+      combatSnapshot(defender),
+      { weaponName: options.weaponName ?? null, hitPenalty: options.hitPenalty ?? 0, critChance: options.critChance ?? null },
+      transcript,
+    );
+    defender.hp = transition.defender.hp;
+    return transition;
+  }
   const atkEdge = attacker.attack - defender.defense;
   let hitChance = 0.62 + atkEdge * 0.04;
   // Pack fighters: slightly better accuracy when kind is pack-tagged
