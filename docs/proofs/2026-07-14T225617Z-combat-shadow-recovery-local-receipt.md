@@ -44,6 +44,18 @@ and vitals hashes. This is deliberately distinct from player terminal state;
 the envelope remains non-terminal because killing a monster does not end the
 player's run.
 
+## Full root-suite refresh — `3772f826a3554708c22c5619b5acd6f5ba085da8`
+
+Serial (not concurrency-contended) root verification passed:
+
+```sh
+npm test                 # 59 files, 737 tests
+npm run test:coverage    # 59 files, 737 tests
+```
+
+The coverage run reported 72.26% statements, 66.94% branches, 80.64%
+functions, and 74.70% lines across the root source inventory.
+
 ## Exact local proof
 
 | Command | Result |
