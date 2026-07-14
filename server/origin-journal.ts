@@ -20,6 +20,12 @@ import {
   type ShadowRoute,
 } from "../src/shadow-journal.js";
 import { movementContinuityHash, reduceMovement, type MovementAuthority } from "../src/movement-reducer.js";
+import {
+  createCombatTurnEnvelopeV1,
+  validateCombatTurnEnvelopeV1,
+  type CombatTurnEnvelopeInput,
+  type CombatTurnEnvelopeV1,
+} from "../src/combat-turn-envelope.js";
 
 export type JournalAppendResult =
   | { status: "appended"; entry: ShadowJournalEntry }
@@ -44,6 +50,14 @@ interface MovementTurnHead {
   turnEntryHash: string | null;
   terminal: boolean;
   lastEnvelope?: MovementTurnEnvelope;
+}
+
+interface CombatTurnHead {
+  cursor: number;
+  envelopeHash: string;
+  turnEntryHash: string | null;
+  terminal: boolean;
+  lastEnvelope?: CombatTurnEnvelopeV1;
 }
 
 interface WriterOwner {
@@ -81,6 +95,7 @@ const SEGMENT_ENTRIES = 64;
 const AUTHORITY_REGISTRY_FILE = "_movement-authority-v1.json";
 const MOVEMENT_EVIDENCE_DIRECTORY = "movement-v2";
 const MOVEMENT_TURN_DIRECTORY = "movement-turn-v1";
+const COMBAT_TURN_DIRECTORY = "combat-turn-v1";
 const MOVEMENT_TURN_PREPARATION_FILE = ".movement-turn-preparation-v1.json";
 const MOVEMENT_TURN_PREPARATION_TEMP_FILE = ".movement-turn-preparation-v1.tmp";
 const LEGACY_MOVEMENT_TURN_PREPARATION_TEMP =
@@ -215,6 +230,12 @@ export type MovementTurnAppendResult =
   | { status: "duplicate"; envelope: MovementTurnEnvelope }
   | Extract<JournalAppendResult, { status: "dropped_capacity" }>;
 
+export type OriginCombatTurnInput = Omit<CombatTurnEnvelopeInput, "cursor" | "previousEnvelopeHash" | "previousTurnEntryHash">;
+
+export type CombatTurnAppendResult =
+  | { status: "appended"; envelope: CombatTurnEnvelopeV1 }
+  | { status: "duplicate"; envelope: CombatTurnEnvelopeV1 };
+
 export interface OriginGameplayJournalOptions {
   /** Fault-injection seam used to prove pre/post-rename fsync recovery. */
   fsyncSync?: (descriptor: number) => void;
@@ -236,6 +257,7 @@ export class OriginGameplayJournal {
   private readonly directory: string;
   private heads = new Map<string, StreamHead>();
   private movementTurnHeads = new Map<string, MovementTurnHead>();
+  private combatTurnHeads = new Map<string, CombatTurnHead>();
   private evidenceState?: SharedEvidenceState;
   private readonly fsyncSync: (descriptor: number) => void;
   private readonly writeSync: (descriptor: number, buffer: Uint8Array, offset: number, length: number) => number;
@@ -663,6 +685,74 @@ export class OriginGameplayJournal {
     }
   }
 
+  appendCombatTurn(input: OriginCombatTurnInput): CombatTurnAppendResult {
+    const head = this.combatTurnHead(input.streamId);
+    const last = head.lastEnvelope;
+    if (last?.operationId === input.operationId) {
+      const retry = createCombatTurnEnvelopeV1({
+        ...input,
+        cursor: last.cursor,
+        previousEnvelopeHash: last.previousEnvelopeHash,
+        previousTurnEntryHash: last.turn.previousEntryHash,
+      });
+      if (retry.envelopeHash === last.envelopeHash) return { status: "duplicate", envelope: last };
+      throw new Error("combat_turn_operation_conflict");
+    }
+    const envelope = createCombatTurnEnvelopeV1({
+      ...input,
+      cursor: head.cursor + 1,
+      previousEnvelopeHash: head.cursor === 0 ? null : head.envelopeHash,
+      previousTurnEntryHash: head.turnEntryHash,
+    });
+    return this.appendCombatTurnEnvelope(envelope);
+  }
+
+  appendCombatTurnEnvelope(envelope: CombatTurnEnvelopeV1): CombatTurnAppendResult {
+    const validated = validateCombatTurnEnvelopeV1(envelope);
+    const head = this.combatTurnHead(validated.streamId);
+    if (head.terminal) throw new Error("combat_turn_terminal_stream");
+    if (validated.cursor <= head.cursor) {
+      const existing = this.combatTurnEnvelopeAt(validated.streamId, validated.cursor);
+      if (existing?.envelopeHash === validated.envelopeHash) return { status: "duplicate", envelope: existing };
+      throw new Error("combat_turn_cursor_conflict");
+    }
+    if (validated.cursor !== head.cursor + 1) throw new Error("combat_turn_cursor_gap");
+    if (validated.previousEnvelopeHash !== (head.cursor === 0 ? null : head.envelopeHash)) {
+      throw new Error("combat_turn_hash_chain_mismatch");
+    }
+    if (validated.turn.previousEntryHash !== head.turnEntryHash) {
+      throw new Error("combat_turn_vitals_chain_mismatch");
+    }
+    const payload = Buffer.from(`${JSON.stringify(validated)}\n`, "utf8");
+    if (payload.byteLength > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) throw new Error("combat_turn_envelope_too_large");
+    const evidence = this.ensureEvidenceState();
+    this.beginJournalWrite(evidence);
+    let file: string;
+    try {
+      this.ensureCombatTurnDirectory();
+      file = this.combatTurnFileFor(validated.streamId, this.segmentFor(validated.cursor));
+      try {
+        this.ensureCommitFile(file);
+        this.appendFileDurably(file, payload);
+        this.appendCommitDurably(file);
+      } catch (error) {
+        this.combatTurnHeads.delete(validated.streamId);
+        this.invalidateAndReconcileEvidence(file);
+        throw error;
+      }
+      this.combatTurnHeads.set(validated.streamId, {
+        cursor: validated.cursor,
+        envelopeHash: validated.envelopeHash,
+        turnEntryHash: validated.turn.entryHash,
+        terminal: validated.terminal,
+        lastEnvelope: validated,
+      });
+      return { status: "appended", envelope: validated };
+    } finally {
+      if (evidence.valid) this.endJournalWrite(evidence);
+    }
+  }
+
   append(entry: ShadowJournalEntry): JournalAppendResult {
     const validated = validateShadowJournalEntry(entry);
     const capacity = this.capacityResult(validated.v);
@@ -791,6 +881,26 @@ export class OriginGameplayJournal {
     throw new Error("journal_writer_busy", { cause: lastError });
   }
 
+  readCombatTurnsAfter(streamId: string, cursor: number, limit: number): CombatTurnEnvelopeV1[] {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new RangeError("invalid cursor");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64) throw new RangeError("invalid limit");
+    this.assertCombatTurnStreamId(streamId);
+    const head = this.combatTurnHead(streamId);
+    if (cursor >= head.cursor) return [];
+    const result: CombatTurnEnvelopeV1[] = [];
+    for (let segment = this.segmentFor(cursor + 1); result.length < limit; segment++) {
+      const envelopes = this.readCombatTurnSegment(streamId, segment, false);
+      for (const envelope of envelopes) {
+        if (envelope.cursor > cursor && envelope.cursor <= head.cursor) result.push(envelope);
+        if (result.length === limit) return result;
+      }
+      if (envelopes.length < SEGMENT_ENTRIES) break;
+    }
+    const expected = Math.min(limit, head.cursor - cursor);
+    if (result.length !== expected) throw new Error("combat_turn_missing_segment");
+    return result;
+  }
+
   private readAfterSnapshot(streamId: string, cursor: number, limit: number): ShadowJournalEntry[] {
     const head = this.head(streamId, false);
     if (cursor >= head.cursor) return [];
@@ -903,6 +1013,42 @@ export class OriginGameplayJournal {
     return this.readMovementTurnSegment(streamId, this.segmentFor(cursor)).find((entry) => entry.cursor === cursor);
   }
 
+  private combatTurnEnvelopeAt(streamId: string, cursor: number): CombatTurnEnvelopeV1 | undefined {
+    return this.readCombatTurnSegment(streamId, this.segmentFor(cursor)).find((entry) => entry.cursor === cursor);
+  }
+
+  private combatTurnHead(streamId: string): CombatTurnHead {
+    this.assertCombatTurnStreamId(streamId);
+    const cached = this.combatTurnHeads.get(streamId);
+    if (cached) return cached;
+    this.ensureCombatTurnDirectory();
+    const all: CombatTurnEnvelopeV1[] = [];
+    for (let segment = 0; ; segment++) {
+      const entries = this.readCombatTurnSegment(streamId, segment);
+      if (!entries.length) break;
+      all.push(...entries);
+      if (entries.length < SEGMENT_ENTRIES) break;
+    }
+    let previous: CombatTurnEnvelopeV1 | undefined;
+    for (const envelope of all) {
+      if (envelope.cursor !== (previous?.cursor ?? 0) + 1 ||
+          envelope.previousEnvelopeHash !== (previous?.envelopeHash ?? null) ||
+          envelope.turn.previousEntryHash !== (previous?.turn.entryHash ?? null) || previous?.terminal) {
+        throw new Error("combat_turn_corrupt_sequence");
+      }
+      previous = envelope;
+    }
+    const head: CombatTurnHead = previous ? {
+      cursor: previous.cursor,
+      envelopeHash: previous.envelopeHash,
+      turnEntryHash: previous.turn.entryHash,
+      terminal: previous.terminal,
+      lastEnvelope: previous,
+    } : { cursor: 0, envelopeHash: "", turnEntryHash: null, terminal: false };
+    this.combatTurnHeads.set(streamId, head);
+    return head;
+  }
+
   private head(streamId: string, repair = true): StreamHead {
     this.assertStreamId(streamId);
     const cached = this.heads.get(streamId);
@@ -1001,6 +1147,20 @@ export class OriginGameplayJournal {
     if (!metadata.isDirectory() || metadata.isSymbolicLink() ||
         (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
       throw new Error("movement_turn_directory_insecure");
+    }
+  }
+
+  private ensureCombatTurnDirectory(): void {
+    this.ensureDirectory();
+    const directory = this.combatTurnDirectory();
+    if (!fs.existsSync(directory)) {
+      fs.mkdirSync(directory, { mode: 0o700 });
+      this.syncDirectory(this.directory);
+    }
+    const metadata = fs.lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() ||
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("combat_turn_directory_insecure");
     }
   }
 
@@ -1354,6 +1514,44 @@ export class OriginGameplayJournal {
     const envelopes = this.readCommittedMovementTurnFile(file, repair);
     if (envelopes.length > SEGMENT_ENTRIES) throw new Error("movement_turn_corrupt_sequence");
     return envelopes;
+  }
+
+  private readCombatTurnSegment(streamId: string, segment: number, repair = true): CombatTurnEnvelopeV1[] {
+    const file = this.combatTurnFileFor(streamId, segment);
+    if (!fs.existsSync(file)) {
+      if (fs.existsSync(this.commitFileFor(file)) && this.readCommitCount(this.commitFileFor(file)) > 0) {
+        throw new Error("combat_turn_missing_segment");
+      }
+      return [];
+    }
+    const envelopes = this.readCommittedCombatTurnFile(file, repair);
+    if (envelopes.length > SEGMENT_ENTRIES) throw new Error("combat_turn_corrupt_sequence");
+    return envelopes;
+  }
+
+  private readCommittedCombatTurnFile(file: string, repair: boolean): CombatTurnEnvelopeV1[] {
+    const commitFile = this.commitFileFor(file);
+    if (!fs.existsSync(commitFile)) throw new Error("combat_turn_commit_sidecar_missing");
+    const metadata = fs.statSync(file);
+    if (!metadata.isFile() || metadata.size > SEGMENT_ENTRIES * MAX_MOVEMENT_TURN_ENVELOPE_BYTES ||
+        (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) {
+      throw new Error("combat_turn_insecure_file");
+    }
+    const payload = this.readFileSync(file);
+    if (payload.byteLength > 0 && payload[payload.byteLength - 1] !== 0x0a) {
+      if (!repair) throw new Error("combat_turn_partial_record");
+      const lastNewline = payload.lastIndexOf(0x0a);
+      this.truncateJournalToLineCount(file, lastNewline < 0 ? 0 : payload.subarray(0, lastNewline + 1).toString("utf8").split("\n").filter(Boolean).length);
+    }
+    const current = this.readFileSync(file);
+    const envelopes = current.toString("utf8").split("\n").filter(Boolean).map((line) => {
+      if (Buffer.byteLength(line, "utf8") + 1 > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) throw new Error("combat_turn_envelope_too_large");
+      return validateCombatTurnEnvelopeV1(JSON.parse(line) as unknown);
+    });
+    const committed = this.readCommitCount(commitFile);
+    if (committed > envelopes.length) throw new Error("combat_turn_commit_sidecar_corrupt");
+    if (repair && envelopes.length > committed) this.truncateJournalToLineCount(file, committed);
+    return envelopes.slice(0, committed);
   }
 
   private readMovementTurnFile(file: string, repair = true): MovementTurnEnvelope[] {
@@ -2148,6 +2346,16 @@ export class OriginGameplayJournal {
     return path.join(this.directory, MOVEMENT_TURN_DIRECTORY);
   }
 
+  private combatTurnFileFor(streamId: string, segment: number): string {
+    this.assertCombatTurnStreamId(streamId);
+    if (!Number.isSafeInteger(segment) || segment < 0) throw new Error("invalid_segment");
+    return path.join(this.combatTurnDirectory(), `${streamId}.${String(segment).padStart(8, "0")}.jsonl`);
+  }
+
+  private combatTurnDirectory(): string {
+    return path.join(this.directory, COMBAT_TURN_DIRECTORY);
+  }
+
   private journalDirectories(): string[] {
     return [this.directory, this.movementDirectory()];
   }
@@ -2162,5 +2370,9 @@ export class OriginGameplayJournal {
 
   private assertMovementTurnStreamId(streamId: string): void {
     if (!/^turn_[0-9a-f]{48}$/u.test(streamId)) throw new Error("invalid_movement_turn_stream_id");
+  }
+
+  private assertCombatTurnStreamId(streamId: string): void {
+    if (!/^combat_[0-9a-f]{48}$/u.test(streamId)) throw new Error("invalid_combat_turn_stream_id");
   }
 }

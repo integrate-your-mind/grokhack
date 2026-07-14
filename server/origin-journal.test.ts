@@ -53,6 +53,19 @@ function movementTurnInput(operationId = "00000000-0000-4000-8000-000000000001")
   };
 }
 
+function combatTurnInput(operationId = "00000000-0000-4000-8000-000000000001") {
+  return {
+    streamId: `combat_${"a".repeat(48)}`,
+    route: movementAuthority,
+    operationId,
+    attacker: { id: "player-1", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+    defender: { id: "rat-1", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+    options: { weaponName: "short sword", hitPenalty: 0, critChance: 0 },
+    transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+    turn: { command: { type: "advance_turn", action: "other" } as const, beforeState: initial() },
+  };
+}
+
 function journal(): { directory: string; value: OriginGameplayJournal } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-origin-journal-"));
   directories.push(directory);
@@ -69,6 +82,19 @@ afterEach(() => {
 });
 
 describe("OriginGameplayJournal", () => {
+  it("durably appends and reconstructs an additive combat turn stream", () => {
+    const { directory, value } = journal();
+    const input = combatTurnInput();
+    const first = value.appendCombatTurn(input);
+    expect(first.status).toBe("appended");
+    const retained = value.readCombatTurnsAfter(input.streamId, 0, 64);
+    expect(retained).toEqual([expect.objectContaining({ cursor: 1, operationId: input.operationId, targetKilled: true, terminal: false })]);
+    expect(new OriginGameplayJournal(directory).readCombatTurnsAfter(input.streamId, 0, 64)).toEqual(retained);
+    expect(value.appendCombatTurn(input).status).toBe("duplicate");
+    expect(() => value.appendCombatTurn({ ...input, attacker: { ...input.attacker, attack: 9 } }))
+      .toThrow("combat_turn_operation_conflict");
+  });
+
   it("creates a bounded floor-fenced movement stream identity", () => {
     const stream = movementJournalStreamId("player-1", movementRunId, movementAuthority);
     expect(stream).toMatch(/^movement_[0-9a-f]{48}$/u);
