@@ -1781,6 +1781,10 @@ export class WorldServer {
           });
         } catch (error) {
           this.shadowEvidenceDegraded = true;
+          // The mutation has happened but its combat record did not commit.
+          // Freeze this process too; cold recovery already treats the prepared
+          // movement fence as poison rather than admitting a divergent retry.
+          this.movementTurnPersistencePending = true;
           this.logMovementTurnFailure(player, "origin_combat_turn_outbox", error);
           this.addMessage(player, "Combat journal unavailable — retry shortly.");
           return;
