@@ -233,6 +233,16 @@ describe("catchUpCombatTurnJournal", () => {
     });
     expect(result).toMatchObject({ checkpoint: 1, accepted: 1, caughtUp: true, backpressured: false });
   });
+
+  it("rejects an acknowledgement that skips beyond the envelope batch", async () => {
+    await expect(catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: (_streamId, cursor, limit) => [combatTurn].filter((entry) => entry.cursor > cursor).slice(0, limit) },
+      streamId: combatTurn.streamId, route, endpoint: "https://edge.test", secret,
+      fetchImpl: async () => Response.json({ streamId: combatTurn.streamId, checkpoint: 2, accepted: 1, duplicates: 0,
+        terminal: false, lastEnvelopeHash: combatTurn.envelopeHash, combatStateHash: combatTurn.afterStateHash,
+        turnStateHash: combatTurn.turn.afterStateHash }),
+    })).rejects.toThrow("invalid combat-turn shadow checkpoint advance");
+  });
 });
 
 describe("catchUpMovementTurnJournal", () => {

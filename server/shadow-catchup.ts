@@ -491,7 +491,7 @@ export async function catchUpCombatTurnJournal(options: {
     }
     const result = parseCombatTurnCheckpoint(body);
     const last = combatEnvelopes.at(-1)!;
-    if (result.streamId !== options.streamId || result.checkpoint < last.cursor ||
+    if (result.streamId !== options.streamId || result.checkpoint !== last.cursor ||
         result.accepted + result.duplicates !== combatEnvelopes.length ||
         result.lastEnvelopeHash !== last.envelopeHash || result.combatStateHash !== last.afterStateHash ||
         result.turnStateHash !== last.turn.afterStateHash || result.terminal !== last.terminal) {
