@@ -35,6 +35,15 @@ production build, and `npm --prefix edge run verify` (107 tests, 82.13%
 statement coverage, seeded shuffle/property, and three Worker dry-runs), plus
 the clean isolated Worker runtime proof above.
 
+## Killed-monster runtime replay — `ba733f63566ce9989df83d83f7ce903ba92fd4aa`
+
+The isolated Worker harness now also runs a deterministic real-origin kill:
+the origin produces a `targetKilled: true` combat envelope, applies zero HP to
+the monster, and the Worker accepts that exact envelope with matching combat
+and vitals hashes. This is deliberately distinct from player terminal state;
+the envelope remains non-terminal because killing a monster does not end the
+player's run.
+
 ## Exact local proof
 
 | Command | Result |
