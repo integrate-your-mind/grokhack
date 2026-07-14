@@ -6,6 +6,12 @@ import {
   type CombatRollTranscriptV1,
   type PlayerMeleeOptionsV1,
 } from "./combat-reducer.js";
+import {
+  createShadowJournalEntry,
+  validateShadowJournalEntry,
+  type GameplayJournalInput,
+  type GameplayShadowJournalEntry,
+} from "./shadow-journal.js";
 
 export const COMBAT_TURN_ENVELOPE_VERSION = 1 as const;
 
@@ -19,11 +25,26 @@ export interface CombatTurnEnvelopeV1 {
   defender: CombatantSnapshotV1;
   options: PlayerMeleeOptionsV1;
   transcript: CombatRollTranscriptV1;
+  turn: GameplayShadowJournalEntry;
   beforeStateHash: string;
   afterStateHash: string;
+  targetKilled: boolean;
   terminal: boolean;
   previousEnvelopeHash: string | null;
   envelopeHash: string;
+}
+
+export interface CombatTurnEnvelopeInput {
+  streamId: string;
+  cursor: number;
+  operationId: string;
+  attacker: CombatantSnapshotV1;
+  defender: CombatantSnapshotV1;
+  options: PlayerMeleeOptionsV1;
+  transcript: CombatRollTranscriptV1;
+  turn: Omit<GameplayJournalInput, "streamId" | "cursor" | "previousEntryHash">;
+  previousEnvelopeHash?: string | null;
+  previousTurnEntryHash?: string | null;
 }
 
 function fnv64(value: string): string {
@@ -49,19 +70,31 @@ function transcriptHashMaterial(transcript: CombatRollTranscriptV1): string {
 
 export function combatTurnEnvelopeHash(envelope: Omit<CombatTurnEnvelopeV1, "envelopeHash">): string {
   return fnv64([envelope.v, envelope.kind, envelope.streamId, envelope.cursor, envelope.operationId,
-    envelope.beforeStateHash, envelope.afterStateHash, envelope.terminal ? 1 : 0,
+    envelope.beforeStateHash, envelope.afterStateHash, envelope.targetKilled ? 1 : 0,
+    envelope.terminal ? 1 : 0, envelope.turn.entryHash,
     transcriptHashMaterial(envelope.transcript), envelope.previousEnvelopeHash ?? "genesis"].join("|"));
 }
 
-export function createCombatTurnEnvelopeV1(input: Omit<CombatTurnEnvelopeV1, "v" | "kind" | "beforeStateHash" | "afterStateHash" | "terminal" | "envelopeHash">): CombatTurnEnvelopeV1 {
+export function createCombatTurnEnvelopeV1(input: CombatTurnEnvelopeInput): CombatTurnEnvelopeV1 {
+  const { turn: turnInput, previousTurnEntryHash, previousEnvelopeHash = null, ...envelopeInput } = input;
   const result = reducePlayerMeleeV1(input.attacker, input.defender, input.options, input.transcript);
+  const turn = createShadowJournalEntry({
+    streamId: `${input.streamId}_vitals`,
+    cursor: input.cursor,
+    command: turnInput.command,
+    beforeState: turnInput.beforeState,
+    previousEntryHash: previousTurnEntryHash ?? null,
+  }) as GameplayShadowJournalEntry;
   const beforeStateHash = playerMeleeStateHashV1(input.attacker, input.defender);
   const afterStateHash = fnv64([
     playerMeleeStateHashV1(input.attacker, result.defender),
     playerMeleeTransitionHashV1(result),
+    turn.afterStateHash,
   ].join("|"));
   const unsigned: Omit<CombatTurnEnvelopeV1, "envelopeHash"> = {
-    ...input, v: COMBAT_TURN_ENVELOPE_VERSION, kind: "combat_turn", beforeStateHash, afterStateHash, terminal: result.killed,
+    ...envelopeInput, turn, v: COMBAT_TURN_ENVELOPE_VERSION, kind: "combat_turn", beforeStateHash, afterStateHash,
+    previousEnvelopeHash,
+    targetKilled: result.killed, terminal: turn.terminal,
   };
   return { ...unsigned, envelopeHash: combatTurnEnvelopeHash(unsigned) };
 }
@@ -77,17 +110,33 @@ export function validateCombatTurnEnvelopeV1(value: unknown): CombatTurnEnvelope
       (envelope.previousEnvelopeHash !== null && (typeof envelope.previousEnvelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.previousEnvelopeHash))) ||
       typeof envelope.beforeStateHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.beforeStateHash) ||
       typeof envelope.afterStateHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.afterStateHash) ||
-      typeof envelope.terminal !== "boolean" || typeof envelope.envelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.envelopeHash)) {
+      typeof envelope.targetKilled !== "boolean" || typeof envelope.terminal !== "boolean" ||
+      typeof envelope.envelopeHash !== "string" || !/^[0-9a-f]{16}$/u.test(envelope.envelopeHash)) {
     throw new Error("invalid_combat_turn_envelope");
+  }
+  let turn: GameplayShadowJournalEntry;
+  try {
+    const candidate = validateShadowJournalEntry(envelope.turn);
+    if (candidate.v !== 1 || candidate.streamId !== `${envelope.streamId}_vitals` ||
+        candidate.cursor !== envelope.cursor) {
+      throw new Error("invalid_combat_turn_envelope");
+    }
+    turn = candidate;
+  } catch (error) {
+    if (error instanceof Error && error.message === "invalid_combat_turn_envelope") throw error;
+    throw new Error("invalid_combat_turn_envelope", { cause: error });
   }
   const canonical = createCombatTurnEnvelopeV1({
     streamId: envelope.streamId, cursor: Number(envelope.cursor), operationId: envelope.operationId,
     attacker: envelope.attacker as CombatantSnapshotV1, defender: envelope.defender as CombatantSnapshotV1,
     options: envelope.options as PlayerMeleeOptionsV1, transcript: envelope.transcript as CombatRollTranscriptV1,
+    turn: { command: turn.command, beforeState: turn.beforeState },
     previousEnvelopeHash: envelope.previousEnvelopeHash ?? null,
+    previousTurnEntryHash: turn.previousEntryHash,
   });
   if (canonical.beforeStateHash !== envelope.beforeStateHash || canonical.afterStateHash !== envelope.afterStateHash ||
-      canonical.terminal !== envelope.terminal || canonical.envelopeHash !== envelope.envelopeHash) {
+      canonical.targetKilled !== envelope.targetKilled || canonical.terminal !== envelope.terminal ||
+      canonical.envelopeHash !== envelope.envelopeHash) {
     throw new Error("combat_turn_envelope_hash_mismatch");
   }
   return canonical;
