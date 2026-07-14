@@ -346,6 +346,11 @@ export class ShadowReplay extends DurableObject<Env> {
       if (envelopes.some((envelope, index) => index > 0 && envelope.cursor <= envelopes[index - 1]!.cursor)) {
         return json({ code: "batch_out_of_order", checkpoint: this.combatTurnCheckpoint(streamId).checkpoint }, 409);
       }
+      if (envelopes.some((envelope) => envelope.route.realmId !== route.realmId ||
+          envelope.route.floorInstanceId !== route.floorInstanceId || envelope.route.depth !== route.depth ||
+          envelope.route.floorEpoch !== route.floorEpoch || envelope.route.rulesetVersion !== route.rulesetVersion)) {
+        return json({ code: "combat_authority_mismatch", checkpoint: this.combatTurnCheckpoint(streamId).checkpoint }, 409);
+      }
       const result = this.ingestCombatTurns(envelopes, route);
       if (result.ok) return json(result);
       const status = result.code.endsWith("_divergence") || result.code === "terminal_mismatch" ? 422 : 409;

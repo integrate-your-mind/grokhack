@@ -71,6 +71,7 @@ function movementTrace(streamId: string, count: number): MovementShadowJournalEn
     const command = { type: "move", dx, dy } as const;
     const entry: MovementShadowJournalEntry = createShadowJournalEntry({
       streamId,
+      route,
       cursor,
       command,
       beforeState,
@@ -124,6 +125,7 @@ function combatTurnTrace(streamId: string, count: number): CombatTurnEnvelopeV1[
   for (let cursor = 1; cursor <= count; cursor++) {
     const envelope = createCombatTurnEnvelopeV1({
       streamId,
+      route,
       cursor,
       operationId: `00000000-0000-4000-8000-${cursor.toString(16).padStart(12, "0")}`,
       attacker: { id: "player", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },

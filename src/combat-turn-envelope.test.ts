@@ -3,6 +3,7 @@ import { createCombatTurnEnvelopeV1, validateCombatTurnEnvelopeV1 } from "./comb
 
 const input = {
   streamId: `combat_${"a".repeat(48)}`,
+  route: { realmId: "shadow-test", floorInstanceId: "primary", depth: 1, floorEpoch: 1, rulesetVersion: 1 },
   cursor: 1,
   operationId: "00000000-0000-4000-8000-000000000001",
   attacker: { id: "player", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },

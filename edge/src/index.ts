@@ -199,6 +199,12 @@ export async function routeShadowCatchup(request: Request, env: Env, config: Edg
   if (records.some((record) => record.streamId !== records[0]!.streamId)) {
     return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
   }
+  const combatRecords = hasCombatEnvelopes ? records as ReturnType<typeof validateCombatTurnEnvelopeV1>[] : [];
+  if (combatRecords.some((record) => record.route.realmId !== route.realmId ||
+      record.route.floorInstanceId !== route.floorInstanceId || record.route.depth !== route.depth ||
+      record.route.floorEpoch !== route.floorEpoch || record.route.rulesetVersion !== route.rulesetVersion)) {
+    return json({ code: "combat_authority_mismatch", checkpoint: 0 }, 409);
+  }
   const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${records[0]!.streamId}`;
   const replay = env.SHADOW_REPLAYS.get(env.SHADOW_REPLAYS.idFromName(name));
   try {
