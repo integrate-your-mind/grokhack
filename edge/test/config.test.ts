@@ -49,6 +49,17 @@ describe("edge configuration", () => {
     expect(result.errors.join("\n")).toMatch(/ALLOWED_BROWSER_ORIGINS/);
   });
 
+  it("rejects an unknown environment before it can weaken origin transport rules", () => {
+    const result = readEdgeConfig({
+      ...(env as Env),
+      EDGE_ENVIRONMENT: "preview-typo",
+      ALLOWED_BROWSER_ORIGINS: "http://insecure.example",
+    } as unknown as Env);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.join("\n")).toMatch(/EDGE_ENVIRONMENT/);
+  });
+
   it("requires an explicit power-of-two support window that includes the active layout", () => {
     const result = readEdgeConfig({
       ...(env as Env),

@@ -30,6 +30,8 @@ export type EdgeConfigResult =
   | { ok: true; value: EdgeConfig }
   | { ok: false; errors: string[] };
 
+const EDGE_ENVIRONMENTS = new Set(["development", "staging", "production", "test"]);
+
 export class EdgeConfigError extends Error {
   readonly errors: string[];
 
@@ -65,6 +67,14 @@ function requiredToken(name: string, raw: unknown, errors: string[]): string {
     return "invalid";
   }
   return raw;
+}
+
+function requiredEnvironment(raw: unknown, errors: string[]): string {
+  const value = requiredToken("EDGE_ENVIRONMENT", raw, errors);
+  if (!EDGE_ENVIRONMENTS.has(value)) {
+    errors.push("EDGE_ENVIRONMENT must be development, staging, production, or test");
+  }
+  return value;
 }
 
 function parseOrigins(raw: unknown, environment: string, errors: string[]): ReadonlySet<string> {
@@ -141,7 +151,7 @@ export function readEdgeConfig(env: Env): EdgeConfigResult {
   ) {
     errors.push("SHADOW_REPLAYS binding is missing or invalid");
   }
-  const environment = requiredToken("EDGE_ENVIRONMENT", env.EDGE_ENVIRONMENT, errors);
+  const environment = requiredEnvironment(env.EDGE_ENVIRONMENT, errors);
   const floorSocketCap = strictInteger("FLOOR_SOCKET_CAP", env.FLOOR_SOCKET_CAP, 1, 500, errors);
   const floorMessagesPerMinute = strictInteger(
     "FLOOR_MESSAGES_PER_MINUTE",
