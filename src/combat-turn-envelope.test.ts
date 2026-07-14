@@ -29,4 +29,19 @@ describe("combat turn envelope", () => {
       turn: { ...envelope.turn, streamId: "wrong_vitals_stream" },
     })).toThrow("invalid_combat_turn_envelope");
   });
+
+  it("does not alias delimiter-bearing combat snapshots in an envelope hash", () => {
+    const first = createCombatTurnEnvelopeV1({
+      ...input,
+      attacker: { ...input.attacker, id: "player|alias", name: "Romy", traits: ["keen,brave"] },
+      transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+    });
+    const second = createCombatTurnEnvelopeV1({
+      ...input,
+      attacker: { ...input.attacker, id: "player", name: "alias|Romy", traits: ["keen", "brave"] },
+      transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+    });
+    expect(first.beforeStateHash).not.toBe(second.beforeStateHash);
+    expect(first.envelopeHash).not.toBe(second.envelopeHash);
+  });
 });

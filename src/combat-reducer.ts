@@ -49,8 +49,13 @@ function fnv64(value: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
+/** JSON array framing keeps attacker/player-provided strings unambiguous. */
+function hashParts(parts: readonly unknown[]): string {
+  return JSON.stringify(parts);
+}
+
 export function playerMeleeStateHashV1(attacker: Readonly<CombatantSnapshotV1>, defender: Readonly<CombatantSnapshotV1>): string {
-  return fnv64([combatantStateHashV1(attacker), combatantStateHashV1(defender)].join("|"));
+  return fnv64(hashParts([combatantStateHashV1(attacker), combatantStateHashV1(defender)]));
 }
 
 const playerMisses = [
@@ -94,17 +99,17 @@ function combatant(value: Readonly<CombatantSnapshotV1>, name: string): Combatan
 
 export function combatantStateHashV1(value: Readonly<CombatantSnapshotV1>): string {
   const entity = combatant(value, "combatant");
-  return fnv64([
+  return fnv64(hashParts([
     entity.id, entity.name, entity.hp, entity.maxHp, entity.attack, entity.defense,
-    entity.isPlayer ? 1 : 0, entity.traits.join(","), entity.enraged ? 1 : 0,
-  ].join("|"));
+    entity.isPlayer ? 1 : 0, entity.traits, entity.enraged ? 1 : 0,
+  ]));
 }
 
 export function playerMeleeTransitionHashV1(result: Readonly<PlayerMeleeTransitionV1>): string {
-  return fnv64([
+  return fnv64(hashParts([
     result.hit ? 1 : 0, result.damage, result.killed ? 1 : 0, result.critical ? 1 : 0,
     result.message, combatantStateHashV1(result.defender),
-  ].join("|"));
+  ]));
 }
 
 function choose<T>(values: readonly T[], roll: number): T {

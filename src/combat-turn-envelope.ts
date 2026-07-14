@@ -60,25 +60,29 @@ function fnv64(value: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
-function transcriptHashMaterial(transcript: CombatRollTranscriptV1): string {
+function hashParts(parts: readonly unknown[]): string {
+  return JSON.stringify(parts);
+}
+
+function transcriptHashMaterial(transcript: CombatRollTranscriptV1): readonly (number | null)[] {
   return [
     transcript.hit,
-    transcript.missFlavor ?? "-",
-    transcript.crit ?? "-",
-    transcript.variance ?? "-",
-    transcript.swiftSpike ?? "-",
-    transcript.severityFlavor ?? "-",
-    transcript.killFlavor ?? "-",
-  ].join("|");
+    transcript.missFlavor ?? null,
+    transcript.crit ?? null,
+    transcript.variance ?? null,
+    transcript.swiftSpike ?? null,
+    transcript.severityFlavor ?? null,
+    transcript.killFlavor ?? null,
+  ];
 }
 
 export function combatTurnEnvelopeHash(envelope: Omit<CombatTurnEnvelopeV1, "envelopeHash">): string {
-  return fnv64([envelope.v, envelope.kind, envelope.streamId,
+  return fnv64(hashParts([envelope.v, envelope.kind, envelope.streamId,
     envelope.route.realmId, envelope.route.floorInstanceId, envelope.route.depth,
     envelope.route.floorEpoch, envelope.route.rulesetVersion, envelope.cursor, envelope.operationId,
     envelope.beforeStateHash, envelope.afterStateHash, envelope.targetKilled ? 1 : 0,
     envelope.terminal ? 1 : 0, envelope.turn.entryHash,
-    transcriptHashMaterial(envelope.transcript), envelope.previousEnvelopeHash ?? "genesis"].join("|"));
+    transcriptHashMaterial(envelope.transcript), envelope.previousEnvelopeHash]));
 }
 
 export function createCombatTurnEnvelopeV1(input: CombatTurnEnvelopeInput): CombatTurnEnvelopeV1 {
@@ -93,11 +97,11 @@ export function createCombatTurnEnvelopeV1(input: CombatTurnEnvelopeInput): Comb
     previousEntryHash: previousTurnEntryHash ?? null,
   }) as GameplayShadowJournalEntry;
   const beforeStateHash = playerMeleeStateHashV1(input.attacker, input.defender);
-  const afterStateHash = fnv64([
+  const afterStateHash = fnv64(hashParts([
     playerMeleeStateHashV1(input.attacker, result.defender),
     playerMeleeTransitionHashV1(result),
     turn.afterStateHash,
-  ].join("|"));
+  ]));
   const unsigned: Omit<CombatTurnEnvelopeV1, "envelopeHash"> = {
     ...envelopeInput, route, turn, v: COMBAT_TURN_ENVELOPE_VERSION, kind: "combat_turn", beforeStateHash, afterStateHash,
     previousEnvelopeHash,

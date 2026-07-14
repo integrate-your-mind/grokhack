@@ -5,7 +5,34 @@
 import WebSocket from "ws";
 import { pathToFileURL } from "node:url";
 
-const BASE = process.env.QA_URL || "http://127.0.0.1:8080";
+const DEFAULT_QA_URL = "http://127.0.0.1:8080";
+
+/**
+ * This script creates players and writes chat/social state. Keep the default
+ * QA target local so a copied environment cannot silently exercise production.
+ */
+export function resolveQaBase(raw = DEFAULT_QA_URL, allowRemote = process.env.QA_ALLOW_REMOTE === "1") {
+  let target;
+  try {
+    target = new URL(raw);
+  } catch {
+    throw new Error("QA_URL must be an absolute http(s) URL");
+  }
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    throw new Error("QA_URL must use http or https");
+  }
+  if (target.username || target.password) {
+    throw new Error("QA_URL must not include credentials");
+  }
+  const local = target.hostname === "127.0.0.1" || target.hostname === "localhost" ||
+    target.hostname === "::1" || target.hostname === "[::1]";
+  if (!local && (!allowRemote || target.protocol !== "https:")) {
+    throw new Error("remote QA requires https and QA_ALLOW_REMOTE=1");
+  }
+  return target.origin;
+}
+
+const BASE = resolveQaBase(process.env.QA_URL || DEFAULT_QA_URL);
 const WS_URL = BASE.replace(/^http/, "ws") + "/ws";
 const NAME = `QA${Date.now().toString(36).slice(-6)}`;
 

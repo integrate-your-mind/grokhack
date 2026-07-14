@@ -5,6 +5,7 @@ import {
   assertStateTransition,
   chooseSafeWalkableStep,
   openQaSocket,
+  resolveQaBase,
   waitMsg,
 } from "./qa-play.mjs";
 
@@ -107,6 +108,22 @@ describe("qa-play safe movement selection", () => {
       ...humanState(),
       floor: { tiles: closedTiles, monsters: [], items: [] },
     })).toThrow("no safe adjacent ordinary step from (2, 2)");
+  });
+});
+
+describe("qa-play target safety", () => {
+  it("uses a loopback target by default and permits local HTTP QA", () => {
+    expect(resolveQaBase()).toBe("http://127.0.0.1:8080");
+    expect(resolveQaBase("http://localhost:8081")).toBe("http://localhost:8081");
+    expect(resolveQaBase("http://[::1]:8082")).toBe("http://[::1]:8082");
+  });
+
+  it("rejects remote and malformed targets unless HTTPS remote QA is explicitly enabled", () => {
+    expect(() => resolveQaBase("https://grokhack.mondello.dev")).toThrow("remote QA requires https and QA_ALLOW_REMOTE=1");
+    expect(() => resolveQaBase("http://example.test", true)).toThrow("remote QA requires https and QA_ALLOW_REMOTE=1");
+    expect(() => resolveQaBase("https://user:pass@example.test", true)).toThrow("QA_URL must not include credentials");
+    expect(() => resolveQaBase("ws://127.0.0.1:8080")).toThrow("QA_URL must use http or https");
+    expect(resolveQaBase("https://staging.example.test", true)).toBe("https://staging.example.test");
   });
 });
 

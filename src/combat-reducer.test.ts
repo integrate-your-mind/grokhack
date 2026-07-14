@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { reducePlayerMeleeV1, type CombatRollTranscriptV1 } from "./combat-reducer.js";
+import {
+  combatantStateHashV1,
+  playerMeleeStateHashV1,
+  reducePlayerMeleeV1,
+  type CombatRollTranscriptV1,
+} from "./combat-reducer.js";
 
 const attacker = { id: "player", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false };
 const defender = { id: "rat", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false };
 const options = { weaponName: "short sword", hitPenalty: 0, critChance: 0 };
 
 describe("reducePlayerMeleeV1", () => {
+  it("frames snapshot fields unambiguously in provenance hashes", () => {
+    const first = { ...attacker, id: "player|alias", name: "Romy", traits: ["keen,brave"] };
+    const second = { ...attacker, id: "player", name: "alias|Romy", traits: ["keen", "brave"] };
+    expect(combatantStateHashV1(first)).not.toBe(combatantStateHashV1(second));
+    expect(playerMeleeStateHashV1(first, defender)).not.toBe(playerMeleeStateHashV1(second, defender));
+  });
+
   it("is byte-stable and does not mutate either combatant", () => {
     const transcript: CombatRollTranscriptV1 = { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 };
     const before = structuredClone({ attacker, defender });
