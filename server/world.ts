@@ -1753,7 +1753,6 @@ export class WorldServer {
       const attackerSnapshot = combatSnapshotV1(attacker);
       const defenderSnapshot = combatSnapshotV1(monster);
       const { transcript, result } = resolveLegacyPlayerMelee(attacker, monster, options);
-      monster.hp = result.defender.hp;
       if (pendingMovement && this.originJournal?.appendCombatTurn) {
         const beforeTurn: GameplayState = {
           turns: player.state.turns,
@@ -1781,15 +1780,16 @@ export class WorldServer {
           });
         } catch (error) {
           this.shadowEvidenceDegraded = true;
-          // The mutation has happened but its combat record did not commit.
-          // Freeze this process too; cold recovery already treats the prepared
-          // movement fence as poison rather than admitting a divergent retry.
+          // No combat mutation is applied until its immutable envelope commits.
+          // Keep the already-durable movement preparation fenced so a cold
+          // restart cannot admit a divergent retry while recovery is pending.
           this.movementTurnPersistencePending = true;
           this.logMovementTurnFailure(player, "origin_combat_turn_outbox", error);
           this.addMessage(player, "Combat journal unavailable — retry shortly.");
           return;
         }
       }
+      monster.hp = result.defender.hp;
       this.addMessage(player, result.message);
       if (result.hit && !result.killed) {
         const enrage = checkBossEnrage(monster);

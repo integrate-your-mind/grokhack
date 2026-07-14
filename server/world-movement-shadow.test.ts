@@ -369,6 +369,29 @@ describe("WorldServer movement shadow journal", () => {
     });
   });
 
+  it("does not mutate combat state when the durable combat envelope rejects", async () => {
+    const journal = createJournal();
+    vi.spyOn(journal, "appendCombatTurn").mockImplementation(() => { throw new Error("injected combat journal failure"); });
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("combat-journal-failure"));
+    const player = await world.joinPlayer("combat-journal-failure", "CombatJournalFailure");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    const monster = createMonster("rat", step.x + step.dx, step.y + step.dy, floor.depth);
+    monster.hp = monster.maxHp = 1;
+    floor.monsters.push(monster);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.entity.attack = 50;
+    player.state.hunger = 2_000;
+    world.handleInput(player.id, step.key);
+    expect(monster.hp).toBe(1);
+    expect(player.state.entity).toMatchObject({ x: step.x, y: step.y });
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+  });
+
   it("keeps origin movement available after V1 and V2 shadow evidence reach capacity", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-movement-capacity-"));
     directories.push(directory);

@@ -1079,6 +1079,9 @@ export class OriginGameplayJournal {
     if (segments.some((value, index) => value !== index)) throw new Error("combat_turn_missing_segment");
     const latest = this.readCombatTurnSegment(streamId, latestSegment, repair);
     if (!latest.length) {
+      if (repair && this.removeEmptyCombatTurnSegmentFiles(streamId, latestSegment)) {
+        return this.combatTurnHead(streamId);
+      }
       if (repair) throw new Error("combat_turn_empty_segment");
       if (latestSegment === 0) return { cursor: 0, envelopeHash: "", turnEntryHash: null, terminal: false };
       throw new Error("combat_turn_empty_segment");
@@ -2399,6 +2402,16 @@ export class OriginGameplayJournal {
     if (!files.length || files.some((candidate) => fs.statSync(candidate).size !== 0)) return false;
     for (const candidate of files) fs.rmSync(candidate);
     this.syncDirectory(this.movementTurnDirectory());
+    return true;
+  }
+
+  private removeEmptyCombatTurnSegmentFiles(streamId: string, segment: number): boolean {
+    const file = this.combatTurnFileFor(streamId, segment);
+    const commitFile = this.commitFileFor(file);
+    const files = [file, commitFile].filter((candidate) => fs.existsSync(candidate));
+    if (!files.length || files.some((candidate) => fs.statSync(candidate).size !== 0)) return false;
+    for (const candidate of files) fs.rmSync(candidate);
+    this.syncDirectory(this.combatTurnDirectory());
     return true;
   }
 
