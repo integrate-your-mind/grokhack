@@ -219,6 +219,37 @@ describe("ShadowReplay catch-up", () => {
     await expect(response.json()).resolves.toEqual({ code: "combat_authority_mismatch", checkpoint: 0 });
   });
 
+  it("rejects combat gaps, reordering, and post-terminal delivery without advancing", async () => {
+    const streamId = `combat_${"7".repeat(48)}`;
+    const [first, second] = combatTurnTrace(streamId, 2);
+    const gap = await ingestCombatTurns([second!]);
+    expect(gap.status).toBe(409);
+    await expect(gap.json()).resolves.toMatchObject({ code: "cursor_gap", checkpoint: 0, expectedCursor: 1 });
+    const reordered = await ingestCombatTurns([second!, first!]);
+    expect(reordered.status).toBe(409);
+    await expect(reordered.json()).resolves.toMatchObject({ code: "batch_out_of_order", checkpoint: 0 });
+
+    const terminalStream = `combat_${"8".repeat(48)}`;
+    const terminal = createCombatTurnEnvelopeV1({
+      ...combatTurnTrace(terminalStream, 1)[0]!,
+      turn: { command: { type: "advance_turn", action: "other" }, beforeState: initial({ hunger: 1, hungerState: "starving", hp: 3 }) },
+    });
+    expect(terminal.terminal).toBe(true);
+    await expect((await ingestCombatTurns([terminal])).json()).resolves.toMatchObject({ checkpoint: 1, accepted: 1, terminal: true });
+    const later = createCombatTurnEnvelopeV1({
+      ...combatTurnTrace(`combat_${"c".repeat(48)}`, 1)[0]!,
+      streamId: terminalStream,
+      cursor: 2,
+      operationId: "00000000-0000-4000-8000-000000000999",
+      previousEnvelopeHash: terminal.envelopeHash,
+      previousTurnEntryHash: terminal.turn.entryHash,
+      turn: { command: { type: "advance_turn", action: "other" }, beforeState: reduceGameplay(terminal.turn.beforeState, terminal.turn.command).state },
+    });
+    const postTerminal = await ingestCombatTurns([later]);
+    expect(postTerminal.status).toBe(409);
+    await expect(postTerminal.json()).resolves.toMatchObject({ code: "terminal_state", checkpoint: 1 });
+  });
+
   it("retains a bounded combat receipt window and returns the durable head after eviction", async () => {
     const streamId = `combat_${"4".repeat(48)}`;
     const envelopes = combatTurnTrace(streamId, 300);
