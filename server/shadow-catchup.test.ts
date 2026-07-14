@@ -8,6 +8,8 @@ import {
 } from "../src/shadow-journal.js";
 import type { GameplayState } from "../src/gameplay-reducer.js";
 import { catchUpMovementTurnJournal, catchUpOriginJournal } from "./shadow-catchup.js";
+import { catchUpCombatTurnJournal } from "./shadow-catchup.js";
+import { createCombatTurnEnvelopeV1 } from "../src/combat-turn-envelope.js";
 
 const state: GameplayState = { turns: 0, depth: 1, hunger: 800, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true };
 const entry = createShadowJournalEntry({ streamId: "copy", cursor: 1, command: { type: "advance_turn", action: "wait" }, beforeState: state });
@@ -83,6 +85,18 @@ function movementTurnSource(envelopes: readonly MovementTurnEnvelope[]) {
       envelopes.filter((value) => value.cursor > cursor).slice(0, limit),
   };
 }
+
+const combatTurn = createCombatTurnEnvelopeV1({
+  streamId: `combat_${"b".repeat(48)}`,
+  route,
+  cursor: 1,
+  operationId: "00000000-0000-4000-8000-000000000001",
+  attacker: { id: "player", name: "Romy", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+  defender: { id: "rat", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+  options: { weaponName: "short sword", hitPenalty: 0, critChance: 0 },
+  transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+  turn: { command: { type: "advance_turn", action: "other" }, beforeState: state },
+});
 
 describe("catchUpOriginJournal", () => {
   it("advances from the edge checkpoint and becomes caught up", async () => {
@@ -198,6 +212,26 @@ describe("catchUpOriginJournal", () => {
       maxDurationMs: 10,
       fetchImpl: async () => new Promise<Response>(() => { /* deliberate blackhole */ }),
     })).rejects.toMatchObject({ code: "shadow_timeout", status: 504, checkpoint: 0 });
+  });
+});
+
+describe("catchUpCombatTurnJournal", () => {
+  it("sends combat envelopes and requires the exact deterministic acknowledgement", async () => {
+    const result = await catchUpCombatTurnJournal({
+      journal: { readCombatTurnsAfter: (_streamId, cursor, limit) => [combatTurn].filter((entry) => entry.cursor > cursor).slice(0, limit) },
+      streamId: combatTurn.streamId,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret,
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { combatEnvelopes: unknown[] };
+        expect(body.combatEnvelopes).toEqual([combatTurn]);
+        return Response.json({ streamId: combatTurn.streamId, checkpoint: 1, accepted: 1, duplicates: 0,
+          terminal: false, lastEnvelopeHash: combatTurn.envelopeHash, combatStateHash: combatTurn.afterStateHash,
+          turnStateHash: combatTurn.turn.afterStateHash });
+      },
+    });
+    expect(result).toMatchObject({ checkpoint: 1, accepted: 1, caughtUp: true, backpressured: false });
   });
 });
 

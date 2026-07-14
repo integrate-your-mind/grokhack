@@ -4,6 +4,7 @@ import {
   type ShadowJournalEntry,
   type ShadowRoute,
 } from "../src/shadow-journal.js";
+import type { CombatTurnEnvelopeV1 } from "../src/combat-turn-envelope.js";
 
 interface ShadowJournalReader {
   readAfter(streamId: string, cursor: number, limit: number): readonly ShadowJournalEntry[];
@@ -11,6 +12,10 @@ interface ShadowJournalReader {
 
 interface MovementTurnJournalReader {
   readMovementTurnsAfter(streamId: string, cursor: number, limit: number): readonly MovementTurnEnvelope[];
+}
+
+interface CombatTurnJournalReader {
+  readCombatTurnsAfter(streamId: string, cursor: number, limit: number): readonly CombatTurnEnvelopeV1[];
 }
 
 export interface ShadowCatchupCheckpoint {
@@ -42,6 +47,23 @@ export interface MovementTurnCatchupCheckpoint {
 }
 
 export interface MovementTurnCatchupResult extends MovementTurnCatchupCheckpoint {
+  batches: number;
+  caughtUp: boolean;
+  backpressured: boolean;
+}
+
+export interface CombatTurnCatchupCheckpoint {
+  streamId: string;
+  checkpoint: number;
+  accepted: number;
+  duplicates: number;
+  terminal: boolean;
+  lastEnvelopeHash: string | null;
+  combatStateHash: string | null;
+  turnStateHash: string | null;
+}
+
+export interface CombatTurnCatchupResult extends CombatTurnCatchupCheckpoint {
   batches: number;
   caughtUp: boolean;
   backpressured: boolean;
@@ -124,6 +146,21 @@ function parseMovementTurnCheckpoint(value: unknown): MovementTurnCatchupCheckpo
     throw new Error("invalid movement-turn shadow response");
   }
   return candidate as MovementTurnCatchupCheckpoint;
+}
+
+function parseCombatTurnCheckpoint(value: unknown): CombatTurnCatchupCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid combat-turn shadow response");
+  const candidate = value as Partial<CombatTurnCatchupCheckpoint>;
+  const validHash = (hash: unknown) => hash === null || (typeof hash === "string" && /^[0-9a-f]{16}$/u.test(hash));
+  if (typeof candidate.streamId !== "string" || !/^combat_[0-9a-f]{48}$/u.test(candidate.streamId) ||
+      !Number.isSafeInteger(candidate.checkpoint) || Number(candidate.checkpoint) < 0 ||
+      !Number.isSafeInteger(candidate.accepted) || Number(candidate.accepted) < 0 ||
+      !Number.isSafeInteger(candidate.duplicates) || Number(candidate.duplicates) < 0 ||
+      typeof candidate.terminal !== "boolean" || !validHash(candidate.lastEnvelopeHash) ||
+      !validHash(candidate.combatStateHash) || !validHash(candidate.turnStateHash)) {
+    throw new Error("invalid combat-turn shadow response");
+  }
+  return candidate as CombatTurnCatchupCheckpoint;
 }
 
 function compactedMovementTurnCheckpoint(value: unknown, streamId: string, currentCheckpoint: number): MovementTurnResumeState {
@@ -403,4 +440,72 @@ export async function catchUpMovementTurnJournal(options: {
   }
   const remaining = options.journal.readMovementTurnsAfter(options.streamId, checkpoint, 1);
   return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, movementStateHash, turnStateHash, batches, caughtUp: remaining.length === 0, backpressured: remaining.length > 0 };
+}
+
+/** Shadow-only combat replication. Acknowledgements must exactly match the local deterministic envelope head. */
+export async function catchUpCombatTurnJournal(options: {
+  journal: CombatTurnJournalReader;
+  streamId: string;
+  route: ShadowRoute;
+  endpoint: string;
+  secret: string;
+  cursor?: number;
+  maxEntriesPerBatch?: number;
+  maxBatches?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<CombatTurnCatchupResult> {
+  const limit = options.maxEntriesPerBatch ?? MAX_SHADOW_BATCH_ENTRIES;
+  const maxBatches = options.maxBatches ?? 4;
+  if (!/^combat_[0-9a-f]{48}$/u.test(options.streamId)) throw new Error("invalid combat-turn stream");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_SHADOW_BATCH_ENTRIES) throw new RangeError("invalid batch limit");
+  if (!Number.isSafeInteger(maxBatches) || maxBatches < 1 || maxBatches > 100) throw new RangeError("invalid batch count");
+  if (new TextEncoder().encode(options.secret).byteLength < 32) throw new Error("shadow secret too short");
+  const send = options.fetchImpl ?? fetch;
+  let checkpoint = options.cursor ?? 0;
+  if (!Number.isSafeInteger(checkpoint) || checkpoint < 0) throw new RangeError("invalid resume cursor");
+  let accepted = 0;
+  let duplicates = 0;
+  let terminal = false;
+  let lastEnvelopeHash: string | null = null;
+  let combatStateHash: string | null = null;
+  let turnStateHash: string | null = null;
+  for (let batches = 0; batches < maxBatches; batches++) {
+    const combatEnvelopes = options.journal.readCombatTurnsAfter(options.streamId, checkpoint, limit);
+    if (!combatEnvelopes.length) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, combatStateHash, turnStateHash, batches, caughtUp: true, backpressured: false };
+    let response: Response;
+    let body: unknown;
+    try {
+      response = await send(options.endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${options.secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ v: 1, route: options.route, combatEnvelopes }),
+      });
+      body = await response.json() as unknown;
+    } catch (error) {
+      throw new ShadowCatchupError(503, checkpoint, error instanceof Error ? error.message : "shadow_fetch_failed");
+    }
+    if (response.status === 429) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, combatStateHash, turnStateHash, batches, caughtUp: false, backpressured: true };
+    if (!response.ok) {
+      const failure = body && typeof body === "object" ? body as { code?: unknown; checkpoint?: unknown } : {};
+      throw new ShadowCatchupError(response.status, Number.isSafeInteger(failure.checkpoint) ? Number(failure.checkpoint) : checkpoint, typeof failure.code === "string" ? failure.code : "unknown_error");
+    }
+    const result = parseCombatTurnCheckpoint(body);
+    const last = combatEnvelopes.at(-1)!;
+    if (result.streamId !== options.streamId || result.checkpoint < last.cursor ||
+        result.accepted + result.duplicates !== combatEnvelopes.length ||
+        result.lastEnvelopeHash !== last.envelopeHash || result.combatStateHash !== last.afterStateHash ||
+        result.turnStateHash !== last.turn.afterStateHash || result.terminal !== last.terminal) {
+      throw new Error("invalid combat-turn shadow checkpoint advance");
+    }
+    checkpoint = result.checkpoint;
+    accepted += result.accepted;
+    duplicates += result.duplicates;
+    terminal = result.terminal;
+    lastEnvelopeHash = result.lastEnvelopeHash;
+    combatStateHash = result.combatStateHash;
+    turnStateHash = result.turnStateHash;
+    if (terminal) return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, combatStateHash, turnStateHash, batches: batches + 1, caughtUp: true, backpressured: false };
+  }
+  const remaining = options.journal.readCombatTurnsAfter(options.streamId, checkpoint, 1);
+  return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, combatStateHash, turnStateHash, batches: maxBatches, caughtUp: remaining.length === 0, backpressured: remaining.length > 0 };
 }
