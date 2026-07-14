@@ -19,9 +19,11 @@ import {
   movementJournalRunId,
   movementJournalStreamId,
   movementTurnJournalStreamId,
+  combatTurnJournalStreamId,
   OriginGameplayJournal,
 } from "../server/origin-journal.js";
 import {
+  catchUpCombatTurnJournal,
   catchUpMovementTurnJournal,
   catchUpOriginJournal,
   ShadowCatchupError,
@@ -823,6 +825,83 @@ try {
     combatMessages,
     monsterHpAfter: proofMonster.hp,
   };
+  // The movement envelope only records the blocked movement/combat intent. The
+  // separately durable combat envelope carries the origin-sampled transcript
+  // and deterministic defender transition, so prove its real Worker route too.
+  const combatStreamId = combatTurnJournalStreamId(
+    combatScenario.player.id,
+    movementJournalRunId(combatScenario.player.resumeToken!),
+    combatScenario.floor.movementAuthority!,
+  );
+  const [combatEnvelope, ...unexpectedCombatEnvelopes] = combatScenario.journal.readCombatTurnsAfter(
+    combatStreamId,
+    0,
+    64,
+  );
+  if (!combatEnvelope || unexpectedCombatEnvelopes.length > 0 ||
+      combatEnvelope.route.realmId !== combatScenario.floor.movementAuthority!.realmId ||
+      combatEnvelope.route.floorInstanceId !== combatScenario.floor.movementAuthority!.floorInstanceId ||
+      combatEnvelope.route.depth !== combatScenario.floor.movementAuthority!.depth ||
+      combatEnvelope.route.floorEpoch !== combatScenario.floor.movementAuthority!.floorEpoch ||
+      combatEnvelope.targetKilled || combatEnvelope.terminal) {
+    throw new Error(`combat scenario did not publish its expected durable combat envelope: ${JSON.stringify({
+      combatStreamId,
+      combatEnvelope,
+      unexpectedCount: unexpectedCombatEnvelopes.length,
+    })}`);
+  }
+  const combatFirstAckHolder: { value: Record<string, unknown> | null } = { value: null };
+  let combatResponseLossObserved = false;
+  try {
+    await catchUpCombatTurnJournal({
+      journal: combatScenario.journal,
+      streamId: combatStreamId,
+      route: combatEnvelope.route,
+      endpoint: "http://worker.local/internal/shadow/catch-up",
+      secret,
+      fetchImpl: async (input, init) => {
+        const response = await harnessFetch(input, init);
+        combatFirstAckHolder.value = await response.clone().json() as Record<string, unknown>;
+        throw new Error("deliberate combat response loss");
+      },
+    });
+  } catch (error) {
+    combatResponseLossObserved = error instanceof ShadowCatchupError &&
+      error.status === 503 && error.code === "deliberate combat response loss";
+  }
+  const combatFirstAck = combatFirstAckHolder.value;
+  if (!combatResponseLossObserved || !combatFirstAck ||
+      combatFirstAck.streamId !== combatStreamId || combatFirstAck.checkpoint !== 1 ||
+      combatFirstAck.accepted !== 1 || combatFirstAck.duplicates !== 0 ||
+      combatFirstAck.lastEnvelopeHash !== combatEnvelope.envelopeHash ||
+      combatFirstAck.combatStateHash !== combatEnvelope.afterStateHash ||
+      combatFirstAck.turnStateHash !== combatEnvelope.turn.afterStateHash ||
+      combatFirstAck.terminal !== false) {
+    throw new Error(`combat response-loss commit was not observed: ${JSON.stringify(combatFirstAck)}`);
+  }
+  const combatRetry = await catchUpCombatTurnJournal({
+    journal: combatScenario.journal,
+    streamId: combatStreamId,
+    route: combatEnvelope.route,
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    fetchImpl: harnessFetch,
+  });
+  if (!combatRetry.caughtUp || combatRetry.backpressured || combatRetry.checkpoint !== 1 ||
+      combatRetry.accepted !== 0 || combatRetry.duplicates !== 1 ||
+      combatRetry.lastEnvelopeHash !== combatEnvelope.envelopeHash ||
+      combatRetry.combatStateHash !== combatEnvelope.afterStateHash ||
+      combatRetry.turnStateHash !== combatEnvelope.turn.afterStateHash || combatRetry.terminal) {
+    throw new Error(`combat response-loss retry failed: ${JSON.stringify(combatRetry)}`);
+  }
+  Object.assign(combatProof, {
+    combatStreamId,
+    combatEnvelopeHash: combatEnvelope.envelopeHash,
+    combatTurnEntryHash: combatEnvelope.turn.entryHash,
+    combatResponseLossObserved,
+    firstCombatAcknowledgement: combatFirstAck,
+    combatRetryAcknowledgement: combatRetry,
+  });
 
   const trapScenario = await createWorldScenario("trap");
   const trapStep = findOrdinaryStep(trapScenario.floor);
