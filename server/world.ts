@@ -347,7 +347,12 @@ export class WorldServer {
     if (!Number.isSafeInteger(this.maxPlayers) || this.maxPlayers < 1) {
       throw new Error("maxPlayers must be a positive safe integer");
     }
-    this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+    // A durable prepared marker can survive a process crash after an immutable
+    // combat/movement envelope commits but before its origin state snapshot
+    // does. It is not enough to label shadow evidence degraded: keep command
+    // admission closed until cold-start reconciliation proves the marker safe.
+    this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+    this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
   }
 
   async hydrateFromDatabase(): Promise<void> {
@@ -412,7 +417,8 @@ export class WorldServer {
         console.error("[world] movement turn receipt cleanup:", error);
       }
       try {
-        this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+        this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+        this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
       } catch {
         this.shadowEvidenceDegraded = true;
       }
@@ -420,6 +426,7 @@ export class WorldServer {
     }
 
     this.shadowEvidenceDegraded = true;
+    this.movementTurnPersistencePending = true;
     if (candidate.state !== "origin_applied") return;
 
     let committed: boolean;
@@ -456,7 +463,8 @@ export class WorldServer {
       console.error("[world] movement turn receipt cleanup:", error);
     }
     try {
-      this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+      this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+      this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
     } catch {
       this.shadowEvidenceDegraded = true;
     }

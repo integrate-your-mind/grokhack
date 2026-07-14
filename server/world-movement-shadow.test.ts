@@ -1243,10 +1243,14 @@ describe("WorldServer movement shadow journal", () => {
 
     restarted.handleInput(resumedPlayer.id, resumedStep.key);
 
+    // A cold process cannot safely admit another turn while a durable prepared
+    // marker has no matching persistence receipt. Doing so would let a new
+    // command race an unresolved combat/movement decision from before restart.
     expect(resumedPlayer.state).toMatchObject({
-      turns: resumedTurns + 1,
-      entity: { x: resumedStep.x + resumedStep.dx, y: resumedStep.y + resumedStep.dy },
+      turns: resumedTurns,
+      entity: { x: resumedStep.x, y: resumedStep.y },
     });
+    expect(resumedPlayer.messages).toContain("Movement persistence is still committing — retry shortly.");
     expect(restarted.getStats().shadowEvidenceDegraded).toBe(true);
     expect(journal.hasPendingMovementTurn()).toBe(true);
     expect(journal.readMovementTurnsAfter(movementTurnStream(resumedPlayer, resumedFloor), 0, 64)).toEqual([]);
