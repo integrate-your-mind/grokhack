@@ -38,6 +38,8 @@ import {
 } from "../src/entities.js";
 import {
   meleeAttack,
+  combatSnapshotV1,
+  resolveLegacyPlayerMelee,
   effectivePlayerEntity,
   useItem,
   playerHitPenalty,
@@ -95,6 +97,7 @@ import {
   type MovementState,
 } from "../src/movement-reducer.js";
 import {
+  combatTurnJournalStreamId,
   movementJournalRunId,
   movementTurnJournalStreamId,
   OriginGameplayJournal,
@@ -199,7 +202,7 @@ export interface WorldServerOptions {
   originJournal?: (
     Pick<OriginGameplayJournal, "appendTransition"> &
     Partial<Pick<OriginGameplayJournal,
-      "appendMovementTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
+      "appendMovementTurn" | "appendCombatTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
       "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
       "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
       "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
@@ -316,7 +319,7 @@ export class WorldServer {
   private readonly originJournal: (
     Pick<OriginGameplayJournal, "appendTransition"> &
     Partial<Pick<OriginGameplayJournal,
-      "appendMovementTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
+      "appendMovementTurn" | "appendCombatTurn" | "prepareMovementTurn" | "markMovementTurnApplied" |
       "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
       "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
       "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
@@ -1742,10 +1745,47 @@ export class WorldServer {
     }
     if (movement.outcome === "combat_intent") {
       if (!monster) throw new Error("movement occupant changed before combat");
-      const result = meleeAttack(effectivePlayerEntity(player.state), monster, {
+      const attacker = effectivePlayerEntity(player.state);
+      const options = {
         weaponName: player.state.equippedWeapon?.name,
         hitPenalty: playerHitPenalty(player.state),
-      });
+      };
+      const attackerSnapshot = combatSnapshotV1(attacker);
+      const defenderSnapshot = combatSnapshotV1(monster);
+      const { transcript, result } = resolveLegacyPlayerMelee(attacker, monster, options);
+      monster.hp = result.defender.hp;
+      if (pendingMovement && this.originJournal?.appendCombatTurn) {
+        const beforeTurn: GameplayState = {
+          turns: player.state.turns,
+          depth: player.floorDepth,
+          hunger: player.state.hunger,
+          maxHunger: player.state.maxHunger,
+          hungerState: player.state.hungerState,
+          hp: player.state.entity.hp,
+          alive: player.state.alive,
+        };
+        try {
+          this.originJournal.appendCombatTurn({
+            streamId: combatTurnJournalStreamId(
+              player.id,
+              movementJournalRunId(player.resumeToken ?? ""),
+              movementState.authority,
+            ),
+            route: movementState.authority,
+            operationId: randomUUID(),
+            attacker: attackerSnapshot,
+            defender: defenderSnapshot,
+            options: { weaponName: options.weaponName ?? null, hitPenalty: options.hitPenalty ?? 0, critChance: null },
+            transcript,
+            turn: { command: { type: "advance_turn", action: "other" }, beforeState: beforeTurn },
+          });
+        } catch (error) {
+          this.shadowEvidenceDegraded = true;
+          this.logMovementTurnFailure(player, "origin_combat_turn_outbox", error);
+          this.addMessage(player, "Combat journal unavailable — retry shortly.");
+          return;
+        }
+      }
       this.addMessage(player, result.message);
       if (result.hit && !result.killed) {
         const enrage = checkBossEnrage(monster);

@@ -205,6 +205,17 @@ export function movementTurnJournalStreamId(
   return `turn_${streamHash}`;
 }
 
+/** Dedicated additive combat stream; movement envelope identities remain frozen. */
+export function combatTurnJournalStreamId(
+  playerId: string,
+  runId: string,
+  authority: Readonly<MovementAuthority>,
+): string {
+  const movementStream = movementJournalStreamId(playerId, runId, authority);
+  const streamHash = createHash("sha256").update(`combat-turn-v1|${movementStream}`, "utf8").digest("hex").slice(0, 48);
+  return `combat_${streamHash}`;
+}
+
 function validateMovementTurnPreparationIdentity(input: {
   streamId: string;
   operationId: string;

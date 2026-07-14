@@ -7,10 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isWalkable } from "../src/dungeon.js";
 import {
+  combatTurnJournalStreamId,
   movementJournalRunId,
   movementTurnJournalStreamId,
   OriginGameplayJournal,
 } from "./origin-journal.js";
+import { createMonster } from "../src/entities.js";
 import type { ClientConnection } from "./types.js";
 import {
   shouldRecordMovementNoopEvidence,
@@ -330,6 +332,40 @@ describe("WorldServer movement shadow journal", () => {
     expect(player.state).toMatchObject({
       turns: turnsBefore + 1,
       entity: { x: step.x + step.dx, y: step.y + step.dy },
+    });
+  });
+
+  it("journals the origin-sampled player combat transcript without replaying monster authority", async () => {
+    const journal = createJournal();
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("combat-walker"));
+    const player = await world.joinPlayer("combat-walker", "CombatWalker");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    const monster = createMonster("rat", step.x + step.dx, step.y + step.dy, floor.depth);
+    monster.hp = monster.maxHp = 1;
+    floor.monsters.push(monster);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.entity.attack = 50;
+    player.state.hunger = 2_000;
+    player.state.entity.hp = player.state.entity.maxHp = 999;
+    world.handleInput(player.id, step.key);
+    const streamId = combatTurnJournalStreamId(
+      player.id,
+      movementJournalRunId(player.resumeToken ?? ""),
+      floor.movementAuthority!,
+    );
+    const [envelope] = journal.readCombatTurnsAfter(streamId, 0, 64);
+    expect(envelope).toMatchObject({
+      cursor: 1,
+      attacker: { id: player.state.entity.id, isPlayer: true },
+      defender: { id: monster.id, hp: 1, isPlayer: false },
+      targetKilled: true,
+      terminal: false,
+      turn: { command: { type: "advance_turn", action: "other" } },
     });
   });
 
