@@ -876,11 +876,14 @@ describe("OriginGameplayJournal", () => {
       import { OriginGameplayJournal } from "./server/origin-journal.ts";
       const value = new OriginGameplayJournal(process.env.JOURNAL_DIR, {
         writeSync: (descriptor, buffer, offset, length) => {
+          if (process.env.CRASH_POINT === "before_data_write" && buffer.byteLength > 1) process.exit(83);
           if (process.env.CRASH_POINT === "before_commit_write" && buffer.byteLength === 1) process.exit(85);
           return fs.writeSync(descriptor, buffer, offset, length);
         },
         fsyncSync: (descriptor) => {
           fs.fsyncSync(descriptor);
+          if (process.env.CRASH_POINT === "after_data_fsync" && fs.fstatSync(descriptor).isFile() &&
+              fs.fstatSync(descriptor).size > 128) process.exit(84);
           if (process.env.CRASH_POINT === "after_commit_fsync" && fs.fstatSync(descriptor).isFile() &&
               fs.fstatSync(descriptor).size === 1) process.exit(86);
         },
@@ -893,6 +896,22 @@ describe("OriginGameplayJournal", () => {
         env: { ...process.env, CRASH_POINT: crashPoint, JOURNAL_DIR: directory, COMBAT_TURN_INPUT: JSON.stringify(input) },
         encoding: "utf8",
       });
+
+    const preDataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-combat-turn-predata-crash-"));
+    directories.push(preDataDirectory);
+    const preDataInput = combatTurnInput("00000000-0000-4000-8000-000000000006");
+    expect(runCrash(preDataDirectory, "before_data_write", preDataInput).status).toBe(83);
+    const preDataRestart = new OriginGameplayJournal(preDataDirectory);
+    expect(preDataRestart.readCombatTurnsAfter(preDataInput.streamId, 0, 64)).toEqual([]);
+    expect(preDataRestart.appendCombatTurn(preDataInput).status).toBe("appended");
+
+    const postDataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-combat-turn-postdata-crash-"));
+    directories.push(postDataDirectory);
+    const postDataInput = combatTurnInput("00000000-0000-4000-8000-000000000007");
+    expect(runCrash(postDataDirectory, "after_data_fsync", postDataInput).status).toBe(84);
+    const postDataRestart = new OriginGameplayJournal(postDataDirectory);
+    expect(postDataRestart.readCombatTurnsAfter(postDataInput.streamId, 0, 64)).toEqual([]);
+    expect(postDataRestart.appendCombatTurn(postDataInput).status).toBe("appended");
 
     const preCommitDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-combat-turn-precommit-crash-"));
     directories.push(preCommitDirectory);
