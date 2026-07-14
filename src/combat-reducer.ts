@@ -36,6 +36,23 @@ export interface PlayerMeleeTransitionV1 {
   message: string;
 }
 
+const transcriptKeys = new Set([
+  "hit", "missFlavor", "crit", "variance", "swiftSpike", "severityFlavor", "killFlavor",
+]);
+
+function fnv64(value: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(value)) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+export function playerMeleeStateHashV1(attacker: Readonly<CombatantSnapshotV1>, defender: Readonly<CombatantSnapshotV1>): string {
+  return fnv64([combatantStateHashV1(attacker), combatantStateHashV1(defender)].join("|"));
+}
+
 const playerMisses = [
   "You miss the {target}.",
   "Your attack whistles past the {target}.",
@@ -73,6 +90,21 @@ function combatant(value: Readonly<CombatantSnapshotV1>, name: string): Combatan
     attack: integer(value.attack, `${name}_attack`), defense: integer(value.defense, `${name}_defense`),
     isPlayer: value.isPlayer, traits: [...value.traits], enraged: value.enraged,
   };
+}
+
+export function combatantStateHashV1(value: Readonly<CombatantSnapshotV1>): string {
+  const entity = combatant(value, "combatant");
+  return fnv64([
+    entity.id, entity.name, entity.hp, entity.maxHp, entity.attack, entity.defense,
+    entity.isPlayer ? 1 : 0, entity.traits.join(","), entity.enraged ? 1 : 0,
+  ].join("|"));
+}
+
+export function playerMeleeTransitionHashV1(result: Readonly<PlayerMeleeTransitionV1>): string {
+  return fnv64([
+    result.hit ? 1 : 0, result.damage, result.killed ? 1 : 0, result.critical ? 1 : 0,
+    result.message, combatantStateHashV1(result.defender),
+  ].join("|"));
 }
 
 function choose<T>(values: readonly T[], roll: number): T {
@@ -113,6 +145,10 @@ export function reducePlayerMeleeV1(
       !Number.isFinite(options.hitPenalty) || options.hitPenalty < 0 ||
       (options.critChance !== null && (!Number.isFinite(options.critChance) || options.critChance < 0 || options.critChance > 1))) {
     throw new Error("invalid_player_melee_options");
+  }
+  if (!transcript || typeof transcript !== "object" || Array.isArray(transcript) ||
+      Object.keys(transcript).some((key) => !transcriptKeys.has(key))) {
+    throw new Error("invalid_combat_transcript_keys");
   }
   const hitRoll = unit(transcript.hit, "hit");
   const atkEdge = attacker.attack - defender.defense;
