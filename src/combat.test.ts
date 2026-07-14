@@ -18,6 +18,7 @@ import {
   chooseStepToward,
   sacrificeCorpse,
   resolveThroneSit,
+  resolveLegacyPlayerMelee,
 } from "./combat";
 import {
   createPlayer,
@@ -103,6 +104,21 @@ describe("conjugateVerb", () => {
 });
 
 describe("melee combat", () => {
+  it("exposes the origin transcript without mutating either combatant", () => {
+    const attacker = createPlayer(0, 0);
+    attacker.attack = 8;
+    const defender = createMonster("rat", 1, 0, 1);
+    defender.defense = 1;
+    defender.hp = defender.maxHp = 8;
+    const random = vi.spyOn(Math, "random").mockReturnValueOnce(0).mockReturnValueOnce(0.9)
+      .mockReturnValueOnce(0.5).mockReturnValueOnce(0).mockReturnValueOnce(0);
+    const resolution = resolveLegacyPlayerMelee(attacker, defender, { critChance: 0 });
+    expect(resolution).toMatchObject({ transcript: { hit: 0, crit: 0.9, variance: 0.5 }, result: { killed: true, damage: 8 } });
+    expect(defender.hp).toBe(8);
+    expect(random).toHaveBeenCalledTimes(5);
+    random.mockRestore();
+  });
+
   it("routes player attacks through the deterministic reducer without changing lazy RNG draws", () => {
     const attacker = createPlayer(0, 0);
     attacker.attack = 8;

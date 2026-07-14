@@ -20,7 +20,7 @@ import {
   WAND_TRUE_NAMES,
   weaponVerb,
 } from "./entities";
-import { reducePlayerMeleeV1, type CombatantSnapshotV1, type CombatRollTranscriptV1 } from "./combat-reducer";
+import { reducePlayerMeleeV1, type CombatantSnapshotV1, type CombatRollTranscriptV1, type PlayerMeleeTransitionV1 } from "./combat-reducer";
 
 export interface CombatResult {
   hit: boolean;
@@ -95,7 +95,7 @@ export interface MeleeOptions {
   critChance?: number;
 }
 
-function combatSnapshot(entity: Entity): CombatantSnapshotV1 {
+export function combatSnapshotV1(entity: Entity): CombatantSnapshotV1 {
   return {
     id: entity.id,
     name: entity.name,
@@ -136,6 +136,27 @@ function legacyPlayerTranscript(attacker: Entity, defender: Entity, options: Mel
 }
 
 /**
+ * Samples the legacy player-combat randomness in its historic branch order,
+ * then resolves without mutating either participant. The origin uses this
+ * before opening a durable combat outbox; replayers consume the transcript.
+ */
+export function resolveLegacyPlayerMelee(
+  attacker: Entity,
+  defender: Entity,
+  options: MeleeOptions = {},
+): { transcript: CombatRollTranscriptV1; result: PlayerMeleeTransitionV1 } {
+  if (!attacker.isPlayer || defender.isPlayer) throw new Error("invalid_player_melee_participants");
+  const transcript = legacyPlayerTranscript(attacker, defender, options);
+  const result = reducePlayerMeleeV1(
+    combatSnapshotV1(attacker),
+    combatSnapshotV1(defender),
+    { weaponName: options.weaponName ?? null, hitPenalty: options.hitPenalty ?? 0, critChance: options.critChance ?? null },
+    transcript,
+  );
+  return { transcript, result };
+}
+
+/**
  * Core melee resolution — shared by client game and multiplayer world.
  * Hit formula is NetHack-adjacent: attack vs defense moves a 15–92% band.
  */
@@ -148,15 +169,9 @@ export function meleeAttack(
   // adapter samples only rolls consumed by the old branch, then applies HP once.
   // Monster-initiated combat remains origin-only in this P0 slice.
   if (attacker.isPlayer && !defender.isPlayer) {
-    const transcript = legacyPlayerTranscript(attacker, defender, options);
-    const transition = reducePlayerMeleeV1(
-      combatSnapshot(attacker),
-      combatSnapshot(defender),
-      { weaponName: options.weaponName ?? null, hitPenalty: options.hitPenalty ?? 0, critChance: options.critChance ?? null },
-      transcript,
-    );
-    defender.hp = transition.defender.hp;
-    return transition;
+    const { result } = resolveLegacyPlayerMelee(attacker, defender, options);
+    defender.hp = result.defender.hp;
+    return result;
   }
   const atkEdge = attacker.attack - defender.defense;
   let hitChance = 0.62 + atkEdge * 0.04;
