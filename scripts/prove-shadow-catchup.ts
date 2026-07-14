@@ -903,6 +903,80 @@ try {
     combatRetryAcknowledgement: combatRetry,
   });
 
+  // Exercise the independently meaningful kill branch with the real origin
+  // random transcript and Worker route. Freeze only this isolated scenario's
+  // entropy so the proof remains deterministic; production never uses it.
+  const combatKillScenario = await createWorldScenario("combat-kill");
+  const combatKillStep = findOrdinaryStep(combatKillScenario.floor);
+  if (!combatKillStep) throw new Error("combat kill scenario has no ordinary step");
+  const combatKillTarget = { x: combatKillStep.x + combatKillStep.dx, y: combatKillStep.y + combatKillStep.dy };
+  const killMonster = createMonster("rat", combatKillTarget.x, combatKillTarget.y, combatKillScenario.floor.depth);
+  killMonster.hp = killMonster.maxHp = 1;
+  killMonster.defense = 0;
+  killMonster.attack = 1;
+  killMonster.traits = [];
+  killMonster.ai = "wander";
+  combatKillScenario.floor.monsters = [killMonster];
+  combatKillScenario.player.state.entity.x = combatKillStep.x;
+  combatKillScenario.player.state.entity.y = combatKillStep.y;
+  combatKillScenario.player.state.entity.attack = 50;
+  const combatKillBefore = originSnapshot(combatKillScenario.player);
+  const savedRandom = Math.random;
+  try {
+    Math.random = () => 0;
+    combatKillScenario.world.handleInput(combatKillScenario.player.id, combatKillStep.key);
+  } finally {
+    Math.random = savedRandom;
+  }
+  const combatKillAfter = originSnapshot(combatKillScenario.player);
+  const combatKillStreamId = combatTurnJournalStreamId(
+    combatKillScenario.player.id,
+    movementJournalRunId(combatKillScenario.player.resumeToken!),
+    combatKillScenario.floor.movementAuthority!,
+  );
+  const [combatKillEnvelope, ...unexpectedCombatKillEnvelopes] = combatKillScenario.journal.readCombatTurnsAfter(
+    combatKillStreamId,
+    0,
+    64,
+  );
+  if (!combatKillEnvelope || unexpectedCombatKillEnvelopes.length > 0 ||
+      !combatKillEnvelope.targetKilled || combatKillEnvelope.terminal || killMonster.hp !== 0 ||
+      combatKillAfter.turns !== combatKillBefore.turns + 1 ||
+      combatKillAfter.x !== combatKillBefore.x || combatKillAfter.y !== combatKillBefore.y) {
+    throw new Error(`combat kill origin result mismatch: ${JSON.stringify({
+      combatKillBefore,
+      combatKillAfter,
+      killMonster,
+      combatKillEnvelope,
+      unexpectedCount: unexpectedCombatKillEnvelopes.length,
+    })}`);
+  }
+  const combatKillReplay = await catchUpCombatTurnJournal({
+    journal: combatKillScenario.journal,
+    streamId: combatKillStreamId,
+    route: combatKillEnvelope.route,
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    fetchImpl: harnessFetch,
+  });
+  if (!combatKillReplay.caughtUp || combatKillReplay.backpressured ||
+      combatKillReplay.checkpoint !== 1 || combatKillReplay.accepted !== 1 ||
+      combatKillReplay.duplicates !== 0 || combatKillReplay.terminal ||
+      combatKillReplay.lastEnvelopeHash !== combatKillEnvelope.envelopeHash ||
+      combatKillReplay.combatStateHash !== combatKillEnvelope.afterStateHash ||
+      combatKillReplay.turnStateHash !== combatKillEnvelope.turn.afterStateHash) {
+    throw new Error(`combat kill Worker parity failed: ${JSON.stringify(combatKillReplay)}`);
+  }
+  const combatKillProof = {
+    streamId: combatKillStreamId,
+    envelopeHash: combatKillEnvelope.envelopeHash,
+    targetKilled: combatKillEnvelope.targetKilled,
+    monsterHpAfter: killMonster.hp,
+    originBefore: combatKillBefore,
+    originAfter: combatKillAfter,
+    Worker: combatKillReplay,
+  };
+
   const trapScenario = await createWorldScenario("trap");
   const trapStep = findOrdinaryStep(trapScenario.floor);
   if (!trapStep) throw new Error("trap scenario has no ordinary step");
@@ -1202,6 +1276,7 @@ try {
       bounds: boundsProof,
       door: doorProof,
       combat: combatProof,
+      combatKill: combatKillProof,
       trap: trapProof,
       transfer: transferProof,
       terminal: terminalMovementProof,
