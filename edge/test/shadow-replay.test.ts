@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
 import { reduceMovement, type MovementState } from "../../src/movement-reducer";
-import { catchUpMovementTurnJournal } from "../../server/shadow-catchup";
+import { catchUpCombatTurnJournal, catchUpMovementTurnJournal } from "../../server/shadow-catchup";
 import {
   MAX_SHADOW_BATCH_BYTES,
   createMovementTurnEnvelope,
@@ -1115,6 +1115,46 @@ describe("ShadowReplay catch-up", () => {
       lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
       movementStateHash: envelopes.at(-1)!.movement.afterStateHash,
       turnStateHash: envelopes.at(-1)!.turn!.afterStateHash,
+      batches: 1,
+      caughtUp: true,
+      backpressured: false,
+    });
+  });
+
+  it("reconstructs a 300-combat envelope prefix against the evicted durable object", async () => {
+    const streamId = `combat_${"9".repeat(48)}`;
+    const envelopes = combatTurnTrace(streamId, 300);
+    for (let offset = 0; offset < envelopes.length; offset += 64) {
+      const response = await ingestCombatTurns(envelopes.slice(offset, offset + 64));
+      expect(response.status, `offset ${offset}: ${await response.clone().text()}`).toBe(200);
+    }
+    await evictDurableObject(stubFor(streamId));
+    const statuses: number[] = [];
+    const result = await catchUpCombatTurnJournal({
+      journal: {
+        readCombatTurnsAfter: (_streamId, cursor, limit) => envelopes.filter((envelope) => envelope.cursor > cursor).slice(0, limit),
+      },
+      streamId,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret: SECRET,
+      maxEntriesPerBatch: 64,
+      maxBatches: 2,
+      fetchImpl: async (input, init) => {
+        const response = await SELF.fetch(input, init);
+        statuses.push(response.status);
+        return response;
+      },
+    });
+    expect(statuses).toEqual([409]);
+    expect(result).toMatchObject({
+      checkpoint: 300,
+      accepted: 0,
+      duplicates: 0,
+      terminal: false,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      combatStateHash: envelopes.at(-1)!.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn.afterStateHash,
       batches: 1,
       caughtUp: true,
       backpressured: false,
