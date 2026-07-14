@@ -167,8 +167,11 @@ queue. The player, one/two floor snapshots, and a bounded operation receipt are
 written in one transaction. Each serialized writer transaction prunes any stale
 prior receipt before inserting its own, bounding application-managed receipts to
 one row even when post-marker cleanup repeatedly fails. Schema v2 retains its
-original composite-key table shape so both the earlier v2 writer and this writer
-remain physically compatible. The receipt
+original composite-key table shape. Startup also detects the unpublished
+single-slot v2 variant and selects its required insert shape without rewriting
+or dropping either database form. Original-v2 databases therefore remain
+compatible with the earlier writer, while temporary single-slot QA databases
+remain readable by this writer. The receipt
 binds the journal identity to a SHA-256
 of the exact stored player/floor rows; an exact retry is idempotent, while a
 conflicting or subsequently overwritten snapshot fails closed. After COMMIT,

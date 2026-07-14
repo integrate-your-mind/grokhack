@@ -20,6 +20,7 @@ let closing = false;
 let currentPath: string | null = null;
 let dbQueue: Promise<void> = Promise.resolve();
 let persistencePoisoned: Error | null = null;
+let movementTurnCommitUsesSlot = false;
 
 const playerTimers = new Map<string, NodeJS.Timeout>();
 const floorTimers = new Map<number, NodeJS.Timeout>();
@@ -216,6 +217,7 @@ export async function initPersistence(): Promise<void> {
   await run(`CREATE INDEX IF NOT EXISTS idx_chat_log_posted_at ON chat_log(posted_at);`);
 
   await applyMigrations();
+  movementTurnCommitUsesSlot = await movementTurnCommitTableUsesSlot();
 
   closing = false;
   ready = true;
@@ -284,6 +286,17 @@ async function applyMigrations(): Promise<void> {
       { applied_at: now },
     );
   }
+}
+
+async function movementTurnCommitTableUsesSlot(): Promise<boolean> {
+  const rows = await queryRows<{ count: number }>(`
+    SELECT COUNT(*)::INTEGER AS count
+      FROM information_schema.columns
+     WHERE table_schema = 'main'
+       AND table_name = 'movement_turn_commits'
+       AND column_name = 'slot'
+  `);
+  return Number(rows[0]?.count ?? 0) === 1;
 }
 
 export async function getSchemaVersion(): Promise<number> {
@@ -634,14 +647,30 @@ export async function saveMovementTurnNow(
         await connection.run(UPSERT_FLOOR_SQL, floorRows[index]!);
         crashHooks.afterFloorWrite?.(floor.depth, index);
       }
-      await connection.run(
-        `INSERT INTO movement_turn_commits (
-           stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
-         ) VALUES (
-           $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
-         )`,
-        { ...expectedReceipt, committed_at: Date.now() },
-      );
+      const receiptValues = { ...expectedReceipt, committed_at: Date.now() };
+      if (movementTurnCommitUsesSlot) {
+        // One unpublished schema-v2 branch briefly required a literal slot.
+        // Preserve that physical shape in place so its QA databases upgrade
+        // without a destructive rewrite; canonical v2 databases use the
+        // original composite-key insert below.
+        await connection.run(
+          `INSERT INTO movement_turn_commits (
+             slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           ) VALUES (
+             1, $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           )`,
+          receiptValues,
+        );
+      } else {
+        await connection.run(
+          `INSERT INTO movement_turn_commits (
+             stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           ) VALUES (
+             $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           )`,
+          receiptValues,
+        );
+      }
       crashHooks.afterCommitReceiptWrite?.();
       crashHooks.beforeCommit?.();
       await connection.run("COMMIT");
@@ -895,6 +924,7 @@ export async function closePersistence(): Promise<void> {
   closing = false;
   currentPath = null;
   persistencePoisoned = null;
+  movementTurnCommitUsesSlot = false;
 }
 
 /** @internal test helper */

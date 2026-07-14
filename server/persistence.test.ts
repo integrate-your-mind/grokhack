@@ -183,6 +183,66 @@ describe("duckdb persistence", () => {
     expect(await hasMovementTurnCommit(identity)).toBe(true);
   });
 
+  it("supports the transient single-slot schema-v2 table without rewriting it", async () => {
+    await closePersistence();
+    const transientV2 = await DuckDBInstance.create(testDbPath());
+    const transientV2Connection = await transientV2.connect();
+    await transientV2Connection.run(`DROP TABLE movement_turn_commits`);
+    await transientV2Connection.run(`
+      CREATE TABLE movement_turn_commits (
+        slot INTEGER PRIMARY KEY CHECK (slot = 1),
+        stream_id VARCHAR NOT NULL,
+        operation_id VARCHAR NOT NULL,
+        player_id VARCHAR NOT NULL,
+        floor_depth_1 INTEGER NOT NULL,
+        floor_depth_2 INTEGER,
+        snapshot_hash VARCHAR NOT NULL,
+        committed_at BIGINT NOT NULL,
+        UNIQUE (stream_id, operation_id)
+      )
+    `);
+    await transientV2Connection.run(`
+      INSERT INTO movement_turn_commits (
+        slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      ) VALUES (
+        1, 'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        '00000000-0000-4000-8000-00000000000d',
+        'transient-writer-player', 1, NULL,
+        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 1
+      )
+    `);
+    transientV2Connection.closeSync();
+
+    await initPersistence();
+    const player = samplePlayer("TransientV2Receipt");
+    const floor = {
+      depth: 2,
+      seed: 410,
+      dungeon: generateDungeon(new RNG(410), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000e");
+    await expect(saveMovementTurnNow(player, [floor], identity)).resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+
+    await closePersistence();
+    const preserved = await DuckDBInstance.create(testDbPath());
+    const preservedConnection = await preserved.connect();
+    const slotColumns = await preservedConnection.runAndReadAll(`
+      SELECT COUNT(*)::INTEGER AS count
+        FROM information_schema.columns
+       WHERE table_schema = 'main' AND table_name = 'movement_turn_commits' AND column_name = 'slot'
+    `);
+    expect(slotColumns.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    const receiptCount = await preservedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count FROM movement_turn_commits`,
+    );
+    expect(receiptCount.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    preservedConnection.closeSync();
+    await initPersistence();
+  });
+
   it("keeps the schema-v2 table writable by the previous receipt column list", async () => {
     await closePersistence();
     const previousWriter = await DuckDBInstance.create(testDbPath());
