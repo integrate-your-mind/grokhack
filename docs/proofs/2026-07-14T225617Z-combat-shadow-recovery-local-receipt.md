@@ -17,6 +17,7 @@
 | `node scripts/run-tests-isolated.mjs server/world-movement-shadow.test.ts server/origin-journal.test.ts` | passed: 2 files, 88 tests |
 | `node scripts/run-tests-isolated.mjs server/shadow-catchup.test.ts` | passed: 1 file, 22 tests |
 | `npm --prefix edge test -- --run test/shadow-replay.test.ts` | passed: 1 file, 34 tests |
+| `GROKHACK_REQUIRE_CLEAN_PROOF=1 npx tsx scripts/prove-shadow-catchup.ts` | passed on clean `8a592ee`; real WorldServer + persistent Worker harness proof |
 
 The root `npm test` run had one timeout in the pre-existing 5-second
 movement-turn segmentation test while Node, property, and edge full gates ran
@@ -38,6 +39,9 @@ node scripts/run-tests-isolated.mjs server/origin-journal.test.ts -t 'segments m
   receipt compaction, and Durable Object eviction are covered.
 - A 300-envelope combat prefix reconstructs against an evicted Durable Object
   only after the remote compacted checkpoint matches the local hash/state head.
+- The isolated Worker harness exercises real WorldServer bounds, doors, combat
+  intent, traps, transfer, terminal state, response loss, and 300-entry
+  compacted-checkpoint recovery against persistent Worker storage.
 
 ## Deliberate non-proofs / release blockers
 
