@@ -21,4 +21,25 @@ describe("reducePlayerMeleeV1", () => {
     expect(() => reducePlayerMeleeV1(attacker, defender, options, { hit: 0, crit: 0, variance: 0.5 })).toThrow("invalid_combat_transcript_hit");
     expect(() => reducePlayerMeleeV1(attacker, defender, options, { hit: Number.NaN, missFlavor: 0 })).toThrow("invalid_combat_transcript_hit");
   });
+
+  it("covers critical, swift, and nonlethal branches without implicit randomness", () => {
+    const critical = reducePlayerMeleeV1(
+      attacker,
+      { ...defender, hp: 100, maxHp: 100 },
+      { ...options, critChance: 1 },
+      { hit: 0, crit: 0, variance: 0.5, severityFlavor: 0 },
+    );
+    expect(critical).toMatchObject({ hit: true, critical: true, damage: 14, killed: false, defender: { hp: 86 } });
+    const swift = reducePlayerMeleeV1(
+      { ...attacker, traits: ["swift"] },
+      { ...defender, hp: 100, maxHp: 100 },
+      options,
+      { hit: 0, crit: 0.9, variance: 0.5, swiftSpike: 0, severityFlavor: 0 },
+    );
+    expect(swift).toMatchObject({ hit: true, critical: false, damage: 9, killed: false, defender: { hp: 91 } });
+    expect(() => reducePlayerMeleeV1(
+      { ...attacker, traits: ["swift"] }, defender, options,
+      { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+    )).toThrow("invalid_combat_transcript_swift");
+  });
 });
