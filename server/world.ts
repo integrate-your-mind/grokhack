@@ -1771,7 +1771,7 @@ export class WorldServer {
               movementJournalRunId(player.resumeToken ?? ""),
               movementState.authority,
             ),
-            route: movementState.authority,
+            route: { ...movementState.authority, rulesetVersion: 1 },
             operationId: randomUUID(),
             attacker: attackerSnapshot,
             defender: defenderSnapshot,
