@@ -20,7 +20,7 @@ import {
   WAND_TRUE_NAMES,
   weaponVerb,
 } from "./entities";
-import { reducePlayerMeleeV1, type CombatantSnapshotV1, type CombatRollTranscriptV1, type PlayerMeleeTransitionV1 } from "./combat-reducer";
+import { reducePlayerMeleeV1, type CombatantSnapshotV1, type CombatRollTranscriptV1, type PlayerMeleeTransitionV1 } from "./combat-reducer.js";
 
 export interface CombatResult {
   hit: boolean;
