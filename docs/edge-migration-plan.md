@@ -264,6 +264,18 @@ drift, and parity divergence fail visibly without silently advancing past the
 failing cursor. The copier's duration budget aborts both the request and response
 body read instead of merely checking time between pages.
 
+Movement-turn receipt compaction is an authenticated recovery boundary, not a
+blind cursor advance. When the Worker has pruned an old receipt, it returns its
+durable stream ID, checkpoint, terminal bit, and envelope/movement/turn head
+hashes with `cursor_compacted`. The Node copier reconstructs that exact prefix
+from the immutable origin journal and advances only when all values match; a
+missing, malformed, stale, nonzero-count, or mismatched head fails closed. This
+response shape is additive. During a mixed old-Worker/new-copier window the old
+Worker omits the proof tuple, so the new copier deliberately remains failed
+closed; rollout must update the Worker before enabling recovery beyond its
+receipt window. Rollback stops new copier admission and preserves the existing
+shadow head without deletion or in-place Durable Object rollback.
+
 This proves the ingestion/catch-up mechanism for vitals and movement decisions.
 It does not claim full-floor gameplay parity or edge movement authority: combat,
 monsters, item mutation, trap/room effects, durable position, and transfers must

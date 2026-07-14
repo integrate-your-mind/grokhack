@@ -960,7 +960,7 @@ try {
     hp: 999,
     alive: true,
   };
-  for (let cursor = 1; cursor <= 130; cursor++) {
+  for (let cursor = 1; cursor <= 300; cursor++) {
     const command = { type: "move", dx: cursor % 2 === 1 ? 1 : -1, dy: 0 } as const;
     const beforeState: MovementState = {
       ...bulkMovementState,
@@ -982,10 +982,10 @@ try {
     bulkGameplayState = reduceGameplay(bulkGameplayState, turnCommand).state;
   }
   const bulkPageBoundaryEnvelope = bulkJournal.readMovementTurnsAfter(bulkStreamId, 63, 1)[0];
-  const bulkFinalEnvelope = bulkJournal.readMovementTurnsAfter(bulkStreamId, 129, 1)[0];
+  const bulkFinalEnvelope = bulkJournal.readMovementTurnsAfter(bulkStreamId, 299, 1)[0];
   if (!bulkPageBoundaryEnvelope || bulkPageBoundaryEnvelope.cursor !== 64 ||
-      !bulkFinalEnvelope || bulkFinalEnvelope.cursor !== 130) {
-    throw new Error("bulk origin journal did not preserve the 64/130 page boundaries");
+      !bulkFinalEnvelope || bulkFinalEnvelope.cursor !== 300) {
+    throw new Error("bulk origin journal did not preserve the 64/300 page boundaries");
   }
   const bulkFirstAcknowledgementHolder: { value: Record<string, unknown> | null } = { value: null };
   let bulkResponseLossObserved = false;
@@ -1032,13 +1032,13 @@ try {
     secret,
     cursor: 0,
     maxEntriesPerBatch: 64,
-    maxBatches: 4,
+    maxBatches: 5,
     maxDurationMs: 60_000,
     fetchImpl: harnessFetch,
   });
-  const reloadStoragePreserved = bulkRetry.duplicates === 64 && bulkRetry.accepted === 66;
-  const reloadStorageRecreated = bulkRetry.duplicates === 0 && bulkRetry.accepted === 130;
-  if (!bulkRetry.caughtUp || bulkRetry.backpressured || bulkRetry.checkpoint !== 130 ||
+  const reloadStoragePreserved = bulkRetry.duplicates === 64 && bulkRetry.accepted === 236;
+  const reloadStorageRecreated = bulkRetry.duplicates === 0 && bulkRetry.accepted === 300;
+  if (!bulkRetry.caughtUp || bulkRetry.backpressured || bulkRetry.checkpoint !== 300 ||
       (!reloadStoragePreserved && !reloadStorageRecreated) ||
       bulkRetry.lastEnvelopeHash !== bulkFinalEnvelope.envelopeHash ||
       bulkRetry.movementStateHash !== bulkFinalEnvelope.movement.afterStateHash ||
@@ -1048,9 +1048,30 @@ try {
   if (reloadStoragePreserved && !durableObjectIdsPreserved) {
     throw new Error("bulk reload retained receipts but lost the Durable Object storage identity listing");
   }
+  const bulkCompactedRecovery = await catchUpMovementTurnJournal({
+    journal: bulkJournal,
+    streamId: bulkStreamId,
+    route: bulkRoute,
+    endpoint: "http://worker.local/internal/shadow/catch-up",
+    secret,
+    cursor: 0,
+    maxEntriesPerBatch: 64,
+    maxBatches: 2,
+    maxDurationMs: 60_000,
+    fetchImpl: harnessFetch,
+  });
+  if (!bulkCompactedRecovery.caughtUp || bulkCompactedRecovery.backpressured ||
+      bulkCompactedRecovery.checkpoint !== 300 || bulkCompactedRecovery.accepted !== 0 ||
+      bulkCompactedRecovery.duplicates !== 0 ||
+      bulkCompactedRecovery.lastEnvelopeHash !== bulkFinalEnvelope.envelopeHash ||
+      bulkCompactedRecovery.movementStateHash !== bulkFinalEnvelope.movement.afterStateHash ||
+      bulkCompactedRecovery.turnStateHash !== bulkFinalEnvelope.turn?.afterStateHash ||
+      bulkCompactedRecovery.terminal) {
+    throw new Error(`bulk compacted checkpoint recovery failed: ${JSON.stringify(bulkCompactedRecovery)}`);
+  }
   const bulkProof = {
     streamId: bulkStreamId,
-    envelopes: 130,
+    envelopes: 300,
     pageSize: 64,
     responseLossObserved: bulkResponseLossObserved,
     firstHiddenAcknowledgement: bulkFirstAcknowledgement,
@@ -1065,6 +1086,7 @@ try {
       requestedDuplicateProofSatisfied: reloadStoragePreserved,
     },
     retryFromCursorZero: bulkRetry,
+    compactedCheckpointRecovery: bulkCompactedRecovery,
     finalEnvelopeHash: bulkFinalEnvelope.envelopeHash,
     finalMovementStateHash: bulkFinalEnvelope.movement.afterStateHash,
     finalTurnStateHash: bulkFinalEnvelope.turn?.afterStateHash ?? null,

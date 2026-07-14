@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { reduceGameplay, type GameplayState } from "../../src/gameplay-reducer";
 import { reduceMovement, type MovementState } from "../../src/movement-reducer";
+import { catchUpMovementTurnJournal } from "../../server/shadow-catchup";
 import {
   MAX_SHADOW_BATCH_BYTES,
   createMovementTurnEnvelope,
@@ -940,13 +941,71 @@ describe("ShadowReplay catch-up", () => {
     expect(compacted.status).toBe(409);
     await expect(compacted.json()).resolves.toMatchObject({
       code: "cursor_compacted",
+      streamId,
       checkpoint: 300,
       cursor: 1,
+      accepted: 0,
+      duplicates: 0,
+      terminal: false,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      movementStateHash: envelopes.at(-1)!.movement.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn!.afterStateHash,
+    });
+    await evictDurableObject(stubFor(streamId));
+    const compactedAfterEviction = await ingestMovementTurns([envelopes[0]!]);
+    expect(compactedAfterEviction.status).toBe(409);
+    await expect(compactedAfterEviction.json()).resolves.toMatchObject({
+      code: "cursor_compacted",
+      streamId,
+      checkpoint: 300,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      movementStateHash: envelopes.at(-1)!.movement.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn!.afterStateHash,
     });
     await expect((await ingestMovementTurns([envelopes.at(-1)!])).json()).resolves.toMatchObject({
       checkpoint: 300,
       accepted: 0,
       duplicates: 1,
+    });
+  });
+
+  it("recovers a local 300-envelope prefix after receipt compaction and actual eviction", async () => {
+    const streamId = `turn_${"9".repeat(48)}`;
+    const envelopes = movementTurnTrace(streamId, 300);
+    for (let offset = 0; offset < envelopes.length; offset += 64) {
+      const response = await ingestMovementTurns(envelopes.slice(offset, offset + 64));
+      expect(response.status, `offset ${offset}: ${await response.clone().text()}`).toBe(200);
+    }
+    await evictDurableObject(stubFor(streamId));
+    const statuses: number[] = [];
+    const result = await catchUpMovementTurnJournal({
+      journal: {
+        readMovementTurnsAfter: (_streamId, cursor, limit) => envelopes.filter((envelope) => envelope.cursor > cursor).slice(0, limit),
+      },
+      streamId,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret: SECRET,
+      maxEntriesPerBatch: 64,
+      maxBatches: 2,
+      fetchImpl: async (input, init) => {
+        const response = await SELF.fetch(input, init);
+        statuses.push(response.status);
+        return response;
+      },
+    });
+    expect(statuses).toEqual([409]);
+    expect(result).toMatchObject({
+      checkpoint: 300,
+      accepted: 0,
+      duplicates: 0,
+      terminal: false,
+      lastEnvelopeHash: envelopes.at(-1)!.envelopeHash,
+      movementStateHash: envelopes.at(-1)!.movement.afterStateHash,
+      turnStateHash: envelopes.at(-1)!.turn!.afterStateHash,
+      batches: 1,
+      caughtUp: true,
+      backpressured: false,
     });
   });
 

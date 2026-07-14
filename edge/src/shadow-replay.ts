@@ -97,6 +97,16 @@ type MovementTurnIngestSuccess = {
   turnStateHash: string | null;
 };
 
+type MovementTurnIngestFailure = IngestFailure & {
+  streamId?: string;
+  accepted?: number;
+  duplicates?: number;
+  terminal?: boolean;
+  lastEnvelopeHash?: string | null;
+  movementStateHash?: string | null;
+  turnStateHash?: string | null;
+};
+
 function firstRow<T>(rows: Iterable<T>): T | undefined {
   for (const row of rows) return row;
   return undefined;
@@ -351,6 +361,27 @@ export class ShadowReplay extends DurableObject<Env> {
     };
   }
 
+  // A compacted receipt cannot prove an old retry by itself. Return the
+  // durable head so an authenticated copier can reconstruct its local prefix
+  // and prove the remote state before it skips forward.
+  private movementTurnCompactedCheckpoint(streamId: string, cursor: number): MovementTurnIngestFailure {
+    const checkpoint = this.movementTurnCheckpoint(streamId);
+    return {
+      ok: false,
+      code: "cursor_compacted",
+      streamId,
+      checkpoint: checkpoint.checkpoint,
+      expectedCursor: checkpoint.checkpoint + 1,
+      cursor,
+      accepted: 0,
+      duplicates: 0,
+      terminal: checkpoint.terminal === 1,
+      lastEnvelopeHash: checkpoint.last_envelope_hash,
+      movementStateHash: checkpoint.movement_state_hash,
+      turnStateHash: checkpoint.turn_state_hash,
+    };
+  }
+
   private recordDivergence(
     entry: ShadowJournalEntry,
     kind: "state" | "event" | "continuity_before" | "continuity_after" | "terminal",
@@ -463,7 +494,7 @@ export class ShadowReplay extends DurableObject<Env> {
   private ingestMovementTurns(
     envelopes: readonly MovementTurnEnvelope[],
     route: ShadowRoute,
-  ): MovementTurnIngestSuccess | IngestFailure {
+  ): MovementTurnIngestSuccess | MovementTurnIngestFailure {
     return this.ctx.storage.transactionSync(() => {
       const streamId = envelopes[0]!.streamId;
       if (!this.bindIdentity(route, streamId)) {
@@ -523,13 +554,7 @@ export class ShadowReplay extends DurableObject<Env> {
         }
         const expectedCursor = checkpoint.checkpoint + 1;
         if (envelope.cursor <= checkpoint.checkpoint - SHADOW_RECEIPT_WINDOW) {
-          return {
-            ok: false,
-            code: "cursor_compacted",
-            checkpoint: committedCheckpoint,
-            expectedCursor,
-            cursor: envelope.cursor,
-          };
+          return this.movementTurnCompactedCheckpoint(streamId, envelope.cursor);
         }
         if (envelope.cursor !== expectedCursor) {
           return {

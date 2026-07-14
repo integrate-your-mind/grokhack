@@ -1,9 +1,17 @@
 import {
   MAX_SHADOW_BATCH_ENTRIES,
   type MovementTurnEnvelope,
+  type ShadowJournalEntry,
   type ShadowRoute,
 } from "../src/shadow-journal.js";
-import type { OriginGameplayJournal } from "./origin-journal.js";
+
+interface ShadowJournalReader {
+  readAfter(streamId: string, cursor: number, limit: number): readonly ShadowJournalEntry[];
+}
+
+interface MovementTurnJournalReader {
+  readMovementTurnsAfter(streamId: string, cursor: number, limit: number): readonly MovementTurnEnvelope[];
+}
 
 export interface ShadowCatchupCheckpoint {
   streamId: string;
@@ -118,13 +126,22 @@ function parseMovementTurnCheckpoint(value: unknown): MovementTurnCatchupCheckpo
   return candidate as MovementTurnCatchupCheckpoint;
 }
 
+function compactedMovementTurnCheckpoint(value: unknown, streamId: string, currentCheckpoint: number): MovementTurnResumeState {
+  const checkpoint = parseMovementTurnCheckpoint(value);
+  if (checkpoint.streamId !== streamId || checkpoint.accepted !== 0 || checkpoint.duplicates !== 0 ||
+      checkpoint.checkpoint <= currentCheckpoint) {
+    throw new Error("invalid movement-turn compacted checkpoint");
+  }
+  return checkpoint;
+}
+
 type MovementTurnResumeState = Pick<
   MovementTurnCatchupCheckpoint,
   "checkpoint" | "terminal" | "lastEnvelopeHash" | "movementStateHash" | "turnStateHash"
 >;
 
 function advanceMovementTurnResumeState(
-  journal: Pick<OriginGameplayJournal, "readMovementTurnsAfter">,
+  journal: MovementTurnJournalReader,
   streamId: string,
   initial: MovementTurnResumeState,
   targetCheckpoint: number,
@@ -152,7 +169,7 @@ function advanceMovementTurnResumeState(
 }
 
 export async function catchUpOriginJournal(options: {
-  journal: Pick<OriginGameplayJournal, "readAfter">;
+  journal: ShadowJournalReader;
   streamId: string;
   route: ShadowRoute;
   endpoint: string;
@@ -246,7 +263,7 @@ export async function catchUpOriginJournal(options: {
 }
 
 export async function catchUpMovementTurnJournal(options: {
-  journal: Pick<OriginGameplayJournal, "readMovementTurnsAfter">;
+  journal: MovementTurnJournalReader;
   streamId: string;
   route: ShadowRoute;
   endpoint: string;
@@ -293,7 +310,7 @@ export async function catchUpMovementTurnJournal(options: {
     if (now() - startedAt >= maxDurationMs) {
       return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, movementStateHash, turnStateHash, batches, caughtUp: false, backpressured: true };
     }
-    const envelopes: MovementTurnEnvelope[] = options.journal.readMovementTurnsAfter(options.streamId, checkpoint, limit);
+    const envelopes = options.journal.readMovementTurnsAfter(options.streamId, checkpoint, limit);
     if (!envelopes.length) {
       return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, movementStateHash, turnStateHash, batches, caughtUp: true, backpressured: false };
     }
@@ -322,6 +339,35 @@ export async function catchUpMovementTurnJournal(options: {
     }
     if (!response.ok) {
       const failure = body && typeof body === "object" ? body as { code?: unknown; checkpoint?: unknown } : {};
+      if (response.status === 409 && failure.code === "cursor_compacted") {
+        let acknowledged: MovementTurnResumeState;
+        try {
+          const remote = compactedMovementTurnCheckpoint(body, options.streamId, checkpoint);
+          acknowledged = advanceMovementTurnResumeState(
+            options.journal,
+            options.streamId,
+            { checkpoint, terminal, lastEnvelopeHash, movementStateHash, turnStateHash },
+            remote.checkpoint,
+          );
+          if (acknowledged.terminal !== remote.terminal ||
+              acknowledged.lastEnvelopeHash !== remote.lastEnvelopeHash ||
+              acknowledged.movementStateHash !== remote.movementStateHash ||
+              acknowledged.turnStateHash !== remote.turnStateHash) {
+            throw new Error("checkpoint proof mismatch");
+          }
+        } catch {
+          throw new Error("invalid movement-turn compacted checkpoint");
+        }
+        checkpoint = acknowledged.checkpoint;
+        terminal = acknowledged.terminal;
+        lastEnvelopeHash = acknowledged.lastEnvelopeHash;
+        movementStateHash = acknowledged.movementStateHash;
+        turnStateHash = acknowledged.turnStateHash;
+        if (terminal) {
+          return { streamId: options.streamId, checkpoint, accepted, duplicates, terminal, lastEnvelopeHash, movementStateHash, turnStateHash, batches: batches + 1, caughtUp: true, backpressured: false };
+        }
+        continue;
+      }
       throw new ShadowCatchupError(response.status, Number.isSafeInteger(failure.checkpoint) ? Number(failure.checkpoint) : checkpoint, typeof failure.code === "string" ? failure.code : "unknown_error");
     }
     const result = parseMovementTurnCheckpoint(body);

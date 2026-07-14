@@ -309,6 +309,64 @@ describe("catchUpMovementTurnJournal", () => {
     });
   });
 
+  it("recovers from a compacted receipt only when the durable head matches local history", async () => {
+    let requests = 0;
+    const result = await catchUpMovementTurnJournal({
+      journal: movementTurnSource([firstMovementTurn, secondMovementTurn]),
+      streamId: movementTurnStream,
+      route,
+      endpoint: "https://edge.test/internal/shadow/catch-up",
+      secret,
+      maxEntriesPerBatch: 1,
+      fetchImpl: async (_url, init) => {
+        requests++;
+        const body = JSON.parse(String(init?.body)) as { envelopes: MovementTurnEnvelope[] };
+        if (requests === 1) {
+          expect(body.envelopes.map((envelope) => envelope.cursor)).toEqual([1]);
+          return Response.json({
+            code: "cursor_compacted", streamId: movementTurnStream, checkpoint: 1, accepted: 0, duplicates: 0,
+            terminal: false, lastEnvelopeHash: firstMovementTurn.envelopeHash,
+            movementStateHash: firstMovementTurn.movement.afterStateHash,
+            turnStateHash: firstMovementTurn.turn?.afterStateHash ?? null,
+          }, { status: 409 });
+        }
+        expect(body.envelopes.map((envelope) => envelope.cursor)).toEqual([2]);
+        return Response.json({
+          streamId: movementTurnStream, checkpoint: 2, accepted: 1, duplicates: 0, terminal: false,
+          lastEnvelopeHash: secondMovementTurn.envelopeHash,
+          movementStateHash: secondMovementTurn.movement.afterStateHash,
+          turnStateHash: secondMovementTurn.turn?.afterStateHash ?? null,
+        });
+      },
+    });
+    expect(requests).toBe(2);
+    expect(result).toMatchObject({ checkpoint: 2, accepted: 1, duplicates: 0, caughtUp: true });
+
+    const durableHead = {
+      code: "cursor_compacted", streamId: movementTurnStream, checkpoint: 1, accepted: 0, duplicates: 0,
+      terminal: false, lastEnvelopeHash: firstMovementTurn.envelopeHash,
+      movementStateHash: firstMovementTurn.movement.afterStateHash,
+      turnStateHash: firstMovementTurn.turn?.afterStateHash ?? null,
+    };
+    const tamperedHeads = [
+      { ...durableHead, streamId: `turn_${"b".repeat(48)}` },
+      { ...durableHead, checkpoint: 0 },
+      { ...durableHead, accepted: 1 },
+      { ...durableHead, duplicates: 1 },
+      { ...durableHead, terminal: true },
+      { ...durableHead, lastEnvelopeHash: "0000000000000000" },
+      { ...durableHead, movementStateHash: "0000000000000000" },
+      { ...durableHead, turnStateHash: "0000000000000000" },
+    ];
+    for (const response of tamperedHeads) {
+      await expect(catchUpMovementTurnJournal({
+        journal: movementTurnSource([firstMovementTurn, secondMovementTurn]), streamId: movementTurnStream, route,
+        endpoint: "https://edge.test/internal/shadow/catch-up", secret,
+        fetchImpl: async () => Response.json(response, { status: 409 }),
+      })).rejects.toThrow("invalid movement-turn compacted checkpoint");
+    }
+  });
+
   it("resumes at a no-turn envelope with the prior durable turn-state hash", async () => {
     const result = await catchUpMovementTurnJournal({
       journal: movementTurnSource([firstMovementTurn, noTurnMovement]),
