@@ -23,5 +23,9 @@ describe("combat turn envelope", () => {
     expect(envelope).toMatchObject({ targetKilled: true, terminal: false, beforeStateHash: expect.stringMatching(/^[0-9a-f]{16}$/u) });
     expect(() => validateCombatTurnEnvelopeV1({ ...envelope, transcript: { ...envelope.transcript, variance: 0 } })).toThrow("invalid_combat_transcript_nonlethal");
     expect(() => validateCombatTurnEnvelopeV1({ ...envelope, transcript: { ...envelope.transcript, extra: 0 } })).toThrow("invalid_combat_transcript_keys");
+    expect(() => validateCombatTurnEnvelopeV1({
+      ...envelope,
+      turn: { ...envelope.turn, streamId: "wrong_vitals_stream" },
+    })).toThrow("invalid_combat_turn_envelope");
   });
 });
