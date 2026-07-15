@@ -32,6 +32,7 @@ const LOCATION_HINTS = new Set<DurableObjectLocationHint>([
   "me",
 ]);
 const HUNGER_STATES = new Set(["satiated", "normal", "hungry", "weak", "fainting", "starving"]);
+const PLAYER_SESSION_SCHEMA_VERSION = 2;
 const MAX_JOIN_OPERATION_RECEIPTS = 64;
 export const MAX_TRANSFER_OPERATION_RECEIPTS = 256;
 export const MAX_TRANSFER_RECEIPTS = DEDUPE_WINDOW_PER_SESSION;
@@ -184,7 +185,8 @@ export type SessionFailure = {
     | "target_prepare_unavailable"
     | "target_not_activated"
     | "target_activation_unavailable"
-    | "abort_in_progress";
+    | "abort_in_progress"
+    | "player_session_schema_incompatible";
   version?: number;
 };
 
@@ -236,6 +238,10 @@ interface OperationRow extends Record<string, SqlStorageValue> {
 
 interface TableColumnRow extends Record<string, SqlStorageValue> {
   name: string;
+}
+
+interface VersionRow extends Record<string, SqlStorageValue> {
+  version: number | null;
 }
 
 function firstRow<T>(rows: Iterable<T>): T | undefined {
@@ -437,13 +443,36 @@ export async function deriveTargetControlToken(input: PrepareTransferRequest): P
 }
 
 export class PlayerSession extends DurableObject<Env> {
+  private readonly schemaCompatible: boolean;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.initializeSchema();
+    this.schemaCompatible = this.initializeSchema();
   }
 
-  private initializeSchema(): void {
-    this.ctx.storage.sql.exec(`
+  private initializeSchema(): boolean {
+    const migrationTable = firstRow(
+      this.ctx.storage.sql.exec<{ name: string }>(
+        `SELECT name FROM sqlite_schema
+         WHERE type = 'table' AND name = '_player_session_schema_migrations'`,
+      ),
+    );
+    if (migrationTable) {
+      const maximumVersion = firstRow(
+        this.ctx.storage.sql.exec<VersionRow>(
+          "SELECT MAX(version) AS version FROM _player_session_schema_migrations",
+        ),
+      )?.version;
+      if (
+        maximumVersion !== null &&
+        maximumVersion !== undefined &&
+        maximumVersion > PLAYER_SESSION_SCHEMA_VERSION
+      ) {
+        return false;
+      }
+    }
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS _player_session_schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at INTEGER NOT NULL
@@ -508,7 +537,7 @@ export class PlayerSession extends DurableObject<Env> {
 
       CREATE INDEX IF NOT EXISTS session_operations_created
         ON session_operations(created_at DESC);
-    `);
+      `);
     const stateColumns = new Set(
       this.ctx.storage.sql
         .exec<TableColumnRow>("PRAGMA table_info(session_state)")
@@ -559,9 +588,14 @@ export class PlayerSession extends DurableObject<Env> {
       INSERT OR IGNORE INTO _player_session_schema_migrations (version, applied_at)
         VALUES (2, unixepoch());
     `);
+      return true;
+    });
   }
 
   async authorizeJoin(input: AuthorizeJoinRequest): Promise<AuthorizeJoinResult> {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     const environment = String(this.env.EDGE_ENVIRONMENT || "");
     if (!validJoinRequest(input, environment)) return { ok: false, code: "invalid_request" };
     if (!this.objectIdentityMatches(environment, input.playerId)) {
@@ -770,6 +804,9 @@ export class PlayerSession extends DurableObject<Env> {
   }
 
   async freezeTransfer(input: FreezeTransferRequest): Promise<TransferResult> {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     const environment = String(this.env.EDGE_ENVIRONMENT || "");
     if (
       !validEnvironmentIdentity(input.environment, input.playerId, environment) ||
@@ -967,6 +1004,9 @@ export class PlayerSession extends DurableObject<Env> {
   }
 
   async prepareTransfer(input: PrepareTransferRequest): Promise<TransferResult> {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     const environment = String(this.env.EDGE_ENVIRONMENT || "");
     const targetFence: SessionAuthorityFence = {
       playerId: input.playerId,
@@ -1144,10 +1184,16 @@ export class PlayerSession extends DurableObject<Env> {
   }
 
   commitTransfer(input: CommitTransferRequest): TransferResult {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     return this.commitPreparedTransfer(input);
   }
 
   async abortTransfer(input: AbortTransferRequest): Promise<TransferResult> {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     const environment = String(this.env.EDGE_ENVIRONMENT || "");
     if (
       !validEnvironmentIdentity(input.environment, input.playerId, environment) ||
@@ -1306,6 +1352,9 @@ export class PlayerSession extends DurableObject<Env> {
   }
 
   async activateTransfer(input: ActivateTransferRequest): Promise<TransferResult> {
+    if (!this.schemaCompatible) {
+      return { ok: false, code: "player_session_schema_incompatible" };
+    }
     const environment = String(this.env.EDGE_ENVIRONMENT || "");
     if (
       !validEnvironmentIdentity(input.environment, input.playerId, environment) ||
@@ -1466,6 +1515,9 @@ export class PlayerSession extends DurableObject<Env> {
         } | null;
       })
     | null {
+    if (!this.schemaCompatible) {
+      throw new Error("player_session_schema_incompatible");
+    }
     const state = this.getState();
     if (!state) return null;
     const transfer = this.getTransfer();
@@ -1491,6 +1543,10 @@ export class PlayerSession extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (!this.schemaCompatible) {
+      console.error(JSON.stringify({ event: "player_session_alarm_schema_incompatible" }));
+      return;
+    }
     const transfer = this.getTransfer();
     if (transfer?.abort_status === "in_progress") {
       const playerId = this.ctx.id.name?.split(":").at(-1) ?? "";

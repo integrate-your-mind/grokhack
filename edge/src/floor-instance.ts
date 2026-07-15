@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { gameplayStateHash, reduceGameplay } from "../../src/gameplay-reducer";
+import { movementStateHash, reduceMovement } from "../../src/movement-reducer";
 
 import type {
   FloorCapacityResult,
@@ -13,6 +14,12 @@ import type {
   TransferHandoff,
   TransferResult,
 } from "./player-session";
+import {
+  buildFloorBootstrap,
+  FLOOR_GENERATOR_VERSION,
+  FLOOR_SIMULATION_PROFILE,
+  supportsFloorGeneratorVersion,
+} from "./floor-bootstrap";
 import { MAX_TRANSFER_HANDOFF_BYTES, MAX_TRANSFER_RECEIPTS } from "./player-session";
 import {
   DEDUPE_WINDOW_PER_SESSION,
@@ -34,6 +41,17 @@ const JOIN_EXPIRED_CLOSE_CODE = 4_003;
 const RATE_LIMIT_CLOSE_CODE = 4_008;
 const FLOOR_OVERLOAD_CLOSE_CODE = 1_013;
 const PROBE_REQUEST_HASH = "slo_probe:v1";
+const FLOOR_SCHEMA_VERSION = 7;
+const FLOOR_IDENTITY_RE =
+  /^floor:v1:([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?):i([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?):d([1-9]|1[0-5]):e([1-9][0-9]{0,15})$/u;
+const HUNGER_STATES = new Set([
+  "satiated",
+  "normal",
+  "hungry",
+  "weak",
+  "fainting",
+  "starving",
+]);
 const frameEncoder = new TextEncoder();
 const frameScratch = new Uint8Array(MAX_INBOUND_FRAME_BYTES + 1);
 
@@ -96,6 +114,62 @@ interface GameplayRow extends Record<string, SqlStorageValue> {
   alive: number;
 }
 
+interface MovementCellRow extends Record<string, SqlStorageValue> {
+  tile: "#" | "." | ">" | "<" | "+";
+  trap: number;
+  stairs_down: number;
+  item_present: number;
+  room_effect: number;
+}
+
+interface PlayerPositionRow extends Record<string, SqlStorageValue> {
+  x: number;
+  y: number;
+  phase: "playing" | "inventory" | "dead" | "won";
+  immobilized_turns: number;
+  present: number;
+}
+
+interface FloorWorldRow extends Record<string, SqlStorageValue> {
+  status: "ready";
+  generator_version: number;
+  ruleset_version: number;
+  simulation_profile: string;
+  seed: number;
+  width: number;
+  height: number;
+  entry_x: number;
+  entry_y: number;
+  cell_count: number;
+  map_hash: string;
+}
+
+interface SpawnCellRow extends Record<string, SqlStorageValue> {
+  x: number;
+  y: number;
+}
+
+interface FloorCellIntegrityRow extends Record<string, SqlStorageValue> {
+  cell_count: number;
+  minimum_x: number | null;
+  maximum_x: number | null;
+  minimum_y: number | null;
+  maximum_y: number | null;
+  spawn_count: number;
+  entry_spawn_count: number;
+}
+
+interface PersistedBootstrapCellRow extends Record<string, SqlStorageValue> {
+  x: number;
+  y: number;
+  tile: "#" | "." | ">" | "<" | "+";
+  spawn_rank: number | null;
+}
+
+interface VersionRow extends Record<string, SqlStorageValue> {
+  version: number | null;
+}
+
 interface TransferExportRow extends Record<string, SqlStorageValue> {
   request_identity: string;
   response_json: string;
@@ -148,7 +222,21 @@ interface TableColumnRow extends Record<string, SqlStorageValue> {
 }
 
 type ActivationResult =
-  | { ok: true; expectedClientSeq: number }
+  | {
+      ok: true;
+      expectedClientSeq: number;
+      position?: { x: number; y: number };
+      movementProfile?: string;
+      availableMoves?: ReadonlyArray<{ dx: number; dy: number }>;
+    }
+  | { ok: false; code: string };
+
+type FloorReadyResult =
+  | { ok: true; world: FloorWorldRow }
+  | { ok: false; code: string };
+
+type MovementPositionResult =
+  | { ok: true; position: { x: number; y: number } }
   | { ok: false; code: string };
 
 type ProbeResult =
@@ -156,6 +244,56 @@ type ProbeResult =
   | { ok: false; code: string; expectedClientSeq?: number };
 
 const WAIT_REQUEST_HASH = "input:wait:v1";
+
+function moveRequestHash(dx: number, dy: number): string {
+  return `input:move:v1:${dx}:${dy}`;
+}
+
+function movementAuthorityFor(attachment: SocketAttachment): {
+  realmId: string;
+  floorInstanceId: string;
+  depth: number;
+  floorEpoch: number;
+  rulesetVersion: number;
+} | null {
+  const match = FLOOR_IDENTITY_RE.exec(attachment.floorObjectName);
+  if (!match) return null;
+  const depth = Number(match[3]);
+  const floorEpoch = Number(match[4]);
+  if (depth !== attachment.depth || !Number.isSafeInteger(floorEpoch)) return null;
+  return {
+    realmId: match[1]!,
+    floorInstanceId: match[2]!,
+    depth,
+    floorEpoch,
+    rulesetVersion: 1,
+  };
+}
+
+function validMovementCell(cell: MovementCellRow): boolean {
+  return (
+    (cell.tile === "#" || cell.tile === "." || cell.tile === ">" ||
+      cell.tile === "<" || cell.tile === "+") &&
+    (cell.trap === 0 || cell.trap === 1) &&
+    (cell.stairs_down === 0 || cell.stairs_down === 1) &&
+    (cell.item_present === 0 || cell.item_present === 1) &&
+    (cell.room_effect === 0 || cell.room_effect === 1)
+  );
+}
+
+function validGameplayRow(row: GameplayRow): boolean {
+  return (
+    Number.isSafeInteger(row.turns) &&
+    row.turns >= 0 &&
+    Number.isSafeInteger(row.hunger) &&
+    row.hunger >= 0 &&
+    Number.isSafeInteger(row.max_hunger) &&
+    row.max_hunger > 0 &&
+    HUNGER_STATES.has(row.hunger_state) &&
+    Number.isSafeInteger(row.hp) &&
+    (row.alive === 0 || row.alive === 1)
+  );
+}
 
 export interface FloorTransferRequest extends SessionAuthorityFence {
   transferId: string;
@@ -370,6 +508,7 @@ function messageExceedsLimit(message: string | ArrayBuffer): boolean {
 export class FloorInstance extends DurableObject<Env> {
   private readonly config: EdgeConfig;
   private readonly bindings: Env;
+  private readonly schemaCompatible: boolean;
   private floorEventTokens: number;
   private floorEventRefilledAt: number;
 
@@ -379,11 +518,31 @@ export class FloorInstance extends DurableObject<Env> {
     this.config = requireEdgeConfig(env);
     this.floorEventTokens = this.config.floorEventBurst;
     this.floorEventRefilledAt = Date.now();
-    this.initializeSchema();
+    this.schemaCompatible = this.initializeSchema();
   }
 
-  private initializeSchema(): void {
-    this.ctx.storage.sql.exec(`
+  private initializeSchema(): boolean {
+    const migrationTable = firstRow(
+      this.ctx.storage.sql.exec<NameRow>(
+        "SELECT name AS object_name FROM sqlite_master WHERE type = 'table' AND name = '_sql_schema_migrations'",
+      ),
+    );
+    if (migrationTable) {
+      const maximumVersion = firstRow(
+        this.ctx.storage.sql.exec<VersionRow>(
+          "SELECT MAX(version) AS version FROM _sql_schema_migrations",
+        ),
+      )?.version;
+      if (
+        maximumVersion !== null &&
+        maximumVersion !== undefined &&
+        maximumVersion > FLOOR_SCHEMA_VERSION
+      ) {
+        return false;
+      }
+    }
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at INTEGER NOT NULL
@@ -408,6 +567,21 @@ export class FloorInstance extends DurableObject<Env> {
       );
       INSERT OR IGNORE INTO floor_lifecycle
         (singleton, state, version, updated_at) VALUES (1, 'active', 1, unixepoch());
+
+      CREATE TABLE IF NOT EXISTS floor_world (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        status TEXT NOT NULL CHECK (status = 'ready'),
+        generator_version INTEGER NOT NULL CHECK (generator_version > 0),
+        ruleset_version INTEGER NOT NULL CHECK (ruleset_version > 0),
+        simulation_profile TEXT NOT NULL,
+        seed INTEGER NOT NULL CHECK (seed > 0),
+        width INTEGER NOT NULL CHECK (width > 0),
+        height INTEGER NOT NULL CHECK (height > 0),
+        entry_x INTEGER NOT NULL CHECK (entry_x >= 0),
+        entry_y INTEGER NOT NULL CHECK (entry_y >= 0),
+        cell_count INTEGER NOT NULL CHECK (cell_count > 0),
+        map_hash TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS sessions (
         player_id TEXT PRIMARY KEY,
@@ -453,6 +627,37 @@ export class FloorInstance extends DurableObject<Env> {
         alive INTEGER NOT NULL CHECK (alive IN (0, 1))
       ) WITHOUT ROWID;
 
+      CREATE TABLE IF NOT EXISTS floor_cells (
+        x INTEGER NOT NULL CHECK (x >= 0),
+        y INTEGER NOT NULL CHECK (y >= 0),
+        tile TEXT NOT NULL CHECK (tile IN ('#', '.', '>', '<', '+')),
+        trap INTEGER NOT NULL DEFAULT 0 CHECK (trap IN (0, 1)),
+        stairs_down INTEGER NOT NULL DEFAULT 0 CHECK (stairs_down IN (0, 1)),
+        item_present INTEGER NOT NULL DEFAULT 0 CHECK (item_present IN (0, 1)),
+        room_effect INTEGER NOT NULL DEFAULT 0 CHECK (room_effect IN (0, 1)),
+        spawn_rank INTEGER CHECK (spawn_rank IS NULL OR spawn_rank >= 0),
+        PRIMARY KEY (x, y)
+      ) WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS player_positions (
+        player_id TEXT PRIMARY KEY,
+        x INTEGER NOT NULL CHECK (x >= 0),
+        y INTEGER NOT NULL CHECK (y >= 0),
+        phase TEXT NOT NULL DEFAULT 'playing'
+          CHECK (phase IN ('playing', 'inventory', 'dead', 'won')),
+        immobilized_turns INTEGER NOT NULL DEFAULT 0 CHECK (immobilized_turns >= 0),
+        updated_revision INTEGER NOT NULL DEFAULT 0 CHECK (updated_revision >= 0),
+        present INTEGER NOT NULL DEFAULT 0 CHECK (present IN (0, 1))
+      ) WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS monster_positions (
+        monster_id TEXT PRIMARY KEY,
+        x INTEGER NOT NULL CHECK (x >= 0),
+        y INTEGER NOT NULL CHECK (y >= 0),
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        UNIQUE (x, y)
+      ) WITHOUT ROWID;
+
       CREATE TABLE IF NOT EXISTS transfer_exports (
         transfer_id TEXT PRIMARY KEY,
         player_id TEXT NOT NULL,
@@ -491,7 +696,7 @@ export class FloorInstance extends DurableObject<Env> {
         response_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
       ) WITHOUT ROWID;
-    `);
+      `);
 
     // Expand old local/pre-deploy v1 stores safely; production schema changes must
     // still follow the expand/contract release plan in the ADR.
@@ -558,24 +763,71 @@ export class FloorInstance extends DurableObject<Env> {
         this.ctx.storage.sql.exec(`ALTER TABLE player_gameplay ADD COLUMN ${name} ${definition}`);
       }
     }
+    const cellColumns = new Set(
+      this.ctx.storage.sql
+        .exec<TableColumnRow>("PRAGMA table_info(floor_cells)")
+        .toArray()
+        .map((column) => column.name),
+    );
+    if (!cellColumns.has("spawn_rank")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE floor_cells ADD COLUMN spawn_rank INTEGER CHECK (spawn_rank IS NULL OR spawn_rank >= 0)",
+      );
+    }
+    const positionColumns = new Set(
+      this.ctx.storage.sql
+        .exec<TableColumnRow>("PRAGMA table_info(player_positions)")
+        .toArray()
+        .map((column) => column.name),
+    );
+    if (!positionColumns.has("present")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE player_positions ADD COLUMN present INTEGER NOT NULL DEFAULT 0 CHECK (present IN (0, 1))",
+      );
+    }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS route_tickets_expiry ON route_tickets(expires_at);
       CREATE INDEX IF NOT EXISTS sessions_disconnected ON sessions(disconnected_at);
+      DROP INDEX IF EXISTS player_positions_coordinate;
+      CREATE UNIQUE INDEX IF NOT EXISTS player_positions_present_coordinate
+        ON player_positions(x, y) WHERE present = 1;
+      CREATE UNIQUE INDEX IF NOT EXISTS floor_cells_spawn_rank
+        ON floor_cells(spawn_rank) WHERE spawn_rank IS NOT NULL;
       INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (1, unixepoch());
       INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (2, unixepoch());
       INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (3, unixepoch());
       INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (4, unixepoch());
       INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (5, unixepoch());
+      INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (6, unixepoch());
+      INSERT OR IGNORE INTO _sql_schema_migrations (version, applied_at) VALUES (7, unixepoch());
     `);
+      return true;
+    });
+  }
+
+  private assertSchemaCompatible(): void {
+    if (!this.schemaCompatible) throw new Error("floor_schema_incompatible");
   }
 
   getCapacitySnapshot(input: unknown): FloorCapacityResult {
+    this.assertSchemaCompatible();
     if (!validFloorLifecycleRequest(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
+    const identity = FLOOR_IDENTITY_RE.exec(input.floorObjectName);
+    if (!identity) return { ok: false, code: "invalid_request" };
     if (!this.bindFloorIdentity(input.floorObjectName)) {
       return { ok: false, code: "identity_mismatch" };
     }
+    const lifecycle = this.floorLifecycle();
+    const floorReady = lifecycle.state === "active"
+      ? this.ctx.storage.transactionSync(() => {
+          const ready = this.ensureFloorReady(input.floorObjectName, Number(identity[3]));
+          return ready.ok && !this.floorCellsMatchWorld(ready.world, Number(identity[3]))
+            ? { ok: false as const, code: "floor_world_incompatible" }
+            : ready;
+        })
+      : { ok: false as const, code: "floor_not_active" };
     const nowSeconds = Math.floor(Date.now() / 1_000);
     this.expirePendingSockets(nowSeconds);
     this.purgeExpiredTicketRows(nowSeconds);
@@ -623,9 +875,10 @@ export class FloorInstance extends DurableObject<Env> {
           "SELECT COUNT(*) AS count FROM transfer_preparations WHERE status = 'prepared'",
         ),
       )?.count ?? 0;
-    const lifecycle = this.floorLifecycle();
     const retirementRequired =
-      lifecycle.state !== "active" || durableSessions >= this.config.floorSessionTombstoneCap;
+      !floorReady.ok ||
+      lifecycle.state !== "active" ||
+      durableSessions >= this.config.floorSessionTombstoneCap;
     // Pending sockets and prepared imports can overlap with later live state. Counting
     // them here is intentionally conservative; Floor admission remains the hard cap.
     const futurePlayerPressure = livePlayers + pendingPlayers + preparedTransfers;
@@ -644,6 +897,7 @@ export class FloorInstance extends DurableObject<Env> {
       maxPlayers: this.config.floorSocketCap,
       maxDurableSessions: this.config.floorSessionTombstoneCap,
       acceptingNewPlayers:
+        floorReady.ok &&
         lifecycle.state === "active" &&
         !retirementRequired &&
         futurePlayerPressure < this.config.floorSocketCap &&
@@ -661,6 +915,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   advanceFloorRetirement(input: unknown): FloorRetirementSealResult {
+    this.assertSchemaCompatible();
     if (!validFloorLifecycleRequest(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -732,6 +987,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   freezeSessionForTransfer(input: FloorTransferRequest): FloorTransferResult {
+    this.assertSchemaCompatible();
     if (!validFloorTransferRequest(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -783,6 +1039,23 @@ export class FloorInstance extends DurableObject<Env> {
         return this.recordFloorTransferOperation(input, "freeze", identity, {
           ok: false,
           code: "terminal_state",
+        });
+      }
+      // TransferHandoff v1 predates authoritative position state. Freezing a
+      // movement-backed player without carrying that state would strand or
+      // duplicate its floor occupancy. Keep transfer fail-closed until the
+      // versioned position handoff is implemented.
+      const position = firstRow(
+        this.ctx.storage.sql.exec<PlayerPositionRow>(
+          `SELECT x, y, phase, immobilized_turns
+           FROM player_positions WHERE player_id = ?`,
+          input.playerId.toLowerCase(),
+        ),
+      );
+      if (position) {
+        return this.recordFloorTransferOperation(input, "freeze", identity, {
+          ok: false,
+          code: "handoff_unavailable",
         });
       }
       const receiptRows = this.ctx.storage.sql
@@ -870,6 +1143,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   bindFrozenTransfer(input: ControlledFloorTransferRequest): FloorTransferResult {
+    this.assertSchemaCompatible();
     if (!validFloorTransferRequest(input, this.ctx.id.name) || !isUuid(input.authorityToken)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -913,6 +1187,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   releaseBoundTransfer(input: ControlledFloorTransferRequest): FloorTransferResult {
+    this.assertSchemaCompatible();
     if (!validFloorTransferRequest(input, this.ctx.id.name) || !isUuid(input.authorityToken)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -943,6 +1218,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   prepareTransferImport(input: PrepareTransferImportRequest): TransferPreparationResult {
+    this.assertSchemaCompatible();
     if (!validTransferPreparation(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -1009,6 +1285,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   abortPreparedTransferImport(input: PrepareTransferImportRequest): TransferPreparationResult {
+    this.assertSchemaCompatible();
     if (!validTransferPreparation(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -1039,6 +1316,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   confirmTransferActivated(input: PrepareTransferImportRequest): TransferPreparationResult {
+    this.assertSchemaCompatible();
     if (!validTransferPreparation(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -1062,10 +1340,12 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   abortFrozenTransfer(input: ControlledFloorTransferRequest): FloorTransferResult {
+    this.assertSchemaCompatible();
     return this.endFrozenTransfer(input, "abort");
   }
 
   finalizeFrozenTransfer(input: ControlledFloorTransferRequest): FloorTransferResult {
+    this.assertSchemaCompatible();
     const result = this.endFrozenTransfer(input, "finalize");
     if (result.ok && result.phase === "finalized") {
       for (const socket of this.ctx.getWebSockets(`player:${input.playerId.toLowerCase()}`)) {
@@ -1089,6 +1369,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   async cancelUnboundFreeze(input: FloorTransferRequest): Promise<FloorTransferResult> {
+    this.assertSchemaCompatible();
     if (!validFloorTransferRequest(input, this.ctx.id.name)) {
       return { ok: false, code: "invalid_request" };
     }
@@ -1246,6 +1527,9 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (!this.schemaCompatible) {
+      return json({ error: "floor_schema_incompatible", retryable: false }, 503);
+    }
     const url = new URL(request.url);
     if (url.pathname !== "/connect") return json({ error: "not_found" }, 404);
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405, { Allow: "GET" });
@@ -1463,6 +1747,11 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    if (!this.schemaCompatible) {
+      send(socket, { type: "error", code: "floor_schema_incompatible", retryable: false });
+      socket.close(1012, "floor_schema_incompatible");
+      return;
+    }
     if (messageExceedsLimit(message)) {
       socket.close(1009, "message_too_large");
       return;
@@ -1570,6 +1859,61 @@ export class FloorInstance extends DurableObject<Env> {
         else send(socket, { type: "error", code: result.code, expectedClientSeq: result.expectedClientSeq, retryable: false });
         return;
       }
+      if (frame.command === "move") {
+        if (!Number.isSafeInteger(frame.clientSeq) || Number(frame.clientSeq) < 1) {
+          send(socket, { type: "error", code: "invalid_client_sequence", retryable: false });
+          return;
+        }
+        const keys = Object.keys(frame).sort();
+        if (keys.join(",") !== "clientSeq,command,dx,dy,type") {
+          send(socket, { type: "error", code: "invalid_movement_input", retryable: false });
+          return;
+        }
+        if (
+          !Number.isSafeInteger(frame.dx) ||
+          !Number.isSafeInteger(frame.dy) ||
+          Math.abs(Number(frame.dx)) > 1 ||
+          Math.abs(Number(frame.dy)) > 1 ||
+          (Number(frame.dx) === 0 && Number(frame.dy) === 0)
+        ) {
+          send(socket, { type: "error", code: "invalid_movement_direction", retryable: false });
+          return;
+        }
+        let result: ProbeResult;
+        try {
+          result = this.commitMove(
+            attachment,
+            Number(frame.clientSeq),
+            Number(frame.dx),
+            Number(frame.dy),
+          );
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              event: "floor_movement_commit_failed",
+              floor: attachment.floorObjectName,
+              errorClass: error instanceof Error ? error.name : "unknown",
+            }),
+          );
+          send(socket, { type: "error", code: "movement_commit_failed", retryable: true });
+          return;
+        }
+        if (result.ok) {
+          try {
+            socket.send(result.response);
+          } catch {
+            // The durable receipt makes response-loss retries byte-identical.
+          }
+        } else {
+          send(socket, {
+            type: "error",
+            code: result.code,
+            expectedClientSeq: result.expectedClientSeq,
+            retryable: false,
+          });
+        }
+        return;
+      }
       send(socket, {
         type: "error",
         code: "edge_gameplay_not_migrated",
@@ -1582,6 +1926,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   webSocketClose(socket: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    if (!this.schemaCompatible) return;
     this.markSocketClosed(socket);
     try {
       socket.close(code, reason);
@@ -1592,6 +1937,7 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   webSocketError(socket: WebSocket): void {
+    if (!this.schemaCompatible) return;
     this.markSocketClosed(socket);
     try {
       socket.close(1011, "websocket_error");
@@ -1601,6 +1947,10 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (!this.schemaCompatible) {
+      console.error(JSON.stringify({ event: "floor_alarm_schema_incompatible" }));
+      return;
+    }
     const nowSeconds = Math.floor(Date.now() / 1_000);
     this.expirePendingSockets(nowSeconds);
     this.ctx.storage.transactionSync(() => {
@@ -1643,6 +1993,376 @@ export class FloorInstance extends DurableObject<Env> {
       );
       return row?.object_name === expectedObjectName;
     });
+  }
+
+  /** Must run inside the caller's SQLite transaction. */
+  private ensureFloorReady(floorObjectName: string, depth: number): FloorReadyResult {
+    const identity = firstRow(
+      this.ctx.storage.sql.exec<NameRow>(
+        "SELECT object_name FROM floor_identity WHERE singleton = 1",
+      ),
+    );
+    if (identity?.object_name !== floorObjectName) {
+      return { ok: false, code: "identity_mismatch" };
+    }
+
+    const existing = firstRow(
+      this.ctx.storage.sql.exec<FloorWorldRow>(
+        `SELECT status, generator_version, ruleset_version, simulation_profile,
+                seed, width, height, entry_x, entry_y, cell_count, map_hash
+         FROM floor_world WHERE singleton = 1`,
+      ),
+    );
+    if (existing) {
+      if (
+        existing.status !== "ready" ||
+        !supportsFloorGeneratorVersion(existing.generator_version) ||
+        existing.ruleset_version !== 1 ||
+        existing.simulation_profile !== FLOOR_SIMULATION_PROFILE ||
+        !Number.isSafeInteger(existing.seed) ||
+        existing.seed <= 0 ||
+        !Number.isSafeInteger(existing.width) ||
+        existing.width <= 0 ||
+        !Number.isSafeInteger(existing.height) ||
+        existing.height <= 0 ||
+        !Number.isSafeInteger(existing.entry_x) ||
+        existing.entry_x < 0 ||
+        existing.entry_x >= existing.width ||
+        !Number.isSafeInteger(existing.entry_y) ||
+        existing.entry_y < 0 ||
+        existing.entry_y >= existing.height ||
+        !Number.isSafeInteger(existing.cell_count) ||
+        existing.cell_count <= 0 ||
+        existing.cell_count !== existing.width * existing.height ||
+        !Number.isSafeInteger(existing.width * existing.height) ||
+        !/^[0-9a-f]{16}$/u.test(existing.map_hash)
+      ) {
+        return { ok: false, code: "floor_world_incompatible" };
+      }
+      return { ok: true, world: existing };
+    }
+
+    const legacyState = firstRow(
+      this.ctx.storage.sql.exec<CountRow>(
+        `SELECT
+           (SELECT COUNT(*) FROM floor_cells) +
+           (SELECT COUNT(*) FROM player_positions) +
+           (SELECT COUNT(*) FROM monster_positions) AS count`,
+      ),
+    )?.count;
+    if (legacyState !== 0) return { ok: false, code: "floor_migration_required" };
+
+    const bootstrap = buildFloorBootstrap(floorObjectName, depth);
+    const batchSize = 128;
+    for (let offset = 0; offset < bootstrap.cells.length; offset += batchSize) {
+      const values = bootstrap.cells.slice(offset, offset + batchSize).map((cell) =>
+        `(${cell.x},${cell.y},'${cell.tile}',0,0,0,0,${cell.spawnRank ?? "NULL"})`,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO floor_cells
+           (x, y, tile, trap, stairs_down, item_present, room_effect, spawn_rank)
+         VALUES ${values.join(",")}`,
+      );
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO floor_world
+         (singleton, status, generator_version, ruleset_version, simulation_profile,
+          seed, width, height, entry_x, entry_y, cell_count, map_hash)
+       VALUES (1, 'ready', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      bootstrap.generatorVersion,
+      bootstrap.simulationProfile,
+      bootstrap.seed,
+      bootstrap.width,
+      bootstrap.height,
+      bootstrap.entryX,
+      bootstrap.entryY,
+      bootstrap.cellCount,
+      bootstrap.mapHash,
+    );
+    const created = firstRow(
+      this.ctx.storage.sql.exec<FloorWorldRow>(
+        `SELECT status, generator_version, ruleset_version, simulation_profile,
+                seed, width, height, entry_x, entry_y, cell_count, map_hash
+         FROM floor_world WHERE singleton = 1`,
+      ),
+    );
+    if (!created) throw new Error("floor bootstrap invariant violated");
+    return { ok: true, world: created };
+  }
+
+  /** Bounded full-map integrity check used at allocation and join, not per command. */
+  private floorCellsMatchWorld(world: FloorWorldRow, depth: number): boolean {
+    const integrity = firstRow(
+      this.ctx.storage.sql.exec<FloorCellIntegrityRow>(
+        `SELECT
+           COUNT(*) AS cell_count,
+           MIN(x) AS minimum_x,
+           MAX(x) AS maximum_x,
+           MIN(y) AS minimum_y,
+           MAX(y) AS maximum_y,
+           SUM(CASE WHEN spawn_rank IS NOT NULL THEN 1 ELSE 0 END) AS spawn_count,
+           SUM(CASE
+                 WHEN x = ? AND y = ? AND spawn_rank = 0 AND tile = '.'
+                   AND trap = 0 AND stairs_down = 0
+                   AND item_present = 0 AND room_effect = 0
+                 THEN 1 ELSE 0
+               END) AS entry_spawn_count
+         FROM floor_cells`,
+        world.entry_x,
+        world.entry_y,
+      ),
+    );
+    if (!(
+      integrity?.cell_count === world.cell_count &&
+      integrity.minimum_x === 0 &&
+      integrity.maximum_x === world.width - 1 &&
+      integrity.minimum_y === 0 &&
+      integrity.maximum_y === world.height - 1 &&
+      integrity.spawn_count >= this.config.floorSocketCap &&
+      integrity.entry_spawn_count === 1
+    )) {
+      return false;
+    }
+
+    let expected;
+    const floorObjectName = this.ctx.id.name;
+    if (!floorObjectName) return false;
+    try {
+      expected = buildFloorBootstrap(floorObjectName, depth, world.generator_version);
+    } catch {
+      return false;
+    }
+    if (
+      expected.seed !== world.seed ||
+      expected.simulationProfile !== world.simulation_profile ||
+      expected.width !== world.width ||
+      expected.height !== world.height ||
+      expected.entryX !== world.entry_x ||
+      expected.entryY !== world.entry_y ||
+      expected.cellCount !== world.cell_count ||
+      expected.mapHash !== world.map_hash
+    ) {
+      return false;
+    }
+
+    const persisted = this.ctx.storage.sql.exec<PersistedBootstrapCellRow>(
+      "SELECT x, y, tile, spawn_rank FROM floor_cells ORDER BY y, x",
+    ).toArray();
+    return persisted.length === expected.cells.length && persisted.every((cell, index) => {
+      const canonical = expected.cells[index];
+      return (
+        canonical !== undefined &&
+        cell.x === canonical.x &&
+        cell.y === canonical.y &&
+        cell.tile === canonical.tile &&
+        cell.spawn_rank === canonical.spawnRank
+      );
+    });
+  }
+
+  /** Must run inside the movement command transaction. */
+  private ensureMovementPosition(
+    attachment: SocketAttachment,
+    validateCells = false,
+  ): MovementPositionResult {
+    const ready = this.ensureFloorReady(attachment.floorObjectName, attachment.depth);
+    if (!ready.ok) return ready;
+    if (validateCells && !this.floorCellsMatchWorld(ready.world, attachment.depth)) {
+      return { ok: false, code: "floor_world_incompatible" };
+    }
+    if (ready.world.simulation_profile !== FLOOR_SIMULATION_PROFILE) {
+      return { ok: false, code: "edge_movement_profile_not_migrated" };
+    }
+
+    const gameplay = firstRow(
+      this.ctx.storage.sql.exec<GameplayRow>(
+        "SELECT turns, hunger, max_hunger, hunger_state, hp, alive FROM player_gameplay WHERE player_id = ?",
+        attachment.playerId,
+      ),
+    );
+    if (gameplay && !validGameplayRow(gameplay)) {
+      return { ok: false, code: "movement_state_corrupt" };
+    }
+    if (gameplay?.alive === 0) return { ok: false, code: "terminal_state" };
+
+    const existing = firstRow(
+      this.ctx.storage.sql.exec<PlayerPositionRow>(
+        `SELECT x, y, phase, immobilized_turns, present
+         FROM player_positions WHERE player_id = ?`,
+        attachment.playerId,
+      ),
+    );
+    if (existing?.phase === "dead" || existing?.phase === "won") {
+      return { ok: false, code: "terminal_state" };
+    }
+    if (existing?.present === 1) {
+      return { ok: true, position: { x: existing.x, y: existing.y } };
+    }
+
+    let spawn = existing
+      ? firstRow(
+          this.ctx.storage.sql.exec<SpawnCellRow>(
+            `SELECT x, y FROM floor_cells
+             WHERE x = ? AND y = ? AND spawn_rank IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM player_positions
+                 WHERE x = ? AND y = ? AND present = 1 AND player_id <> ?
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM monster_positions
+                 WHERE x = ? AND y = ? AND active = 1
+               )`,
+            existing.x,
+            existing.y,
+            existing.x,
+            existing.y,
+            attachment.playerId,
+            existing.x,
+            existing.y,
+          ),
+        )
+      : undefined;
+    spawn ??= firstRow(
+      this.ctx.storage.sql.exec<SpawnCellRow>(
+        `SELECT floor_cells.x, floor_cells.y
+         FROM floor_cells
+         WHERE spawn_rank IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM player_positions
+             WHERE player_positions.x = floor_cells.x
+               AND player_positions.y = floor_cells.y
+               AND player_positions.present = 1
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM monster_positions
+             WHERE monster_positions.x = floor_cells.x
+               AND monster_positions.y = floor_cells.y
+               AND monster_positions.active = 1
+           )
+         ORDER BY spawn_rank
+         LIMIT 1`,
+      ),
+    );
+    if (!spawn) return { ok: false, code: "floor_capacity_exhausted" };
+
+    if (existing) {
+      this.ctx.storage.sql.exec(
+        `UPDATE player_positions
+         SET x = ?, y = ?, present = 1
+         WHERE player_id = ? AND present = 0`,
+        spawn.x,
+        spawn.y,
+        attachment.playerId,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO player_positions
+           (player_id, x, y, phase, immobilized_turns, updated_revision, present)
+         VALUES (?, ?, ?, 'playing', 0, 0, 1)`,
+        attachment.playerId,
+        spawn.x,
+        spawn.y,
+      );
+    }
+    const positionChanges = firstRow(
+      this.ctx.storage.sql.exec<CountRow>("SELECT changes() AS count"),
+    )?.count;
+    if (positionChanges !== 1) throw new Error("player spawn fence lost");
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO player_gameplay
+         (player_id, turns, hunger, max_hunger, hunger_state, hp, alive)
+       VALUES (?, 0, 1000, 1000, 'satiated', 20, 1)`,
+      attachment.playerId,
+    );
+    return { ok: true, position: { x: spawn.x, y: spawn.y } };
+  }
+
+  /** Must run inside the caller's SQLite transaction. */
+  private availablePlainMoves(
+    playerId: string,
+    position: { x: number; y: number },
+  ): ReadonlyArray<{ dx: number; dy: number }> {
+    const directions = [
+      { dx: 1, dy: 0 },
+      { dx: -1, dy: 0 },
+      { dx: 0, dy: 1 },
+      { dx: 0, dy: -1 },
+    ];
+    return directions.filter(({ dx, dy }) => {
+      const x = position.x + dx;
+      const y = position.y + dy;
+      const cell = firstRow(
+        this.ctx.storage.sql.exec<MovementCellRow>(
+          `SELECT tile, trap, stairs_down, item_present, room_effect
+           FROM floor_cells WHERE x = ? AND y = ?`,
+          x,
+          y,
+        ),
+      );
+      if (
+        !cell ||
+        !validMovementCell(cell) ||
+        cell.tile !== "." ||
+        cell.trap !== 0 ||
+        cell.stairs_down !== 0 ||
+        cell.item_present !== 0 ||
+        cell.room_effect !== 0
+      ) {
+        return false;
+      }
+      const occupants = firstRow(
+        this.ctx.storage.sql.exec<CountRow>(
+          `SELECT
+             (SELECT COUNT(*) FROM player_positions
+              WHERE x = ? AND y = ? AND present = 1 AND player_id <> ?) +
+             (SELECT COUNT(*) FROM monster_positions
+              WHERE x = ? AND y = ? AND active = 1) AS count`,
+          x,
+          y,
+          playerId,
+          x,
+          y,
+        ),
+      )?.count;
+      return occupants === 0;
+    });
+  }
+
+  /** Claims a position only when the allocator already provisioned this floor. */
+  private claimReadyFloorPosition(
+    attachment: SocketAttachment,
+  ):
+    | {
+        ok: true;
+        position: { x: number; y: number };
+        movementProfile: string;
+        availableMoves: ReadonlyArray<{ dx: number; dy: number }>;
+      }
+    | { ok: false; code: string }
+    | undefined {
+    const provisioned = firstRow(
+      this.ctx.storage.sql.exec<CountRow>(
+        "SELECT COUNT(*) AS count FROM floor_world WHERE singleton = 1",
+      ),
+    )?.count;
+    if (provisioned === 0) return undefined;
+    if (provisioned !== 1) return { ok: false, code: "floor_world_incompatible" };
+    const activeMonsters = firstRow(
+      this.ctx.storage.sql.exec<CountRow>(
+        "SELECT COUNT(*) AS count FROM monster_positions WHERE active = 1",
+      ),
+    )?.count;
+    if (activeMonsters !== 0) {
+      return { ok: false, code: "edge_movement_effect_not_migrated" };
+    }
+    const claimed = this.ensureMovementPosition(attachment, true);
+    if (!claimed.ok) return claimed;
+    return {
+      ok: true,
+      position: claimed.position,
+      movementProfile: FLOOR_SIMULATION_PROFILE,
+      availableMoves: this.availablePlainMoves(attachment.playerId, claimed.position),
+    };
   }
 
   private floorLifecycle(): LifecycleRow {
@@ -1833,6 +2553,13 @@ export class FloorInstance extends DurableObject<Env> {
       authorityEpoch: attachment.authorityEpoch,
       leaseId: attachment.leaseId,
       expectedClientSeq: activation.expectedClientSeq,
+      ...(activation.position ? { position: activation.position } : {}),
+      ...(activation.movementProfile
+        ? { movementProfile: activation.movementProfile }
+        : {}),
+      ...(activation.availableMoves
+        ? { availableMoves: activation.availableMoves }
+        : {}),
     });
   }
 
@@ -1897,7 +2624,15 @@ export class FloorInstance extends DurableObject<Env> {
           session.lease_id === attachment.leaseId &&
           session.connection_id === attachment.connectionId
         ) {
-          return { ok: true, expectedClientSeq: session.last_client_seq + 1 };
+          const readyPosition = this.claimReadyFloorPosition(attachment);
+          if (readyPosition && !readyPosition.ok) return readyPosition;
+          return {
+            ok: true,
+            expectedClientSeq: session.last_client_seq + 1,
+            position: readyPosition?.position,
+            movementProfile: readyPosition?.movementProfile,
+            availableMoves: readyPosition?.availableMoves,
+          };
         }
         return { ok: false, code: "stale_connection" };
       }
@@ -1920,6 +2655,16 @@ export class FloorInstance extends DurableObject<Env> {
       ) {
         return { ok: false, code: "invalid_transfer_handoff" };
       }
+      const provisionedWorlds = firstRow(
+        this.ctx.storage.sql.exec<CountRow>(
+          "SELECT COUNT(*) AS count FROM floor_world WHERE singleton = 1",
+        ),
+      )?.count;
+      if (transferId && provisionedWorlds !== 0) {
+        return { ok: false, code: "position_handoff_required" };
+      }
+      const readyPosition = transferId ? undefined : this.claimReadyFloorPosition(attachment);
+      if (readyPosition && !readyPosition.ok) return readyPosition;
       if (transferId && handoff && targetControlToken) {
         const preparedInput: PrepareTransferImportRequest = {
           transferId,
@@ -2091,7 +2836,13 @@ export class FloorInstance extends DurableObject<Env> {
       );
       const updated = this.getSession(attachment.playerId);
       if (!updated) throw new Error("session activation invariant violated");
-      return { ok: true, expectedClientSeq: updated.last_client_seq + 1 };
+      return {
+        ok: true,
+        expectedClientSeq: updated.last_client_seq + 1,
+        position: readyPosition?.position,
+        movementProfile: readyPosition?.movementProfile,
+        availableMoves: readyPosition?.availableMoves,
+      };
     });
   }
 
@@ -2141,16 +2892,27 @@ export class FloorInstance extends DurableObject<Env> {
   }
 
   private markSessionDisconnected(attachment: SocketAttachment): void {
-    this.ctx.storage.sql.exec(
-      `UPDATE sessions SET disconnected_at = unixepoch(), updated_at = unixepoch()
-       WHERE player_id = ? AND session_epoch = ? AND authority_epoch = ?
-         AND lease_id = ? AND connection_id = ?`,
-      attachment.playerId,
-      attachment.sessionEpoch,
-      attachment.authorityEpoch,
-      attachment.leaseId,
-      attachment.connectionId,
-    );
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `UPDATE sessions SET disconnected_at = unixepoch(), updated_at = unixepoch()
+         WHERE player_id = ? AND session_epoch = ? AND authority_epoch = ?
+           AND lease_id = ? AND connection_id = ?`,
+        attachment.playerId,
+        attachment.sessionEpoch,
+        attachment.authorityEpoch,
+        attachment.leaseId,
+        attachment.connectionId,
+      );
+      const sessionChanges = firstRow(
+        this.ctx.storage.sql.exec<CountRow>("SELECT changes() AS count"),
+      )?.count;
+      if (sessionChanges === 1) {
+        this.ctx.storage.sql.exec(
+          "UPDATE player_positions SET present = 0 WHERE player_id = ? AND present = 1",
+          attachment.playerId,
+        );
+      }
+    });
   }
 
   private expirePendingSockets(nowSeconds: number): void {
@@ -2412,6 +3174,344 @@ export class FloorInstance extends DurableObject<Env> {
     });
   }
 
+  private commitMove(
+    attachment: SocketAttachment,
+    clientSeq: number,
+    dx: number,
+    dy: number,
+  ): ProbeResult {
+    const requestHash = moveRequestHash(dx, dy);
+    return this.ctx.storage.transactionSync(() => {
+      const session = this.getSession(attachment.playerId);
+      if (
+        !session ||
+        session.session_epoch !== attachment.sessionEpoch ||
+        session.authority_epoch !== attachment.authorityEpoch ||
+        session.lease_id !== attachment.leaseId ||
+        session.connection_id !== attachment.connectionId
+      ) {
+        return { ok: false, code: "stale_connection" };
+      }
+
+      const cached = firstRow(
+        this.ctx.storage.sql.exec<CachedCommandRow>(
+          `SELECT request_hash, response_json FROM processed_commands
+           WHERE player_id = ? AND session_epoch = ? AND client_seq = ?`,
+          attachment.playerId,
+          attachment.sessionEpoch,
+          clientSeq,
+        ),
+      );
+      if (cached) {
+        return cached.request_hash === requestHash
+          ? { ok: true, response: cached.response_json }
+          : { ok: false, code: "idempotency_conflict" };
+      }
+      if (session.transfer_frozen === 1) return { ok: false, code: "transfer_frozen" };
+
+      const expectedClientSeq = session.last_client_seq + 1;
+      if (clientSeq !== expectedClientSeq) {
+        return {
+          ok: false,
+          code: clientSeq < expectedClientSeq ? "stale_client_sequence" : "client_sequence_gap",
+          expectedClientSeq,
+        };
+      }
+
+      const authority = movementAuthorityFor(attachment);
+      if (!authority) return { ok: false, code: "movement_state_corrupt" };
+      const movementState = this.ensureMovementPosition(attachment);
+      if (!movementState.ok) return movementState;
+      const gameplay = firstRow(
+        this.ctx.storage.sql.exec<GameplayRow>(
+          `SELECT turns, hunger, max_hunger, hunger_state, hp, alive
+           FROM player_gameplay WHERE player_id = ?`,
+          attachment.playerId,
+        ),
+      );
+      const position = firstRow(
+        this.ctx.storage.sql.exec<PlayerPositionRow>(
+          `SELECT x, y, phase, immobilized_turns, present
+           FROM player_positions WHERE player_id = ?`,
+          attachment.playerId,
+        ),
+      );
+      if (!position) return { ok: false, code: "movement_state_unavailable" };
+      if (
+        !Number.isSafeInteger(position.x) ||
+        position.x < 0 ||
+        !Number.isSafeInteger(position.y) ||
+        position.y < 0 ||
+        !Number.isSafeInteger(position.immobilized_turns) ||
+        position.immobilized_turns < 0 ||
+        position.present !== 1
+      ) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+      if (gameplay && !validGameplayRow(gameplay)) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+      if (gameplay?.alive === 0 || position.phase === "dead" || position.phase === "won") {
+        return { ok: false, code: "terminal_state" };
+      }
+      if (position.phase !== "playing") {
+        return { ok: false, code: "movement_state_unavailable" };
+      }
+
+      const source = firstRow(
+        this.ctx.storage.sql.exec<MovementCellRow>(
+          `SELECT tile, trap, stairs_down, item_present, room_effect
+           FROM floor_cells WHERE x = ? AND y = ?`,
+          position.x,
+          position.y,
+        ),
+      );
+      if (!source) return { ok: false, code: "movement_state_unavailable" };
+      if (!validMovementCell(source)) return { ok: false, code: "movement_state_corrupt" };
+      if (
+        source.tile !== "." ||
+        source.trap === 1 ||
+        source.stairs_down === 1 ||
+        source.item_present === 1 ||
+        source.room_effect === 1
+      ) {
+        return { ok: false, code: "edge_movement_effect_not_migrated" };
+      }
+      const sourceMonsters =
+        firstRow(
+          this.ctx.storage.sql.exec<CountRow>(
+            "SELECT COUNT(*) AS count FROM monster_positions WHERE x = ? AND y = ? AND active = 1",
+            position.x,
+            position.y,
+          ),
+        )?.count ?? 0;
+      if (sourceMonsters !== 0) return { ok: false, code: "movement_state_corrupt" };
+      const activeMonsters =
+        firstRow(
+          this.ctx.storage.sql.exec<CountRow>(
+            "SELECT COUNT(*) AS count FROM monster_positions WHERE active = 1",
+          ),
+        )?.count ?? 0;
+      if (activeMonsters > 0) {
+        return { ok: false, code: "edge_movement_effect_not_migrated" };
+      }
+
+      const destinationX = position.x + dx;
+      const destinationY = position.y + dy;
+      if (!Number.isSafeInteger(destinationX) || !Number.isSafeInteger(destinationY)) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+      const inBounds = destinationX >= 0 && destinationY >= 0;
+      const destination = inBounds
+        ? firstRow(
+            this.ctx.storage.sql.exec<MovementCellRow>(
+              `SELECT tile, trap, stairs_down, item_present, room_effect
+               FROM floor_cells WHERE x = ? AND y = ?`,
+              destinationX,
+              destinationY,
+            ),
+          )
+        : undefined;
+      if (destination && !validMovementCell(destination)) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+      const playerOccupants = inBounds
+        ? (firstRow(
+            this.ctx.storage.sql.exec<CountRow>(
+              `SELECT COUNT(*) AS count FROM player_positions
+               WHERE x = ? AND y = ? AND present = 1 AND player_id <> ?`,
+              destinationX,
+              destinationY,
+              attachment.playerId,
+            ),
+          )?.count ?? 0)
+        : 0;
+      const monsterOccupants = inBounds
+        ? (firstRow(
+            this.ctx.storage.sql.exec<CountRow>(
+              `SELECT COUNT(*) AS count FROM monster_positions
+               WHERE x = ? AND y = ? AND active = 1`,
+              destinationX,
+              destinationY,
+            ),
+          )?.count ?? 0)
+        : 0;
+      if (
+        playerOccupants > 1 ||
+        monsterOccupants > 1 ||
+        (playerOccupants > 0 && monsterOccupants > 0) ||
+        (!destination && (playerOccupants > 0 || monsterOccupants > 0)) ||
+        (destination?.tile === "#" && (playerOccupants > 0 || monsterOccupants > 0))
+      ) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+
+      const movement = reduceMovement(
+        {
+          authority,
+          x: position.x,
+          y: position.y,
+          phase: position.phase,
+          alive: gameplay ? gameplay.alive === 1 : true,
+          immobilizedTurns: position.immobilized_turns,
+          destination: {
+            tile: destination?.tile ?? null,
+            occupant:
+              playerOccupants === 1
+                ? "player"
+                : monsterOccupants === 1
+                  ? "monster"
+                  : "none",
+            trap: destination?.trap === 1,
+            stairsDown: destination?.stairs_down === 1,
+          },
+        },
+        { type: "move", dx, dy },
+      );
+      if (
+        position.immobilized_turns > 0 ||
+        monsterOccupants > 0 ||
+        destination?.tile === "+" ||
+        destination?.tile === ">" ||
+        destination?.tile === "<" ||
+        destination?.trap === 1 ||
+        destination?.stairs_down === 1 ||
+        destination?.item_present === 1 ||
+        destination?.room_effect === 1 ||
+        movement.outcome === "combat_intent"
+      ) {
+        return { ok: false, code: "edge_movement_effect_not_migrated" };
+      }
+
+      const priorGameplay = {
+        turns: gameplay?.turns ?? 0,
+        depth: attachment.depth,
+        hunger: gameplay?.hunger ?? 1000,
+        maxHunger: gameplay?.max_hunger ?? 1000,
+        hungerState:
+          (gameplay?.hunger_state as
+            | "satiated"
+            | "normal"
+            | "hungry"
+            | "weak"
+            | "fainting"
+            | "starving"
+            | undefined) ?? "satiated",
+        hp: gameplay?.hp ?? 20,
+        alive: gameplay ? gameplay.alive === 1 : true,
+      };
+      const turn =
+        movement.turnCost === "none"
+          ? { state: priorGameplay, events: [] as const }
+          : reduceGameplay(priorGameplay, { type: "advance_turn", action: "other" });
+      const meta = firstRow(
+        this.ctx.storage.sql.exec<RevisionRow>(
+          "SELECT revision FROM floor_meta WHERE singleton = 1",
+        ),
+      );
+      if (!meta || !Number.isSafeInteger(meta.revision) || meta.revision < 0 ||
+          meta.revision === Number.MAX_SAFE_INTEGER) {
+        return { ok: false, code: "movement_state_corrupt" };
+      }
+      const serverRevision = meta.revision + 1;
+      const response = JSON.stringify({
+        type: "ack",
+        command: "move",
+        dx,
+        dy,
+        clientSeq,
+        serverSeq: serverRevision,
+        serverRevision,
+        outcome: movement.outcome,
+        position: { x: movement.state.x, y: movement.state.y },
+        movement: {
+          turnCost: movement.turnCost,
+          stateHash: movementStateHash(movement.state),
+          events: movement.events,
+        },
+        state: turn.state,
+        stateHash: gameplayStateHash(turn.state),
+        events: turn.events,
+      });
+
+      this.ctx.storage.sql.exec(
+        `UPDATE player_positions
+         SET x = ?, y = ?, updated_revision = ?,
+             phase = CASE WHEN ? = 1 THEN phase ELSE 'dead' END,
+             present = CASE WHEN ? = 1 THEN 1 ELSE 0 END
+         WHERE player_id = ? AND x = ? AND y = ? AND present = 1`,
+        movement.state.x,
+        movement.state.y,
+        serverRevision,
+        turn.state.alive ? 1 : 0,
+        turn.state.alive ? 1 : 0,
+        attachment.playerId,
+        position.x,
+        position.y,
+      );
+      const positionChanges = firstRow(
+        this.ctx.storage.sql.exec<CountRow>("SELECT changes() AS count"),
+      )?.count;
+      if (positionChanges !== 1) throw new Error("player position fence lost");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO player_gameplay
+           (player_id, turns, hunger, max_hunger, hunger_state, hp, alive)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(player_id) DO UPDATE SET
+           turns = excluded.turns, hunger = excluded.hunger,
+           max_hunger = excluded.max_hunger, hunger_state = excluded.hunger_state,
+           hp = excluded.hp, alive = excluded.alive`,
+        attachment.playerId,
+        turn.state.turns,
+        turn.state.hunger,
+        turn.state.maxHunger,
+        turn.state.hungerState,
+        turn.state.hp,
+        turn.state.alive ? 1 : 0,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE floor_meta SET revision = ? WHERE singleton = 1",
+        serverRevision,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE sessions
+         SET last_client_seq = ?, updated_at = unixepoch(), disconnected_at = NULL
+         WHERE player_id = ? AND session_epoch = ? AND authority_epoch = ?
+           AND lease_id = ? AND connection_id = ?`,
+        clientSeq,
+        attachment.playerId,
+        attachment.sessionEpoch,
+        attachment.authorityEpoch,
+        attachment.leaseId,
+        attachment.connectionId,
+      );
+      const sessionChanges = firstRow(
+        this.ctx.storage.sql.exec<CountRow>("SELECT changes() AS count"),
+      )?.count;
+      if (sessionChanges !== 1) throw new Error("session authority fence lost");
+      this.ctx.storage.sql.exec(
+        `INSERT INTO processed_commands
+           (player_id, session_epoch, client_seq, server_revision, request_hash,
+            response_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, unixepoch())`,
+        attachment.playerId,
+        attachment.sessionEpoch,
+        clientSeq,
+        serverRevision,
+        requestHash,
+        response,
+      );
+      this.ctx.storage.sql.exec(
+        `DELETE FROM processed_commands
+         WHERE player_id = ? AND session_epoch = ? AND client_seq <= ?`,
+        attachment.playerId,
+        attachment.sessionEpoch,
+        clientSeq - DEDUPE_WINDOW_PER_SESSION,
+      );
+      return { ok: true, response };
+    });
+  }
+
   private commitWait(attachment: SocketAttachment, clientSeq: number): ProbeResult {
     return this.ctx.storage.transactionSync(() => {
       const session = this.getSession(attachment.playerId);
@@ -2453,6 +3553,12 @@ export class FloorInstance extends DurableObject<Env> {
           max_hunger = excluded.max_hunger, hunger_state = excluded.hunger_state, hp = excluded.hp, alive = excluded.alive`,
         attachment.playerId, transition.state.turns, transition.state.hunger, transition.state.maxHunger,
         transition.state.hungerState, transition.state.hp, transition.state.alive ? 1 : 0);
+      if (!transition.state.alive) {
+        this.ctx.storage.sql.exec(
+          "UPDATE player_positions SET phase = 'dead', present = 0 WHERE player_id = ?",
+          attachment.playerId,
+        );
+      }
       this.ctx.storage.sql.exec("UPDATE floor_meta SET revision = ? WHERE singleton = 1", serverRevision);
       this.ctx.storage.sql.exec(
         `UPDATE sessions SET last_client_seq = ?, updated_at = unixepoch(), disconnected_at = NULL

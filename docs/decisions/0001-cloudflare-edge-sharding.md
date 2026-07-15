@@ -1,9 +1,32 @@
 # ADR 0001: Shard authoritative gameplay across Cloudflare Durable Objects
 
-- Status: accepted for implementation; not approved for production traffic
+- Status: accepted production target; cutover remains gated on exact-head proof
 - Date: 2026-07-10
+- Product direction reaffirmed: 2026-07-14
 - Decision owner: project owner, delegated through the production-readiness task
-- Scope: architecture and an undeployed local scaffold only
+- Scope: architecture, implementation, migration, and reliability proof; no
+  production traffic is authorized by this record
+
+## Product-direction amendment (2026-07-14)
+
+Cloudflare is the sole target production runtime. The public game must not depend
+on a developer Mac, `tsx`, the local DuckDB database, a Cloudflare Tunnel, or a
+host supervisor for normal operation. The Mac becomes a development and isolated
+verification environment only.
+
+The target production path is the stateless Worker gateway plus sharded,
+SQLite-backed Durable Objects described below. D1, R2, Queues, Pages/static
+assets, and observability may support that data plane only within their explicit
+ownership boundaries. The legacy Node/DuckDB/Tunnel service remains a frozen
+migration source until a separately authorized, checksum-verified cutover; it is
+not a fallback production authority and must never run concurrently as a second
+owner for an edge-owned player or floor.
+
+This direction does not itself establish four-nines availability. A 99.99%
+application claim remains gated by the command-level SLO, capacity, eviction,
+failure-injection, deploy-under-load, external-probe, and restore evidence in
+[`../production-slo.md`](../production-slo.md) and
+[`../edge-migration-plan.md`](../edge-migration-plan.md).
 
 ## Context
 
