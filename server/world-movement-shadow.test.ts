@@ -352,6 +352,7 @@ describe("WorldServer movement shadow journal", () => {
     player.state.entity.attack = 50;
     player.state.hunger = 2_000;
     player.state.entity.hp = player.state.entity.maxHp = 999;
+    vi.spyOn(Math, "random").mockReturnValue(0);
     world.handleInput(player.id, step.key);
     const streamId = combatTurnJournalStreamId(
       player.id,
