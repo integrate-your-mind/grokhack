@@ -42,14 +42,9 @@ origin_local_responding() {
 }
 
 run_release_gates() {
-  log "Running release gates"
-  npm run lint
-  npm run test:coverage
-  npm test -- --sequence.shuffle --sequence.seed=20260710
-  npm run build
-  npm run check:server-types
-  npm run mcp:build
-  npm run edge:verify
+  # Canonical free CI — never GitHub-hosted Actions (billing lock / $0 policy).
+  log "Running release gates via local CI"
+  npm run ci
 }
 
 deploy_pages() {
