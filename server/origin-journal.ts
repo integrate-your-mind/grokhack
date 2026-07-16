@@ -318,18 +318,21 @@ export class OriginGameplayJournal {
    * written after every required DuckDB write acknowledges, so an exact
    * committed envelope plus that durable phase can safely reconcile cleanup.
    * Earlier phases remain poison because they cannot prove persisted state.
+   *
+   * Intentionally does **not** reconcile the full shadow-journal inventory.
+   * Boot/pending probes must survive poison/legacy evidence so origin gameplay
+   * can stay available while shadow remains fenced/degraded.
    */
   hasPendingMovementTurn(): boolean {
-    this.ensureEvidenceState();
-    const directory = this.movementTurnDirectory();
     try {
-      fs.lstatSync(directory);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw error;
-    }
-    this.ensureMovementTurnDirectory();
-    try {
+      const directory = this.movementTurnDirectory();
+      try {
+        fs.lstatSync(directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+      this.ensureMovementTurnDirectory();
       this.recoverMovementTurnPreparationTemps();
       const existing = this.readMovementTurnPreparation();
       if (existing?.state === "persistence_committed" &&
@@ -341,7 +344,7 @@ export class OriginGameplayJournal {
       return existing !== null;
     } catch {
       // Corrupt or ambiguous marker/temp state must fence shadow adoption, but
-      // legacy origin availability is handled by the caller's degraded latch.
+      // must never throw into WorldServer construction / request admission.
       return true;
     }
   }
@@ -350,9 +353,9 @@ export class OriginGameplayJournal {
    * Returns the exact durable preparation identity for database-receipt
    * reconciliation. This is intentionally read-only: only the caller that
    * proves the matching committed snapshot may advance or clear the marker.
+   * Avoids full journal inventory so cold recovery can run after poison evidence.
    */
   movementTurnRecoveryCandidate(): MovementTurnRecoveryCandidate | null {
-    this.ensureEvidenceState();
     const directory = this.movementTurnDirectory();
     try {
       fs.lstatSync(directory);
@@ -409,6 +412,37 @@ export class OriginGameplayJournal {
       throw new Error("movement_turn_preparation_exists");
     }
     this.writeMovementTurnPreparationDurably(preparation);
+  }
+
+  /**
+   * Removes an exact preparation only while no origin mutation or immutable
+   * movement envelope can have committed. This is the narrow rollback path for
+   * failures that occur after durable preparation but before combat planning.
+   */
+  abortMovementTurnPreparation(input: { streamId: string; operationId: string }): void {
+    const identity = validateMovementTurnPreparationIdentity(input);
+    this.ensureEvidenceState();
+    this.ensureMovementTurnDirectory();
+    this.recoverMovementTurnPreparationTemps();
+    const existing = this.readMovementTurnPreparation();
+    if (!existing) {
+      const committed = this.movementTurnHead(identity.streamId).lastEnvelope;
+      if (committed?.operationId === identity.operationId) {
+        throw new Error("movement_turn_preparation_already_committed");
+      }
+      // An unlink may have succeeded before its directory-fsync acknowledgement
+      // was lost. Re-syncing proves the exact idempotent abort retry.
+      this.syncDirectory(this.movementTurnDirectory());
+      return;
+    }
+    if (existing.streamId !== identity.streamId || existing.operationId !== identity.operationId) {
+      throw new Error("movement_turn_preparation_conflict");
+    }
+    if (existing.state !== "prepared" || this.movementTurnPreparationIsCommitted(existing)) {
+      throw new Error("movement_turn_preparation_not_abortable");
+    }
+    this.unlinkMovementTurnPreparationSync(this.movementTurnPreparationFile());
+    this.syncDirectory(this.movementTurnDirectory());
   }
 
   /** Durably records that all synchronous origin effects represented by the operation finished. */
@@ -697,6 +731,15 @@ export class OriginGameplayJournal {
   }
 
   appendCombatTurn(input: OriginCombatTurnInput): CombatTurnAppendResult {
+    return this.appendCombatTurnEnvelope(this.planCombatTurn(input));
+  }
+
+  /**
+   * Builds the exact next combat envelope without publishing it. The origin
+   * persists these immutable bytes in its authority transaction, then appends
+   * them idempotently from the transactional outbox.
+   */
+  planCombatTurn(input: OriginCombatTurnInput): CombatTurnEnvelopeV1 {
     const head = this.combatTurnHead(input.streamId);
     const last = head.lastEnvelope;
     if (last?.operationId === input.operationId) {
@@ -706,17 +749,16 @@ export class OriginGameplayJournal {
         previousEnvelopeHash: last.previousEnvelopeHash,
         previousTurnEntryHash: last.turn.previousEntryHash,
       });
-      if (retry.envelopeHash === last.envelopeHash) return { status: "duplicate", envelope: last };
+      if (retry.envelopeHash === last.envelopeHash) return last;
       throw new Error("combat_turn_operation_conflict");
     }
     if (head.cursor >= MAX_MOVEMENT_EVIDENCE_ENTRIES) throw new Error("combat_turn_evidence_capacity_exceeded");
-    const envelope = createCombatTurnEnvelopeV1({
+    return createCombatTurnEnvelopeV1({
       ...input,
       cursor: head.cursor + 1,
       previousEnvelopeHash: head.cursor === 0 ? null : head.envelopeHash,
       previousTurnEntryHash: head.turnEntryHash,
     });
-    return this.appendCombatTurnEnvelope(envelope);
   }
 
   appendCombatTurnEnvelope(envelope: CombatTurnEnvelopeV1): CombatTurnAppendResult {

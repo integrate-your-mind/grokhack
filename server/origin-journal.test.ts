@@ -166,6 +166,44 @@ describe("OriginGameplayJournal", () => {
       .map((entry) => entry.cursor)).toEqual([1, 2]);
   });
 
+  it("probes pending preparation without reconciling poison shadow inventory", () => {
+    const { directory, value } = journal();
+    const input = movementTurnInput("00000000-0000-4000-8000-0000000000f1");
+    value.prepareMovementTurn(input);
+    // Legacy live inventory (2026-07-16 outage): v2 moves without continuity hashes
+    // previously made ensureEvidenceState throw and took WorldServer offline.
+    fs.writeFileSync(
+      path.join(directory, "player-poison.00000000.jsonl"),
+      `${JSON.stringify({
+        v: 2,
+        streamId: "player-poison",
+        cursor: 1,
+        command: { type: "move", dx: 1, dy: 0 },
+        beforeState: { x: 1, y: 1, phase: "playing", alive: true, immobilizedTurns: 0, destination: { tile: ".", occupant: "none", trap: false, stairsDown: false } },
+        beforeStateHash: "0123456789abcdef",
+        afterStateHash: "fedcba9876543210",
+        eventHash: "aaaaaaaaaaaaaaaa",
+        terminal: false,
+        previousEntryHash: null,
+        entryHash: "bbbbbbbbbbbbbbbb",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(path.join(directory, "player-poison.00000000.jsonl.commits"), "1\n", { mode: 0o600 });
+
+    // Fresh process: full inventory reconcile would throw, but boot/pending
+    // probes only inspect the preparation marker.
+    const restarted = new OriginGameplayJournal(directory);
+    expect(restarted.hasPendingMovementTurn()).toBe(true);
+    expect(restarted.movementTurnRecoveryCandidate()).toEqual({
+      streamId: input.streamId,
+      operationId: input.operationId,
+      state: "prepared",
+    });
+    // Full inventory reconcile still fails closed for append/capacity.
+    expect(() => restarted.readAfter("player-poison", 0, 1)).toThrow();
+  });
+
   it("keeps one preparation durable and clears it only after matching envelope and persistence commit", () => {
     const { directory, value } = journal();
     const input = movementTurnInput("00000000-0000-4000-8000-000000000009");
@@ -210,6 +248,54 @@ describe("OriginGameplayJournal", () => {
     restarted.completeMovementTurnPreparation(input);
     expect(restarted.hasPendingMovementTurn()).toBe(false);
     expect(new OriginGameplayJournal(directory).hasPendingMovementTurn()).toBe(false);
+  });
+
+  it("aborts only the exact uncommitted preparation and retries unlink acknowledgement loss", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "grokhack-preparation-abort-"));
+    directories.push(directory);
+    let unlinkFailure: "before" | "after" | null = null;
+    const value = new OriginGameplayJournal(directory, {
+      unlinkMovementTurnPreparationSync: (file) => {
+        if (unlinkFailure === "before") {
+          unlinkFailure = null;
+          throw new Error("injected preparation abort failure");
+        }
+        fs.unlinkSync(file);
+        if (unlinkFailure === "after") {
+          unlinkFailure = null;
+          throw new Error("injected preparation abort acknowledgement loss");
+        }
+      },
+    });
+
+    const first = movementTurnInput("00000000-0000-4000-8000-000000000021");
+    value.prepareMovementTurn(first);
+    unlinkFailure = "before";
+    expect(() => value.abortMovementTurnPreparation(first))
+      .toThrow("injected preparation abort failure");
+    expect(value.hasPendingMovementTurn()).toBe(true);
+    value.abortMovementTurnPreparation(first);
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    expect(() => value.abortMovementTurnPreparation(first)).not.toThrow();
+
+    const second = movementTurnInput("00000000-0000-4000-8000-000000000022");
+    value.prepareMovementTurn(second);
+    expect(() => value.abortMovementTurnPreparation({
+      ...second,
+      operationId: "00000000-0000-4000-8000-000000000023",
+    })).toThrow("movement_turn_preparation_conflict");
+    unlinkFailure = "after";
+    expect(() => value.abortMovementTurnPreparation(second))
+      .toThrow("injected preparation abort acknowledgement loss");
+    expect(value.hasPendingMovementTurn()).toBe(false);
+    expect(() => value.abortMovementTurnPreparation(second)).not.toThrow();
+
+    const committed = movementTurnInput("00000000-0000-4000-8000-000000000024");
+    value.prepareMovementTurn(committed);
+    expect(value.appendMovementTurn(committed).status).toBe("appended");
+    expect(() => value.abortMovementTurnPreparation(committed))
+      .toThrow("movement_turn_preparation_not_abortable");
+    expect(value.hasPendingMovementTurn()).toBe(true);
   });
 
   it("does not rescan every movement-turn segment while recovering the fixed preparation temp", () => {

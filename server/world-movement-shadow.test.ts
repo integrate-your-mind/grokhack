@@ -146,14 +146,17 @@ function movementTurnStream(
 }
 
 describe("WorldServer movement shadow journal", () => {
-  it("fails empty-world hydration closed when the authority registry is corrupt", async () => {
+  it("degrades empty-world hydration when the authority registry is corrupt", async () => {
     const world = new WorldServer({
       originJournal: {
         appendTransition: () => { throw new Error("unexpected append"); },
         validateMovementAuthorityRegistry: () => { throw new Error("authority registry corrupt"); },
       },
     });
-    await expect(world.hydrateFromDatabase()).rejects.toThrow("authority registry corrupt");
+    // Origin availability wins: poison registry fences shadow/transfer evidence
+    // without taking DuckDB world hydration offline (2026-07-16 CF 1033 lesson).
+    await expect(world.hydrateFromDatabase()).resolves.toBeUndefined();
+    expect(world.getStats()).toMatchObject({ shadowEvidenceDegraded: true });
   });
 
   it("fails a new floor closed before player mutation when authority durability is unavailable", async () => {
@@ -372,7 +375,9 @@ describe("WorldServer movement shadow journal", () => {
 
   it("does not mutate combat state when the durable combat envelope rejects", async () => {
     const journal = createJournal();
-    vi.spyOn(journal, "appendCombatTurn").mockImplementation(() => { throw new Error("injected combat journal failure"); });
+    vi.spyOn(journal, "planCombatTurn").mockImplementationOnce(() => {
+      throw new Error("injected combat journal failure");
+    });
     const world = new WorldServer({ originJournal: journal });
     world.registerConnection(connection("combat-journal-failure"));
     const player = await world.joinPlayer("combat-journal-failure", "CombatJournalFailure");
@@ -387,10 +392,70 @@ describe("WorldServer movement shadow journal", () => {
     player.state.entity.y = step.y;
     player.state.entity.attack = 50;
     player.state.hunger = 2_000;
+    player.state.entity.hp = player.state.entity.maxHp = 999;
+    const turnsBefore = player.state.turns;
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
     world.handleInput(player.id, step.key);
+
     expect(monster.hp).toBe(1);
     expect(player.state.entity).toMatchObject({ x: step.x, y: step.y });
-    expect(journal.hasPendingMovementTurn()).toBe(true);
+    expect(player.state.turns).toBe(turnsBefore);
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+    expect(world.getStats().shadowEvidenceDegraded).toBe(false);
+
+    world.handleInput(player.id, step.key);
+
+    expect(monster.hp).toBe(0);
+    expect(floor.monsters.some((candidate) => candidate.id === monster.id)).toBe(false);
+    expect(player.state.turns).toBe(turnsBefore + 1);
+    expect(journal.hasPendingMovementTurn()).toBe(false);
+  });
+
+  it("recovers combat publication acknowledgement loss without a state split", async () => {
+    const journal = createJournal();
+    const append = journal.appendCombatTurnEnvelope.bind(journal);
+    let loseAcknowledgement = true;
+    vi.spyOn(journal, "appendCombatTurnEnvelope").mockImplementation((envelope) => {
+      const result = append(envelope);
+      if (loseAcknowledgement) {
+        loseAcknowledgement = false;
+        throw new Error("injected combat acknowledgement loss");
+      }
+      return result;
+    });
+    const world = new WorldServer({ originJournal: journal });
+    world.registerConnection(connection("combat-ack-loss"));
+    const player = await world.joinPlayer("combat-ack-loss", "CombatAckLoss");
+    if (typeof player === "string") throw new Error(player);
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    const step = ordinaryStep(floor);
+    const monster = createMonster("rat", step.x + step.dx, step.y + step.dy, floor.depth);
+    monster.hp = monster.maxHp = 1;
+    floor.monsters.push(monster);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.entity.attack = 50;
+    player.state.hunger = 2_000;
+    const turnsBefore = player.state.turns;
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
+    world.handleInput(player.id, step.key);
+
+    const streamId = combatTurnJournalStreamId(
+      player.id,
+      movementJournalRunId(player.resumeToken ?? ""),
+      floor.movementAuthority!,
+    );
+    expect(journal.readCombatTurnsAfter(streamId, 0, 64)).toEqual([
+      expect.objectContaining({ targetKilled: true, operationId: expect.any(String) }),
+    ]);
+    expect(journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64)).toHaveLength(1);
+    expect(monster.hp).toBe(0);
+    expect(floor.monsters.some((candidate) => candidate.id === monster.id)).toBe(false);
+    expect(player.state.turns).toBe(turnsBefore + 1);
+    expect(journal.hasPendingMovementTurn()).toBe(false);
   });
 
   it("keeps origin movement available after V1 and V2 shadow evidence reach capacity", async () => {
@@ -720,11 +785,71 @@ describe("WorldServer movement shadow journal", () => {
       .toEqual(committed);
     expect(player.messages).toContain("Movement persistence is still committing — retry shortly.");
 
+    const turnsBeforeWait = player.state.turns;
+    world.handleInput(player.id, ".");
+    expect(player.state.turns).toBe(turnsBeforeWait);
+    expect(player.messages.at(-1)).toBe("Movement persistence is still committing — retry shortly.");
+
     acknowledgePersistence();
     await vi.waitFor(() => {
       expect(world.getStats().shadowEvidenceDegraded).toBe(false);
       expect(journal.hasPendingMovementTurn()).toBe(false);
     });
+  });
+
+  it("revalidates join admission when movement becomes pending during durable lookup", async () => {
+    const journal = createJournal();
+    let lookupCount = 0;
+    let releaseLookup!: () => void;
+    let lookupStarted!: () => void;
+    const lookupBlocked = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const observedLookup = new Promise<void>((resolve) => {
+      lookupStarted = resolve;
+    });
+    let acknowledgePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      acknowledgePersistence = resolve;
+    });
+    const world = new WorldServer({
+      originJournal: journal,
+      loadResumablePlayer: async () => {
+        lookupCount++;
+        if (lookupCount === 1) return null;
+        lookupStarted();
+        await lookupBlocked;
+        return null;
+      },
+      persistMovementTurn: () => persistence,
+    });
+    world.registerConnection(connection("join-race-actor"));
+    const actor = await world.joinPlayer("join-race-actor", "JoinRaceActor");
+    if (typeof actor === "string") throw new Error(actor);
+    const floor = world.buildView(actor).floor;
+    floor.traps = [];
+    floor.monsters = [];
+    floor.items = [];
+    const step = ordinaryStep(floor);
+    actor.state.entity.x = step.x;
+    actor.state.entity.y = step.y;
+    actor.state.entity.hp = actor.state.entity.maxHp = 999;
+    actor.state.hunger = 2_000;
+
+    const lateConnection = connection("join-race-late");
+    world.registerConnection(lateConnection);
+    const lateJoin = world.joinPlayer(lateConnection.id, "JoinRaceLate");
+    await observedLookup;
+    world.handleInput(actor.id, step.key);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+    releaseLookup();
+
+    await expect(lateJoin).resolves.toBe("Movement persistence is still committing — retry shortly.");
+    expect(lateConnection.playerId).toBeNull();
+    expect(world.getOnlineCount()).toBe(1);
+
+    acknowledgePersistence();
+    await vi.waitFor(() => expect(journal.hasPendingMovementTurn()).toBe(false));
   });
 
   it("holds the graceful durability barrier until movement persistence finishes", async () => {
@@ -799,6 +924,7 @@ describe("WorldServer movement shadow journal", () => {
 
     world.beginShutdown();
     await expect(world.flushAllDurable()).rejects.toThrow("movement turn persistence remains unresolved");
+    expect(player.connected).toBe(true);
     expect(journal.hasPendingMovementTurn()).toBe(true);
   });
 
@@ -875,6 +1001,21 @@ describe("WorldServer movement shadow journal", () => {
     expect(persistedSourceHasPickup).toBe(false);
     expect(world.getStats().shadowEvidenceDegraded).toBe(true);
     expect(journal.hasPendingMovementTurn()).toBe(true);
+
+    const fencedState = {
+      depth: player.floorDepth,
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      turns: player.state.turns,
+    };
+    world.handleInput(player.id, prepared.key);
+    expect({
+      depth: player.floorDepth,
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      turns: player.state.turns,
+    }).toEqual(fencedState);
+    expect(player.messages).toContain("Movement persistence is still committing — retry shortly.");
   });
 
   it("recovers exact DB commit receipts while fencing pre-ack and tampered crashes", () => {
@@ -882,6 +1023,8 @@ describe("WorldServer movement shadow journal", () => {
       { name: "normal_completion", status: 0, recovered: true, persisted: "after", receipt: false },
       { name: "before_ack", status: 77, recovered: false, persisted: "before", receipt: false },
       { name: "after_db_commit", status: 79, recovered: true, persisted: "after", receipt: false },
+      { name: "after_db_commit_combat", status: 81, recovered: true, persisted: "after", receipt: false },
+      { name: "after_combat_publication", status: 82, recovered: true, persisted: "after", receipt: false },
       { name: "after_db_commit_tampered", status: 80, recovered: false, persisted: "after", receipt: true },
       { name: "after_persistence_commit", status: 78, recovered: true, persisted: "after", receipt: false },
     ] as const;
@@ -901,7 +1044,9 @@ describe("WorldServer movement shadow journal", () => {
           import fs from "node:fs";
           import path from "node:path";
           import { isWalkable } from "./src/dungeon.ts";
+          import { createMonster } from "./src/entities.ts";
           import {
+            combatTurnJournalStreamId,
             movementJournalRunId,
             movementTurnJournalStreamId,
             OriginGameplayJournal,
@@ -923,14 +1068,22 @@ describe("WorldServer movement shadow journal", () => {
             scenario === "after_persistence_commit"
               ? { unlinkMovementTurnPreparationSync() { process.exit(78); } }
               : {});
+          if (scenario === "after_combat_publication") {
+            const appendCombatTurnEnvelope = journal.appendCombatTurnEnvelope.bind(journal);
+            journal.appendCombatTurnEnvelope = (envelope) => {
+              const result = appendCombatTurnEnvelope(envelope);
+              process.exit(82);
+            };
+          }
           const world = new WorldServer({
             loadResumablePlayer: async () => null,
             originJournal: journal,
             ...(scenario === "before_ack"
               ? { persistMovementTurn: async () => { process.exit(77); } }
-              : scenario === "after_db_commit" || scenario === "after_db_commit_tampered"
+              : scenario === "after_db_commit" || scenario === "after_db_commit_combat" ||
+                  scenario === "after_db_commit_tampered"
                 ? {
-                    persistMovementTurn: async (player, floors, identity) => {
+                    persistMovementTurn: async (player, floors, identity, combatEnvelope) => {
                       await saveMovementTurnNow(player, floors, identity, {
                         afterCommit() {
                           if (scenario === "after_db_commit_tampered") {
@@ -945,9 +1098,10 @@ describe("WorldServer movement shadow journal", () => {
                             fs.writeFileSync(marker, JSON.stringify(tampered));
                             process.exit(80);
                           }
+                          if (scenario === "after_db_commit_combat") process.exit(81);
                           process.exit(79);
                         },
-                      });
+                      }, combatEnvelope);
                     },
                   }
               : {}),
@@ -990,6 +1144,16 @@ describe("WorldServer movement shadow journal", () => {
           player.state.hunger = 2_000;
           player.state.entity.hp = 999;
           player.state.entity.maxHp = 999;
+          let targetMonsterId = null;
+          if (scenario === "after_db_commit_combat" || scenario === "after_combat_publication") {
+            Math.random = () => 0;
+            player.state.entity.attack = 50;
+            const target = createMonster("rat", step.x + step.dx, step.y + step.dy, floor.depth);
+            target.hp = target.maxHp = 1;
+            targetMonsterId = target.id;
+            floor.monsters.push(target);
+          }
+          const runId = movementJournalRunId(player.resumeToken);
           const baseline = {
             playerId: player.id,
             x: player.state.entity.x,
@@ -1001,9 +1165,11 @@ describe("WorldServer movement shadow journal", () => {
             dy: step.dy,
             streamId: movementTurnJournalStreamId(
               player.id,
-              movementJournalRunId(player.resumeToken),
+              runId,
               floor.movementAuthority,
             ),
+            combatStreamId: combatTurnJournalStreamId(player.id, runId, floor.movementAuthority),
+            targetMonsterId,
           };
           await savePlayerNow(player);
           await saveFloorNow(floor);
@@ -1056,15 +1222,26 @@ describe("WorldServer movement shadow journal", () => {
             closePersistence,
             hasMovementTurnCommit,
             initPersistence,
+            readMovementTurnCombatOutbox,
           } from "./server/persistence.ts";
           import { WorldServer } from "./server/world.ts";
           const root = process.argv[1];
+          const scenario = process.argv[2];
           const baseline = JSON.parse(fs.readFileSync(path.join(root, "baseline.json"), "utf8"));
           await initPersistence();
           const journal = new OriginGameplayJournal(path.join(root, "journal"));
+          let combatBeforeRecovery = null;
+          if (scenario === "after_db_commit_combat" || scenario === "after_combat_publication") {
+            const candidate = journal.movementTurnRecoveryCandidate();
+            combatBeforeRecovery = {
+              entries: journal.readCombatTurnsAfter(baseline.combatStreamId, 0, 64).length,
+              outbox: candidate ? Boolean(await readMovementTurnCombatOutbox(candidate)) : false,
+            };
+          }
           const world = new WorldServer({ originJournal: journal });
           await world.hydrateFromDatabase();
           const player = world.getPlayer(baseline.playerId);
+          const floor = player ? world.buildView(player).floor : null;
           const envelope = journal.readMovementTurnsAfter(baseline.streamId, 0, 1)[0];
           const movementAfter = envelope && reduceMovement(envelope.movement.beforeState, envelope.movement.command).state;
           const turnAfter = envelope?.turn && reduceGameplay(envelope.turn.beforeState, envelope.turn.command).state;
@@ -1074,6 +1251,14 @@ describe("WorldServer movement shadow journal", () => {
             receipt: envelope
               ? await hasMovementTurnCommit({ streamId: envelope.streamId, operationId: envelope.operationId })
               : false,
+            outbox: envelope
+              ? Boolean(await readMovementTurnCombatOutbox({ streamId: envelope.streamId, operationId: envelope.operationId }))
+              : false,
+            combatBeforeRecovery,
+            combatEntries: journal.readCombatTurnsAfter(baseline.combatStreamId, 0, 64).length,
+            targetMonsterPresent: baseline.targetMonsterId === null
+              ? null
+              : floor?.monsters.some((monster) => monster.id === baseline.targetMonsterId),
             baseline,
             persisted: player && {
               x: player.state.entity.x,
@@ -1092,6 +1277,7 @@ describe("WorldServer movement shadow journal", () => {
           process.stdout.write("COLD_RESULT " + JSON.stringify(result) + "\\n");
         `,
         directory,
+        scenario.name,
       ], { cwd: process.cwd(), env: environment, encoding: "utf8", timeout: 20_000 });
       expect(restart.status, `${scenario.name}: ${restart.stderr}`).toBe(0);
       const resultLine = restart.stdout.split("\n").find((line) => line.startsWith("COLD_RESULT "));
@@ -1100,6 +1286,10 @@ describe("WorldServer movement shadow journal", () => {
         degraded: boolean;
         pending: boolean;
         receipt: boolean;
+        outbox: boolean;
+        combatBeforeRecovery: { entries: number; outbox: boolean } | null;
+        combatEntries: number;
+        targetMonsterPresent: boolean | null;
         baseline: { x: number; y: number; turns: number; hunger: number };
         persisted: { x: number; y: number; turns: number; hunger: number };
         envelopeAfter: { x: number; y: number; turns: number; hunger: number };
@@ -1116,6 +1306,15 @@ describe("WorldServer movement shadow journal", () => {
         expect(result.envelopeAfter).not.toEqual(result.persisted);
       }
       expect(result.receipt).toBe(scenario.receipt);
+      expect(result.outbox).toBe(false);
+      if (scenario.name === "after_db_commit_combat" || scenario.name === "after_combat_publication") {
+        expect(result.combatBeforeRecovery).toEqual({
+          entries: scenario.name === "after_combat_publication" ? 1 : 0,
+          outbox: true,
+        });
+        expect(result.combatEntries).toBe(1);
+        expect(result.targetMonsterPresent).toBe(false);
+      }
       if (scenario.recovered) {
         expect(result).toMatchObject({ degraded: false, pending: false });
       } else {
@@ -1226,34 +1425,31 @@ describe("WorldServer movement shadow journal", () => {
     expect(world.getStats().shadowEvidenceDegraded).toBe(true);
     expect(player.messages).toContain("Turn completed; shadow evidence is degraded.");
     expect(journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64)).toEqual([]);
+    const fencedState = {
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      turns: player.state.turns,
+    };
+    world.handleInput(player.id, step.key);
+    expect({
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      turns: player.state.turns,
+    }).toEqual(fencedState);
+    expect(player.messages).toContain("Movement persistence is still committing — retry shortly.");
     const restarted = new WorldServer({ originJournal: journal });
     expect(restarted.getStats().shadowEvidenceDegraded).toBe(true);
-    restarted.registerConnection(connection("degraded-restart"));
-    const resumedPlayer = await restarted.joinPlayer("degraded-restart", "DegradedRestart");
-    if (typeof resumedPlayer === "string") throw new Error(resumedPlayer);
-    const resumedFloor = restarted.buildView(resumedPlayer).floor;
-    resumedFloor.traps = [];
-    const resumedStep = ordinaryStep(resumedFloor);
-    resumedFloor.monsters = resumedFloor.monsters.filter((candidate) =>
-      candidate.x !== resumedStep.x + resumedStep.dx || candidate.y !== resumedStep.y + resumedStep.dy);
-    resumedFloor.items = resumedFloor.items.filter((candidate) =>
-      candidate.x !== resumedStep.x + resumedStep.dx || candidate.y !== resumedStep.y + resumedStep.dy);
-    resumedPlayer.state.entity.x = resumedStep.x;
-    resumedPlayer.state.entity.y = resumedStep.y;
-    const resumedTurns = resumedPlayer.state.turns;
-
-    restarted.handleInput(resumedPlayer.id, resumedStep.key);
-
     // A cold process cannot safely admit another turn while a durable prepared
     // marker has no matching persistence receipt. Doing so would let a new
     // command race an unresolved combat/movement decision from before restart.
-    expect(resumedPlayer.state).toMatchObject({
-      turns: resumedTurns,
-      entity: { x: resumedStep.x, y: resumedStep.y },
-    });
-    expect(resumedPlayer.messages).toContain("Movement persistence is still committing — retry shortly.");
+    const restartConnection = connection("degraded-restart");
+    restarted.registerConnection(restartConnection);
+    await expect(restarted.joinPlayer("degraded-restart", "DegradedRestart"))
+      .resolves.toBe("Movement persistence is still committing — retry shortly.");
+    expect(restartConnection.playerId).toBeNull();
+    expect(restarted.getOnlineCount()).toBe(0);
     expect(restarted.getStats().shadowEvidenceDegraded).toBe(true);
     expect(journal.hasPendingMovementTurn()).toBe(true);
-    expect(journal.readMovementTurnsAfter(movementTurnStream(resumedPlayer, resumedFloor), 0, 64)).toEqual([]);
+    expect(journal.readMovementTurnsAfter(movementTurnStream(player, floor), 0, 64)).toEqual([]);
   });
 });

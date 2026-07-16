@@ -8,6 +8,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
 import type { FloorState, OnlinePlayer } from "./types.js";
+import {
+  validateCombatTurnEnvelopeV1,
+  type CombatTurnEnvelopeV1,
+} from "../src/combat-turn-envelope.js";
+import { MAX_MOVEMENT_TURN_ENVELOPE_BYTES } from "../src/shadow-journal.js";
 import { dataPath } from "./data-paths.js";
 import { LatestSingleFlightWriter } from "./latest-writer.js";
 
@@ -32,8 +37,10 @@ const worldMetaWriter = new LatestSingleFlightWriter<WorldMeta>(writeWorldMeta, 
   retryBackoffMs: 1_000,
   onError: (error) => console.error("[db] save world meta:", error),
 });
-/** Durable schema epoch — bump when adding migrations in applyMigrations(). */
-export const SCHEMA_VERSION = 2;
+/** Maximum schema epoch this binary can read, including the accidentally emitted v3 marker. */
+export const SCHEMA_VERSION = 3;
+/** Highest epoch written by this release; additive outbox storage remains rollback-safe at v2. */
+export const SCHEMA_WRITE_VERSION = 2;
 let chatIdSeq = 0;
 
 function enqueueDb<T>(fn: () => Promise<T>): Promise<T> {
@@ -113,6 +120,17 @@ export interface MovementTurnPersistenceCrashHooks {
   afterFloorWrite?: (depth: number, index: number) => void;
   afterStaleCommitReceiptPrune?: () => void;
   afterCommitReceiptWrite?: () => void;
+  afterCombatOutboxWrite?: () => void;
+  beforeCommit?: () => void;
+  afterCommit?: () => void;
+  beforeRollback?: () => void;
+}
+
+/** @internal Fault seams for receipt/outbox cleanup transaction proof. */
+export interface MovementTurnCleanupCrashHooks {
+  afterBegin?: () => void;
+  afterCombatOutboxDelete?: () => void;
+  afterCommitReceiptDelete?: () => void;
   beforeCommit?: () => void;
   afterCommit?: () => void;
   beforeRollback?: () => void;
@@ -221,7 +239,7 @@ export async function initPersistence(): Promise<void> {
 
   closing = false;
   ready = true;
-  console.log(`[db] DuckDB ready at ${file} (schema v${SCHEMA_VERSION})`);
+  console.log(`[db] DuckDB ready at ${file} (schema v${await getSchemaVersion()})`);
 }
 
 async function appliedMigrationVersions(): Promise<Set<number>> {
@@ -251,6 +269,10 @@ async function assertSupportedSchemaVersionBeforeWrites(
 /**
  * Idempotent migrations. Version 1 = base tables/indexes (created above).
  * Version 2 = movement snapshot commit receipts used for cross-store recovery.
+ * The immutable combat outbox is additive and deliberately does not advance
+ * the recorded epoch beyond v2. The exact v2 rollback artifact ignores the
+ * extra table and therefore remains boot-compatible. This binary still reads
+ * the already-emitted v3 marker from pre-release incident databases.
  */
 async function applyMigrations(): Promise<void> {
   const applied = await appliedMigrationVersions();
@@ -286,6 +308,17 @@ async function applyMigrations(): Promise<void> {
       { applied_at: now },
     );
   }
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS movement_turn_combat_outbox (
+      stream_id VARCHAR NOT NULL,
+      operation_id VARCHAR NOT NULL,
+      envelope_hash VARCHAR NOT NULL,
+      envelope_json VARCHAR NOT NULL,
+      committed_at BIGINT NOT NULL,
+      PRIMARY KEY (stream_id, operation_id)
+    );
+  `);
 }
 
 async function movementTurnCommitTableUsesSlot(): Promise<boolean> {
@@ -393,9 +426,15 @@ async function readConnectionRows<T extends Record<string, unknown>>(
   return rows.map((row) => JSON.parse(JSON.stringify(row)) as T);
 }
 
+interface CombatOutboxHashMaterial {
+  envelopeHash: string;
+  envelopeJson: string;
+}
+
 function movementSnapshotHash(
   playerRow: Record<string, unknown>,
   floorRows: readonly Record<string, unknown>[],
+  combatOutbox?: CombatOutboxHashMaterial,
 ): string {
   const player = {
     id: String(playerRow.id),
@@ -417,7 +456,10 @@ function movementSnapshotHash(
     seed: Number(row.seed),
     stateJson: String(row.state_json),
   })).sort((left, right) => left.depth - right.depth);
-  return createHash("sha256").update(JSON.stringify({ player, floors }), "utf8").digest("hex");
+  const material = combatOutbox
+    ? { player, floors, combatOutbox }
+    : { player, floors };
+  return createHash("sha256").update(JSON.stringify(material), "utf8").digest("hex");
 }
 
 function normalizeMovementTurnCommitRow(row: Record<string, unknown>): MovementTurnCommitRow | null {
@@ -462,8 +504,74 @@ async function movementTurnReceiptMatchesStoredSnapshot(
     },
   );
   const expectedFloorCount = receipt.floor_depth_2 === null ? 1 : 2;
-  return playerRows.length === 1 && floorRows.length === expectedFloorCount &&
-    movementSnapshotHash(playerRows[0]!, floorRows) === receipt.snapshot_hash;
+  if (playerRows.length !== 1 || floorRows.length !== expectedFloorCount) return false;
+
+  const combatRows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT envelope_hash, envelope_json
+       FROM movement_turn_combat_outbox
+      WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+    { stream_id: receipt.stream_id, operation_id: receipt.operation_id },
+  );
+  if (combatRows.length > 1) return false;
+  let combatOutbox: CombatOutboxHashMaterial | undefined;
+  if (combatRows.length === 1) {
+    const envelopeHash = String(combatRows[0]!.envelope_hash);
+    const envelopeJson = String(combatRows[0]!.envelope_json);
+    try {
+      const envelope = validateCombatTurnEnvelopeV1(JSON.parse(envelopeJson));
+      if (envelope.operationId !== receipt.operation_id || envelope.envelopeHash !== envelopeHash) {
+        return false;
+      }
+      combatOutbox = { envelopeHash, envelopeJson };
+    } catch {
+      return false;
+    }
+  }
+  return movementSnapshotHash(playerRows[0]!, floorRows, combatOutbox) === receipt.snapshot_hash;
+}
+
+interface CombatOutboxPayload {
+  envelope: CombatTurnEnvelopeV1;
+  json: string;
+}
+
+function combatOutboxPayload(
+  identity: MovementTurnPersistenceIdentity,
+  input: CombatTurnEnvelopeV1,
+): CombatOutboxPayload {
+  const envelope = validateCombatTurnEnvelopeV1(input);
+  if (envelope.operationId !== identity.operationId) {
+    throw new Error("movement_turn_combat_outbox_identity_mismatch");
+  }
+  const json = JSON.stringify(envelope);
+  if (Buffer.byteLength(json, "utf8") + 1 > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) {
+    throw new Error("movement_turn_combat_outbox_too_large");
+  }
+  return { envelope, json };
+}
+
+async function combatOutboxMatches(
+  connection: DuckDBConnection,
+  identity: MovementTurnPersistenceIdentity,
+  expected: CombatOutboxPayload | null,
+): Promise<boolean> {
+  const rows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT envelope_hash, envelope_json
+       FROM movement_turn_combat_outbox
+      WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+    { stream_id: identity.streamId, operation_id: identity.operationId },
+  );
+  if (!expected) return rows.length === 0;
+  if (rows.length !== 1 || String(rows[0]!.envelope_hash) !== expected.envelope.envelopeHash ||
+      String(rows[0]!.envelope_json) !== expected.json) return false;
+  try {
+    return validateCombatTurnEnvelopeV1(JSON.parse(String(rows[0]!.envelope_json))).envelopeHash ===
+      expected.envelope.envelopeHash;
+  } catch {
+    return false;
+  }
 }
 
 const UPSERT_PLAYER_SQL = `INSERT INTO players (
@@ -569,6 +677,7 @@ export async function saveMovementTurnNow(
   floors: readonly FloorState[],
   persistenceIdentity: MovementTurnPersistenceIdentity,
   crashHooks: MovementTurnPersistenceCrashHooks = {},
+  combatEnvelope?: CombatTurnEnvelopeV1,
 ): Promise<void> {
   if (persistencePoisoned) throw persistencePoisoned;
   if (!ready || closing) throw new Error("movement_turn_persistence_unavailable");
@@ -576,6 +685,7 @@ export async function saveMovementTurnNow(
     throw new Error("invalid_movement_turn_persistence_floors");
   }
   const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const combatOutbox = combatEnvelope ? combatOutboxPayload(identity, combatEnvelope) : null;
 
   const playerTimer = playerTimers.get(player.id);
   if (playerTimer) clearTimeout(playerTimer);
@@ -591,7 +701,13 @@ export async function saveMovementTurnNow(
   const playerRow = serializePlayer(player);
   const floorRows = floors.map(serializeFloor);
   const floorDepths = floors.map((floor) => floor.depth).sort((left, right) => left - right);
-  const snapshotHash = movementSnapshotHash(playerRow, floorRows);
+  const snapshotHash = movementSnapshotHash(
+    playerRow,
+    floorRows,
+    combatOutbox
+      ? { envelopeHash: combatOutbox.envelope.envelopeHash, envelopeJson: combatOutbox.json }
+      : undefined,
+  );
   const expectedReceipt: MovementTurnCommitRow = {
     stream_id: identity.streamId,
     operation_id: identity.operationId,
@@ -618,11 +734,17 @@ export async function saveMovementTurnNow(
         const existing = normalizeMovementTurnCommitRow(existingRows[0]!);
         if (existingRows.length !== 1 || !existing ||
             JSON.stringify(existing) !== JSON.stringify(expectedReceipt) ||
-            !(await movementTurnReceiptMatchesStoredSnapshot(connection, existing))) {
+            !(await movementTurnReceiptMatchesStoredSnapshot(connection, existing)) ||
+            !(await combatOutboxMatches(connection, identity, combatOutbox))) {
           throw new Error("movement_turn_persistence_receipt_conflict");
         }
         await connection.run(
           `DELETE FROM movement_turn_commits
+            WHERE stream_id <> $stream_id OR operation_id <> $operation_id`,
+          { stream_id: identity.streamId, operation_id: identity.operationId },
+        );
+        await connection.run(
+          `DELETE FROM movement_turn_combat_outbox
             WHERE stream_id <> $stream_id OR operation_id <> $operation_id`,
           { stream_id: identity.streamId, operation_id: identity.operationId },
         );
@@ -639,6 +761,7 @@ export async function saveMovementTurnNow(
       // marker removal. enqueueDb serializes every writer around this delete
       // and replacement insert.
       await connection.run(`DELETE FROM movement_turn_commits`);
+      await connection.run(`DELETE FROM movement_turn_combat_outbox`);
       crashHooks.afterStaleCommitReceiptPrune?.();
       await connection.run(UPSERT_PLAYER_SQL, playerRow);
       crashHooks.afterPlayerWrite?.();
@@ -672,6 +795,23 @@ export async function saveMovementTurnNow(
         );
       }
       crashHooks.afterCommitReceiptWrite?.();
+      if (combatOutbox) {
+        await connection.run(
+          `INSERT INTO movement_turn_combat_outbox (
+             stream_id, operation_id, envelope_hash, envelope_json, committed_at
+           ) VALUES (
+             $stream_id, $operation_id, $envelope_hash, $envelope_json, $committed_at
+           )`,
+          {
+            stream_id: identity.streamId,
+            operation_id: identity.operationId,
+            envelope_hash: combatOutbox.envelope.envelopeHash,
+            envelope_json: combatOutbox.json,
+            committed_at: Date.now(),
+          },
+        );
+        crashHooks.afterCombatOutboxWrite?.();
+      }
       crashHooks.beforeCommit?.();
       await connection.run("COMMIT");
       committed = true;
@@ -716,20 +856,89 @@ export async function hasMovementTurnCommit(
   });
 }
 
+/** Returns immutable combat evidence committed with the authoritative snapshot. */
+export async function readMovementTurnCombatOutbox(
+  persistenceIdentity: MovementTurnPersistenceIdentity,
+): Promise<CombatTurnEnvelopeV1 | null> {
+  const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const connection = activeConnection();
+  return enqueueDb(async () => {
+    activeConnection(connection);
+    const rows = await readConnectionRows<Record<string, unknown>>(
+      connection,
+      `SELECT envelope_hash, envelope_json
+         FROM movement_turn_combat_outbox
+        WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+      { stream_id: identity.streamId, operation_id: identity.operationId },
+    );
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) throw new Error("movement_turn_combat_outbox_corrupt");
+    try {
+      const envelope = validateCombatTurnEnvelopeV1(JSON.parse(String(rows[0]!.envelope_json)));
+      if (envelope.operationId !== identity.operationId ||
+          envelope.envelopeHash !== String(rows[0]!.envelope_hash)) {
+        throw new Error("movement_turn_combat_outbox_corrupt");
+      }
+      return envelope;
+    } catch (error) {
+      if (error instanceof Error && error.message === "movement_turn_combat_outbox_corrupt") throw error;
+      throw new Error("movement_turn_combat_outbox_corrupt", { cause: error });
+    }
+  });
+}
+
 /** Deletes one receipt only after its durable filesystem preparation has been removed. */
 export async function deleteMovementTurnCommit(
   persistenceIdentity: MovementTurnPersistenceIdentity,
+  crashHooks: MovementTurnCleanupCrashHooks = {},
 ): Promise<void> {
   const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
-  await run(
-    `DELETE FROM movement_turn_commits
-      WHERE stream_id = $stream_id AND operation_id = $operation_id`,
-    { stream_id: identity.streamId, operation_id: identity.operationId },
-  );
+  const connection = activeConnection();
+  await enqueueDb(async () => {
+    activeConnection(connection);
+    let committed = false;
+    try {
+      await connection.run("BEGIN TRANSACTION");
+      crashHooks.afterBegin?.();
+      const values = { stream_id: identity.streamId, operation_id: identity.operationId };
+      await connection.run(
+        `DELETE FROM movement_turn_combat_outbox
+          WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+        values,
+      );
+      crashHooks.afterCombatOutboxDelete?.();
+      await connection.run(
+        `DELETE FROM movement_turn_commits
+          WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+        values,
+      );
+      crashHooks.afterCommitReceiptDelete?.();
+      crashHooks.beforeCommit?.();
+      await connection.run("COMMIT");
+      committed = true;
+      crashHooks.afterCommit?.();
+    } catch (error) {
+      if (!committed) {
+        try {
+          crashHooks.beforeRollback?.();
+          await connection.run("ROLLBACK");
+        } catch (rollbackError) {
+          poisonPersistenceConnection(connection, rollbackError);
+          throw new AggregateError(
+            [error, rollbackError],
+            "movement turn cleanup rollback failed",
+            { cause: rollbackError },
+          );
+        }
+      }
+      throw error;
+    }
+  });
 }
 
 /** Boot-only cleanup for receipts whose filesystem preparation already completed. */
 export async function clearMovementTurnCommits(): Promise<void> {
+  await run(`DELETE FROM movement_turn_combat_outbox`);
   await run(`DELETE FROM movement_turn_commits`);
 }
 
