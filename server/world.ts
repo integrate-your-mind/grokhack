@@ -454,6 +454,39 @@ export class WorldServer {
 
     this.shadowEvidenceDegraded = true;
     this.movementTurnPersistencePending = true;
+
+    // `prepared` means the durable prep fence exists but origin mutation has not
+    // been applied. Leaving that marker forever takes the whole public game
+    // offline (join/move return "still committing"). Abort is safe: no envelope
+    // or snapshot was committed for this operation yet.
+    if (candidate.state === "prepared") {
+      const abort = this.originJournal?.abortMovementTurnPreparation;
+      if (!abort) {
+        console.error("[world] movement turn prepared marker stuck; abort API unavailable");
+        return;
+      }
+      try {
+        abort.call(this.originJournal, candidate);
+      } catch (error) {
+        console.error("[world] movement turn prepared-marker abort:", error);
+        return;
+      }
+      try {
+        this.movementTurnPersistencePending =
+          this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+        this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+        if (!this.movementTurnPersistencePending) this.drainDeferredLifecyclePersistence();
+        console.warn(
+          "[world] aborted pre-mutation movement preparation fence",
+          candidate.streamId,
+          candidate.operationId,
+        );
+      } catch {
+        this.shadowEvidenceDegraded = true;
+      }
+      return;
+    }
+
     if (candidate.state !== "origin_applied") return;
 
     let committed: boolean;
