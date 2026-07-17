@@ -1151,7 +1151,17 @@ export class WorldServer {
     if (verdict === "ok") return true;
     // A missing/corrupt vault is an operational recovery event, never proof that
     // the next anonymous claimant owns the durable character.
-    return "Resume denied. Provide resumeToken from your original join (localStorage / prior ack).";
+    if (verdict === "missing") {
+      return (
+        "Resume denied. This name has a durable save but no resume key is registered " +
+        "(server vault gap). Pick a different name to start a new run."
+      );
+    }
+    return (
+      "Resume denied. This name already has a save and this browser is missing the " +
+      "matching resume key. Pick a different name, or open the browser/device that " +
+      "first joined this character."
+    );
   }
 
   /**
