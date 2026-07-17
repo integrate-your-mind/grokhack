@@ -39,6 +39,11 @@ fi
 if [[ "${GROKHACK_ENABLE_AGENT_BOTS:-0}" != "1" ]]; then
   export AGENT_BOT_COUNT=0
 fi
+# TEMP 2026-07-17: telnet acceptor also implicated in post-boot SIGSEGV noise;
+# browser/WebSocket path is the public product surface.
+if [[ "${GROKHACK_ENABLE_TELNET:-0}" != "1" ]]; then
+  export TELNET_PORT=0
+fi
 
 # launchd/interactive shells can carry unrelated developer-agent credentials.
 # The game loads project-specific .env values; never propagate unrelated workstation
