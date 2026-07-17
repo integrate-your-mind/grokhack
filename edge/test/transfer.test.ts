@@ -1382,5 +1382,112 @@ describe("PlayerSession transfer and takeover saga", () => {
     });
     expect(persisted.hash).toBe(input.resumeProofHash);
     expect(persisted.allText).not.toContain("raw-resume-proof");
+    await evictDurableObject(authority);
+    await expect(authority.getSnapshot()).resolves.toMatchObject({
+      playerId: input.playerId,
+      floorObjectName: floorName,
+      version: 8,
+      resumeProofBound: true,
+    });
+    await expect(
+      runInDurableObject(authority, (_instance, state) =>
+        state.storage.sql
+          .exec<{ version: number }>(
+            "SELECT version FROM _player_session_schema_migrations ORDER BY version",
+          )
+          .toArray()
+          .map((row) => row.version),
+      ),
+    ).resolves.toEqual([1, 2]);
+  });
+
+  it("rolls back a failed PlayerSession schema migration atomically", async () => {
+    const input = ticketInput({ playerName: "SessionMigrate" });
+    const authority = authorityStub(input.playerId);
+    const migration = await runInDurableObject(authority, (instance, state) => {
+      state.storage.sql.exec(
+        "DELETE FROM _player_session_schema_migrations WHERE version = 2",
+      );
+      state.storage.sql.exec("DROP INDEX session_operations_created");
+      state.storage.sql.exec(`
+        CREATE TRIGGER inject_player_session_schema_failure
+        BEFORE INSERT ON _player_session_schema_migrations
+        WHEN NEW.version = 2
+        BEGIN SELECT RAISE(ABORT, 'injected_player_session_schema_failure'); END;
+      `);
+      const snapshot = () => ({
+        schema: state.storage.sql.exec<{ type: string; name: string; sql: string | null }>(
+          "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name",
+        ).toArray(),
+        versions: state.storage.sql.exec<{ version: number }>(
+          "SELECT version FROM _player_session_schema_migrations ORDER BY version",
+        ).toArray().map((row) => row.version),
+      });
+      const before = snapshot();
+      let error = "";
+      try {
+        (instance as unknown as { initializeSchema(): boolean }).initializeSchema();
+      } catch (caught) {
+        error = caught instanceof Error ? caught.message : String(caught);
+      }
+      return { before, after: snapshot(), error };
+    });
+    expect(migration.error).toContain("injected_player_session_schema_failure");
+    expect(migration.after).toEqual(migration.before);
+    expect(migration.after.versions).toEqual([1]);
+    expect(migration.after.schema.some(({ name }) => name === "session_operations_created")).toBe(false);
+  });
+
+  it("fails closed without mutating a newer unknown PlayerSession schema", async () => {
+    const input = ticketInput({ playerName: "FutureSchema", resumeProofHash: "e".repeat(64) });
+    const authority = authorityStub(input.playerId);
+    const connectionId = crypto.randomUUID();
+    await expect(
+      authority.authorizeJoin(await authorityJoinRequest(input, connectionId)),
+    ).resolves.toMatchObject({ ok: true, decision: "initial_bound", version: 1 });
+    await runInDurableObject(authority, (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TABLE future_player_session_state (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          value TEXT NOT NULL
+        );
+        INSERT INTO future_player_session_state (singleton, value) VALUES (1, 'preserve-me');
+        INSERT INTO _player_session_schema_migrations (version, applied_at)
+          VALUES (3, unixepoch());
+      `);
+    });
+    const snapshot = () =>
+      runInDurableObject(authority, (_instance, state) => ({
+        schema: state.storage.sql
+          .exec<{ type: string; name: string; table_name: string; sql: string | null }>(
+            `SELECT type, name, tbl_name AS table_name, sql
+             FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name`,
+          )
+          .toArray(),
+        migrations: state.storage.sql
+          .exec<{ version: number; applied_at: number }>(
+            "SELECT version, applied_at FROM _player_session_schema_migrations ORDER BY version",
+          )
+          .toArray(),
+        identity: state.storage.sql.exec("SELECT * FROM session_identity ORDER BY singleton").toArray(),
+        session: state.storage.sql.exec("SELECT * FROM session_state ORDER BY singleton").toArray(),
+        transfers: state.storage.sql.exec("SELECT * FROM session_transfers ORDER BY singleton").toArray(),
+        operations: state.storage.sql
+          .exec("SELECT * FROM session_operations ORDER BY operation_id")
+          .toArray(),
+        future: state.storage.sql
+          .exec("SELECT * FROM future_player_session_state ORDER BY singleton")
+          .toArray(),
+      }));
+    const before = await snapshot();
+    await evictDurableObject(authority);
+
+    const nextInput = { ...input, jti: crypto.randomUUID() };
+    await expect(
+      authority.authorizeJoin(await authorityJoinRequest(nextInput, connectionId)),
+    ).resolves.toEqual({ ok: false, code: "player_session_schema_incompatible" });
+    await expect(snapshot()).resolves.toEqual(before);
   });
 });

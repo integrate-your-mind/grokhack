@@ -25,6 +25,26 @@ export NODE_ENV=production
 export GROKHACK_ENV=production
 export X402_FORCE_PROD=1
 
+# TEMP 2026-07-17: with Discord + IRC enabled, the origin was hard-crashing
+# (exit 139 / SIGSEGV) a few seconds after boot under Node 26, taking public
+# CF tunnel offline. Keep the playable game up; re-enable bridges only when
+# GROKHACK_ENABLE_BRIDGES=1 is set intentionally after the native crash is fixed.
+if [[ "${GROKHACK_ENABLE_BRIDGES:-0}" != "1" ]]; then
+  export IRC_ENABLED=0
+  export DISCORD_BOT_TOKEN=
+fi
+# TEMP 2026-07-17: agent bots join/move immediately after boot and were racing the
+# crash loop (exit 139). Keep public human/agent clients available without the
+# local fleet until the native crash is root-caused.
+if [[ "${GROKHACK_ENABLE_AGENT_BOTS:-0}" != "1" ]]; then
+  export AGENT_BOT_COUNT=0
+fi
+# TEMP 2026-07-17: telnet acceptor also implicated in post-boot SIGSEGV noise;
+# browser/WebSocket path is the public product surface.
+if [[ "${GROKHACK_ENABLE_TELNET:-0}" != "1" ]]; then
+  export TELNET_PORT=0
+fi
+
 # launchd/interactive shells can carry unrelated developer-agent credentials.
 # The game loads project-specific .env values; never propagate unrelated workstation
 # provider keys into long-lived public service children.

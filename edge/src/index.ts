@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { BoundedBodyError, readBoundedBytes, readBoundedText } from "./bounded-body";
 import {
   MAX_CONTROL_BODY_BYTES,
   directoryBucketFor,
@@ -14,7 +15,14 @@ import { FloorInstance } from "./floor-instance";
 import { PlayerSession } from "./player-session";
 import { RealmDirectory } from "./realm-directory";
 import { ShadowReplay } from "./shadow-replay";
-import { MAX_SHADOW_BATCH_BYTES, MAX_SHADOW_BATCH_ENTRIES, validateShadowJournalEntry, validateShadowRoute } from "../../src/shadow-journal";
+import {
+  MAX_SHADOW_BATCH_BYTES,
+  MAX_SHADOW_BATCH_ENTRIES,
+  validateMovementTurnEnvelope,
+  validateShadowJournalEntry,
+  validateShadowRoute,
+} from "../../src/shadow-journal";
+import { validateCombatTurnEnvelopeV1 } from "../../src/combat-turn-envelope";
 import {
   EDGE_PROTOCOL_VERSION,
   MAX_ROUTE_TICKET_BYTES,
@@ -144,88 +152,92 @@ async function secretsEqual(left: string, right: string): Promise<boolean> {
   return difference === 0;
 }
 
-async function readBoundedText(request: Request, maximumBytes: number): Promise<string> {
-  const declared = request.headers.get("Content-Length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) throw new Error("batch_too_large");
-  if (!request.body) return "";
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let bytes = 0;
-  let text = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > maximumBytes) throw new Error("batch_too_large");
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    text += decoder.decode();
-    return text;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-async function readBoundedBytes(request: Request, maximumBytes: number): Promise<Uint8Array> {
-  const declared = request.headers.get("Content-Length");
-  if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes)) {
-    throw new Error("batch_too_large");
-  }
-  if (!request.body) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > maximumBytes) throw new Error("batch_too_large");
-      chunks.push(chunk.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const body = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
-}
-
-async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig): Promise<Response> {
+export async function routeShadowCatchup(request: Request, env: Env, config: EdgeConfig): Promise<Response> {
   if (request.method !== "POST") return json({ code: "method_not_allowed" }, 405, { Allow: "POST" });
   const authorization = request.headers.get("Authorization") ?? "";
   const supplied = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
   if (!(await secretsEqual(supplied, config.shadowIngestSecret))) return json({ code: "unauthorized" }, 401);
   let text: string;
   try { text = await readBoundedText(request, MAX_SHADOW_BATCH_BYTES); }
-  catch { return json({ code: "batch_too_large" }, 413); }
+  catch (error) {
+    if (error instanceof BoundedBodyError && error.code === "body_too_large") {
+      return json({ code: "batch_too_large" }, 413);
+    }
+    return json({ code: error instanceof BoundedBodyError ? error.code : "body_read_failed" }, 400);
+  }
   let candidate: unknown;
   try { candidate = JSON.parse(text); } catch { return json({ code: "malformed_json" }, 400); }
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return json({ code: "invalid_batch" }, 400);
-  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown };
-  if (batch.v !== 1 || !Array.isArray(batch.entries) || batch.entries.length < 1) return json({ code: "invalid_batch" }, 400);
-  if (batch.entries.length > MAX_SHADOW_BATCH_ENTRIES) return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429, { "Retry-After": "1" });
+  const batch = candidate as { v?: unknown; route?: unknown; entries?: unknown; envelopes?: unknown; combatEnvelopes?: unknown };
+  const hasEntries = Array.isArray(batch.entries);
+  const hasEnvelopes = Array.isArray(batch.envelopes);
+  const hasCombatEnvelopes = Array.isArray(batch.combatEnvelopes);
+  if (batch.v !== 1 || Number(hasEntries) + Number(hasEnvelopes) + Number(hasCombatEnvelopes) !== 1 ||
+      (hasEntries && batch.envelopes !== undefined) ||
+      (hasEntries && batch.combatEnvelopes !== undefined) ||
+      (hasEnvelopes && (batch.entries !== undefined || batch.combatEnvelopes !== undefined)) ||
+      (hasCombatEnvelopes && (batch.entries !== undefined || batch.envelopes !== undefined))) {
+    return json({ code: "invalid_batch" }, 400);
+  }
+  const rawRecords = hasCombatEnvelopes
+    ? batch.combatEnvelopes as unknown[]
+    : hasEnvelopes ? batch.envelopes as unknown[] : batch.entries as unknown[];
+  if (rawRecords.length < 1) return json({ code: "invalid_batch" }, 400);
+  if (rawRecords.length > MAX_SHADOW_BATCH_ENTRIES) {
+    return json({ code: "shadow_backpressure", limit: MAX_SHADOW_BATCH_ENTRIES }, 429, { "Retry-After": "1" });
+  }
   let route;
-  let entries;
+  let records;
   try {
     route = validateShadowRoute(batch.route);
-    entries = batch.entries.map(validateShadowJournalEntry);
+    records = hasCombatEnvelopes
+      ? rawRecords.map(validateCombatTurnEnvelopeV1)
+      : hasEnvelopes ? rawRecords.map(validateMovementTurnEnvelope) : rawRecords.map(validateShadowJournalEntry);
   } catch (error) {
     return json({ code: error instanceof Error ? error.message : "invalid_batch", checkpoint: 0 }, 400);
   }
-  if (entries.some((entry) => entry.streamId !== entries[0]!.streamId)) return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
-  const name = `shadow:v1:${floorObjectName(route)}:s${entries[0]!.streamId}`;
+  if (records.some((record) => record.streamId !== records[0]!.streamId)) {
+    return json({ code: "mixed_stream_batch", checkpoint: 0 }, 400);
+  }
+  const combatRecords = hasCombatEnvelopes ? records as ReturnType<typeof validateCombatTurnEnvelopeV1>[] : [];
+  if (combatRecords.some((record) => record.route.realmId !== route.realmId ||
+      record.route.floorInstanceId !== route.floorInstanceId || record.route.depth !== route.depth ||
+      record.route.floorEpoch !== route.floorEpoch || record.route.rulesetVersion !== route.rulesetVersion)) {
+    return json({ code: "combat_authority_mismatch", checkpoint: 0 }, 409);
+  }
+  const name = `shadow:v1:${floorObjectName(route)}:r${route.rulesetVersion}:s${records[0]!.streamId}`;
   const replay = env.SHADOW_REPLAYS.get(env.SHADOW_REPLAYS.idFromName(name));
-  return replay.fetch("https://shadow.internal/catch-up", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ entries }),
-  });
+  try {
+    return await replay.fetch("https://shadow.internal/catch-up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(hasCombatEnvelopes
+        ? { route, combatEnvelopes: records }
+        : hasEnvelopes ? { route, envelopes: records } : { route, entries: records }),
+    });
+  } catch (error) {
+    const failure = durableObjectFailure(error);
+    const retryable = failure.retryable || failure.overloaded;
+    console.error(JSON.stringify({
+      event: "shadow_replay_route_failed",
+      realmId: route.realmId,
+      floorInstanceId: route.floorInstanceId,
+      depth: route.depth,
+      floorEpoch: route.floorEpoch,
+      rulesetVersion: route.rulesetVersion,
+      overloaded: failure.overloaded,
+      retryable: failure.retryable,
+      remote: failure.remote,
+    }));
+    return json(
+      {
+        code: failure.overloaded ? "shadow_replay_overloaded" : "shadow_replay_unavailable",
+        retryable,
+      },
+      503,
+      retryable ? { "Retry-After": failure.overloaded ? "3" : "1" } : undefined,
+    );
+  }
 }
 
 function controlStatus(result: AllocationResult | RetirementResult): number {
@@ -263,8 +275,11 @@ async function routeAllocationControl(
   let bodyBytes: Uint8Array;
   try {
     bodyBytes = await readBoundedBytes(request, MAX_CONTROL_BODY_BYTES);
-  } catch {
-    return json({ code: "request_too_large" }, 413);
+  } catch (error) {
+    if (error instanceof BoundedBodyError && error.code === "body_too_large") {
+      return json({ code: "request_too_large" }, 413);
+    }
+    return json({ code: "body_read_failed" }, 400);
   }
   const authorized = await verifyControlSignature({
     method: request.method,

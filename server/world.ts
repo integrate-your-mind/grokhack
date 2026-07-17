@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   generateDungeon,
   isWalkable,
@@ -36,6 +38,8 @@ import {
 } from "../src/entities.js";
 import {
   meleeAttack,
+  combatSnapshotV1,
+  resolveLegacyPlayerMelee,
   effectivePlayerEntity,
   useItem,
   playerHitPenalty,
@@ -83,10 +87,23 @@ import {
 } from "../src/world-events.js";
 // TICKET-WE-01 pollution (kills fuel blood_moon)
 import { ensureFloorEventBook, notePollution } from "../src/events.js";
-import type { Direction, Entity, GamePhase, PlayerState } from "../src/types.js";
+import type { Direction, Entity, GamePhase, PlayerState, Tile } from "../src/types.js";
 import { reduceGameplay } from "../src/gameplay-reducer.js";
 import type { GameplayState } from "../src/gameplay-reducer.js";
-import { OriginGameplayJournal } from "./origin-journal.js";
+import type { CombatTurnEnvelopeV1 } from "../src/combat-turn-envelope.js";
+import {
+  movementEventHash,
+  movementStateHash,
+  reduceMovement,
+  type MovementState,
+} from "../src/movement-reducer.js";
+import {
+  combatTurnJournalStreamId,
+  movementJournalRunId,
+  movementTurnJournalStreamId,
+  OriginGameplayJournal,
+  type JournalAppendResult,
+} from "./origin-journal.js";
 import { logEvent } from "./audit.js";
 import {
   attachPlayer,
@@ -116,15 +133,23 @@ import { redeemLinkCode } from "./discord-links.js";
 import { redeemXLinkCode } from "./x-links.js";
 import {
   appendChatMessages,
+  clearMovementTurnCommits,
+  deleteMovementTurnCommit,
   deletePlayerById,
+  hasMovementTurnCommit,
+  isPersistenceReady,
   loadResumablePlayerByName,
   loadWorld,
+  readMovementTurnCombatOutbox,
   saveFloorNow,
+  saveMovementTurnNow,
   savePlayerNow,
   saveWorldMeta,
   scheduleSaveFloor,
   scheduleSavePlayer,
   scheduleSaveWorldMeta,
+  type MovementTurnPersistenceCrashHooks,
+  type MovementTurnPersistenceIdentity,
 } from "./persistence.js";
 import { sanitizeChatText, sanitizeExternalName } from "./security.js";
 import { normalizeFloorMonsters } from "./floor-monsters.js";
@@ -150,7 +175,26 @@ const LAIR_DEPTH = 10;
 const MAX_DEPTH = 15;
 const FOV_RADIUS = 8;
 const MAX_PLAYERS = 500;
+const MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER = 64;
+const MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS = 2_048;
 export const SHUTDOWN_RETRY_MESSAGE = "Server is restarting. Retry shortly.";
+const MOVEMENT_PERSISTENCE_RETRY_MESSAGE = "Movement persistence is still committing — retry shortly.";
+
+export function shouldRecordMovementNoopEvidence(
+  evidenceByPlayer: ReadonlyMap<string, ReadonlyMap<string, true>>,
+  playerId: string,
+  fingerprint: string,
+  perPlayerLimit = MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+  playerLimit = MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS,
+): boolean {
+  if (!Number.isSafeInteger(perPlayerLimit) || perPlayerLimit < 1 ||
+      !Number.isSafeInteger(playerLimit) || playerLimit < 1) {
+    throw new RangeError("invalid movement evidence limit");
+  }
+  const evidence = evidenceByPlayer.get(playerId);
+  if (!evidence && evidenceByPlayer.size >= playerLimit) return false;
+  return !evidence?.has(fingerprint) && (evidence?.size ?? 0) < perPlayerLimit;
+}
 
 export interface WorldServerOptions {
   /** Override only for deterministic admission tests; production uses durable persistence. */
@@ -158,7 +202,31 @@ export interface WorldServerOptions {
   /** Maximum resident characters admitted by the legacy single-origin runtime. */
   maxPlayers?: number;
   /** Null disables shadow journaling in narrow tests; production uses the append-only journal. */
-  originJournal?: Pick<OriginGameplayJournal, "appendTransition"> | null;
+  originJournal?: (
+    Pick<OriginGameplayJournal, "appendTransition"> &
+    Partial<Pick<OriginGameplayJournal,
+      "appendMovementTurn" | "appendCombatTurnEnvelope" | "planCombatTurn" | "prepareMovementTurn" | "abortMovementTurnPreparation" | "markMovementTurnApplied" |
+      "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
+      "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
+      "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+  ) | null;
+  /** Fault/test seam; production persists the player and every affected floor before clearing the movement fence. */
+  persistMovementTurn?: (
+    player: OnlinePlayer,
+    floors: readonly FloorState[],
+    identity: MovementTurnPersistenceIdentity,
+    combatEnvelope?: CombatTurnEnvelopeV1,
+  ) => Promise<void>;
+  /** @internal Process-crash seam for the production DuckDB movement transaction. */
+  movementTurnPersistenceCrashHooks?: MovementTurnPersistenceCrashHooks;
+}
+
+interface PendingMovementTurn {
+  streamId: string;
+  operationId: string;
+  command: { type: "move"; dx: number; dy: number };
+  beforeState: MovementState;
+  combatEnvelope?: CombatTurnEnvelopeV1;
 }
 /** Hide from map if no input this long — still listed in :who as [away] */
 const MAP_IDLE_MS = 30 * 60 * 1000;
@@ -234,32 +302,88 @@ export class WorldServer {
   /** playerId → grace deadline ms (soft-disconnect window) */
   private graceUntil = new Map<string, number>();
   private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Presence writes/finalization deferred behind the global movement authority fence. */
+  private deferredLifecyclePlayers = new Set<string>();
+  private deferredLifecycleFloors = new Set<number>();
+  private deferredDisconnects = new Map<string, DisconnectReason>();
   /** playerId → last audit sessionId (for grace_expired disconnect logs) */
   private playerSessions = new Map<string, string>();
   private usedGlyphs = new Set<string>();
   private chatLog: string[] = [];
   /** playerId → timestamps of recent social/chat posts (spam guard) */
   private chatHits = new Map<string, number[]>();
+  /** Globally and per-player bounded sampler for free/no-op collision evidence. */
+  private movementNoopEvidence = new Map<string, Map<string, true>>();
+  /** Avoids turning full non-authoritative shadow journals into log amplification. */
+  private evidenceCapacityReported = new Set<"vitals" | "movement">();
   private startedAt = Date.now();
   private totalTurns = 0;
   private worldSeed = Date.now();
+  private readonly movementAuthorityBootstrapId = randomUUID();
+  private readonly pendingMovementAuthorityRotations = new Map<number, string>();
   /** FIFO admission mutex: capacity/name checks and commits must be one atomic decision. */
   private joinAdmissionTail: Promise<void> = Promise.resolve();
   private readonly loadResumablePlayer: (name: string) => Promise<OnlinePlayer | null>;
   private readonly maxPlayers: number;
-  private readonly originJournal: Pick<OriginGameplayJournal, "appendTransition"> | null;
+  private readonly originJournal: (
+    Pick<OriginGameplayJournal, "appendTransition"> &
+    Partial<Pick<OriginGameplayJournal,
+      "appendMovementTurn" | "appendCombatTurnEnvelope" | "planCombatTurn" | "prepareMovementTurn" | "abortMovementTurnPreparation" | "markMovementTurnApplied" |
+      "markMovementTurnPersistenceCommitted" | "completeMovementTurnPreparation" |
+      "hasPendingMovementTurn" | "movementTurnRecoveryCandidate" |
+      "movementAuthorityForFloor" | "validateMovementAuthorityRegistry">>
+  ) | null;
+  private readonly persistMovementTurn?: (
+    player: OnlinePlayer,
+    floors: readonly FloorState[],
+    identity: MovementTurnPersistenceIdentity,
+    combatEnvelope?: CombatTurnEnvelopeV1,
+  ) => Promise<void>;
+  private readonly movementTurnPersistenceCrashHooks: MovementTurnPersistenceCrashHooks;
+  /** Sticky across restart while a durable movement-turn preparation remains unresolved. */
+  private shadowEvidenceDegraded = false;
+  /** The one global preparation marker cannot admit another movement until its state snapshot is durable. */
+  private movementTurnPersistencePending = false;
+  /** Graceful shutdown joins the complete persistence/marker cleanup chain. */
+  private movementTurnPersistenceTask: Promise<void> | null = null;
   private shuttingDown = false;
 
   constructor(options: WorldServerOptions = {}) {
     this.loadResumablePlayer = options.loadResumablePlayer ?? loadResumablePlayerByName;
     this.maxPlayers = options.maxPlayers ?? MAX_PLAYERS;
     this.originJournal = options.originJournal === undefined ? new OriginGameplayJournal() : options.originJournal;
+    this.persistMovementTurn = options.persistMovementTurn;
+    this.movementTurnPersistenceCrashHooks = options.movementTurnPersistenceCrashHooks ?? {};
     if (!Number.isSafeInteger(this.maxPlayers) || this.maxPlayers < 1) {
       throw new Error("maxPlayers must be a positive safe integer");
+    }
+    // A durable prepared marker can survive a process crash after an immutable
+    // combat/movement envelope commits but before its origin state snapshot
+    // does. It is not enough to label shadow evidence degraded: keep command
+    // admission closed until cold-start reconciliation proves the marker safe.
+    // Never let journal inventory poison abort WorldServer construction — that
+    // takes the whole public origin offline (2026-07-16 CF 1033 incident).
+    try {
+      this.movementTurnPersistencePending =
+        this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+      this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+    } catch (error) {
+      console.error("[world] movement turn pending probe failed closed:", error);
+      this.movementTurnPersistencePending = true;
+      this.shadowEvidenceDegraded = true;
     }
   }
 
   async hydrateFromDatabase(): Promise<void> {
+    try {
+      this.originJournal?.validateMovementAuthorityRegistry?.call(this.originJournal);
+    } catch (error) {
+      // Authority registry poison degrades shadow/transfer evidence; origin can
+      // still hydrate DuckDB world state for live play.
+      this.shadowEvidenceDegraded = true;
+      console.error("[world] movement authority registry:", error);
+    }
+    await this.reconcileMovementTurnPersistence();
     const data = await loadWorld();
     if (!data) {
       await this.persistMeta();
@@ -271,6 +395,7 @@ export class WorldServer {
     this.startedAt = data.meta.startedAt;
 
     for (const floor of data.floors) {
+      floor.movementAuthority = this.resolveMovementAuthority(floor.depth, floor.seed, false);
       const compacted = this.enforceFloorMonsterInvariant(floor, "hydrate");
       // trap-pressure handoff
       floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
@@ -295,6 +420,126 @@ export class WorldServer {
     );
   }
 
+  private async reconcileMovementTurnPersistence(): Promise<void> {
+    const recoveryCandidate = this.originJournal?.movementTurnRecoveryCandidate;
+    if (!recoveryCandidate || !this.originJournal?.markMovementTurnPersistenceCommitted ||
+        !this.originJournal.completeMovementTurnPreparation || !isPersistenceReady()) return;
+
+    let candidate: ReturnType<OriginGameplayJournal["movementTurnRecoveryCandidate"]>;
+    try {
+      candidate = recoveryCandidate.call(this.originJournal);
+    } catch (error) {
+      this.shadowEvidenceDegraded = true;
+      console.error("[world] movement turn recovery marker:", error);
+      return;
+    }
+
+    if (!candidate) {
+      try {
+        await clearMovementTurnCommits();
+      } catch (error) {
+        // A stale receipt is harmless once no filesystem preparation remains;
+        // leave it for the next boot rather than fail origin availability.
+        console.error("[world] movement turn receipt cleanup:", error);
+      }
+      try {
+        this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+        this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+        if (!this.movementTurnPersistencePending) this.drainDeferredLifecyclePersistence();
+      } catch {
+        this.shadowEvidenceDegraded = true;
+      }
+      return;
+    }
+
+    this.shadowEvidenceDegraded = true;
+    this.movementTurnPersistencePending = true;
+
+    // `prepared` means the durable prep fence exists but origin mutation has not
+    // been applied. Leaving that marker forever takes the whole public game
+    // offline (join/move return "still committing"). Abort is safe: no envelope
+    // or snapshot was committed for this operation yet.
+    if (candidate.state === "prepared") {
+      const abort = this.originJournal?.abortMovementTurnPreparation;
+      if (!abort) {
+        console.error("[world] movement turn prepared marker stuck; abort API unavailable");
+        return;
+      }
+      try {
+        abort.call(this.originJournal, candidate);
+      } catch (error) {
+        console.error("[world] movement turn prepared-marker abort:", error);
+        return;
+      }
+      try {
+        this.movementTurnPersistencePending =
+          this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? false;
+        this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+        if (!this.movementTurnPersistencePending) this.drainDeferredLifecyclePersistence();
+        console.warn(
+          "[world] aborted pre-mutation movement preparation fence",
+          candidate.streamId,
+          candidate.operationId,
+        );
+      } catch {
+        this.shadowEvidenceDegraded = true;
+      }
+      return;
+    }
+
+    if (candidate.state !== "origin_applied") return;
+
+    let committed: boolean;
+    try {
+      committed = await hasMovementTurnCommit(candidate);
+    } catch (error) {
+      console.error("[world] movement turn commit receipt:", error);
+      return;
+    }
+    if (!committed) return;
+
+    let combatEnvelope: CombatTurnEnvelopeV1 | null;
+    try {
+      combatEnvelope = await readMovementTurnCombatOutbox(candidate);
+      if (combatEnvelope) this.publishCombatTurnEnvelope(combatEnvelope);
+    } catch (error) {
+      console.error("[world] movement turn combat outbox recovery:", error);
+      return;
+    }
+
+    const retryMarker = (advance: () => void): void => {
+      try {
+        advance();
+      } catch {
+        // Rename/directory-fsync acknowledgement may be lost after the durable
+        // operation. Exact-identity marker transitions are idempotent.
+        advance();
+      }
+    };
+    try {
+      retryMarker(() => this.originJournal!.markMovementTurnPersistenceCommitted!(candidate));
+      retryMarker(() => this.originJournal!.completeMovementTurnPreparation!(candidate));
+    } catch (error) {
+      console.error("[world] movement turn recovery completion:", error);
+      return;
+    }
+
+    try {
+      await deleteMovementTurnCommit(candidate);
+    } catch (error) {
+      // Marker cleanup happened first, so a leftover receipt is only bounded
+      // garbage and will be pruned on the next cold start.
+      console.error("[world] movement turn receipt cleanup:", error);
+    }
+    try {
+      this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+      this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+      if (!this.movementTurnPersistencePending) this.drainDeferredLifecyclePersistence();
+    } catch {
+      this.shadowEvidenceDegraded = true;
+    }
+  }
+
   /**
    * Force-write entire live world for SIGTERM / soft reload.
    * Marks players disconnected in the DB snapshot so cold-start rejoin can resume.
@@ -302,6 +547,26 @@ export class WorldServer {
    * SESSION-HA: call before flushPersistence() + closePersistence().
    */
   async flushAllDurable(): Promise<void> {
+    // Admission is already frozen by beginShutdown(). Join the exact movement
+    // durability chain before writing the final disconnected world snapshot;
+    // otherwise shutdown could report success while origin_applied is poison.
+    const pendingMovementPersistence = this.movementTurnPersistenceTask;
+    if (pendingMovementPersistence) await pendingMovementPersistence;
+
+    // Never let shutdown's blanket player/floor writes overwrite the exact
+    // snapshot protected by an unresolved receipt/outbox. Recovery must see
+    // either those committed rows or the pre-transaction baseline unchanged.
+    let movementTurnUnresolved = this.shadowEvidenceDegraded || this.movementTurnPersistencePending;
+    try {
+      movementTurnUnresolved = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal)
+        ?? movementTurnUnresolved;
+    } catch {
+      movementTurnUnresolved = true;
+    }
+    if (movementTurnUnresolved) {
+      throw new Error("movement turn persistence remains unresolved");
+    }
+
     const playerCount = this.players.size;
     const floorCount = this.floors.size;
 
@@ -386,6 +651,7 @@ export class WorldServer {
       floorsActive: this.floors.size,
       totalTurns: this.totalTurns,
       uptimeMs: Date.now() - this.startedAt,
+      shadowEvidenceDegraded: this.shadowEvidenceDegraded,
     };
   }
 
@@ -427,6 +693,42 @@ export class WorldServer {
     this.graceUntil.delete(playerId);
   }
 
+  /** Never overwrite a receipt-protected player/floor snapshot. */
+  private persistLifecycleState(player: OnlinePlayer, floor?: FloorState): void {
+    if (this.movementTurnPersistencePending) {
+      this.deferredLifecyclePlayers.add(player.id);
+      if (floor) this.deferredLifecycleFloors.add(floor.depth);
+      return;
+    }
+    void savePlayerNow(player).catch((error) => console.error("[db] save player lifecycle:", error));
+    if (floor) {
+      void saveFloorNow(floor).catch((error) => console.error("[db] save floor lifecycle:", error));
+    }
+  }
+
+  /** Drain presence changes only after the exact movement/outbox fence clears. */
+  private drainDeferredLifecyclePersistence(): void {
+    if (this.movementTurnPersistencePending) return;
+    const playerIds = [...this.deferredLifecyclePlayers];
+    const floorDepths = [...this.deferredLifecycleFloors];
+    const disconnects = [...this.deferredDisconnects];
+    this.deferredLifecyclePlayers.clear();
+    this.deferredLifecycleFloors.clear();
+    this.deferredDisconnects.clear();
+
+    const finalized = new Set(disconnects.map(([playerId]) => playerId));
+    for (const [playerId, reason] of disconnects) this.finalizeDisconnect(playerId, reason);
+    for (const playerId of playerIds) {
+      if (finalized.has(playerId)) continue;
+      const player = this.players.get(playerId);
+      if (player) this.persistLifecycleState(player);
+    }
+    for (const depth of floorDepths) {
+      const floor = this.floors.get(depth);
+      if (floor) void saveFloorNow(floor).catch((error) => console.error("[db] save floor lifecycle:", error));
+    }
+  }
+
   /**
    * After grace expires (or forced finalize): announce disconnect + drop from map.
    * No-op if the player already reconnected.
@@ -439,6 +741,11 @@ export class WorldServer {
     this.graceUntil.delete(playerId);
     const player = this.players.get(playerId);
     if (!player || player.connected) return;
+    if (this.movementTurnPersistencePending) {
+      this.deferredDisconnects.set(playerId, reason);
+      this.deferredLifecyclePlayers.add(playerId);
+      return;
+    }
 
     // Socket-level session_disconnect already logged on close; only emit
     // grace_expired here (player fully left map after soft window).
@@ -458,7 +765,7 @@ export class WorldServer {
       bridgeSystemMessage(`${player.name} left the dungeon`);
     }
     this.broadcastFloor(player.floorDepth);
-    void savePlayerNow(player);
+    this.persistLifecycleState(player);
   }
 
   /** SIGTERM/SIGINT: tag open sockets so close audits report reason=restart */
@@ -564,10 +871,10 @@ export class WorldServer {
     player.connected = false;
     if (conn.sessionId) this.playerSessions.set(playerId, conn.sessionId);
 
-    // Durable save before grace so server restart mid-window still resumes.
-    void savePlayerNow(player);
+    // Durable save before grace so server restart mid-window still resumes,
+    // unless an exact movement receipt currently protects the prior snapshot.
     const floor = this.floors.get(player.floorDepth);
-    if (floor) void saveFloorNow(floor);
+    this.persistLifecycleState(player, floor);
 
     // Process restart: finalize immediately (no dangling map ghosts across boots)
     if (_reason === "restart" || conn.disconnectReason === "restart") {
@@ -614,6 +921,7 @@ export class WorldServer {
     resumeToken?: string | null
   ): Promise<OnlinePlayer | string> {
     if (this.shuttingDown) return SHUTDOWN_RETRY_MESSAGE;
+    if (this.movementTurnPersistencePending) return MOVEMENT_PERSISTENCE_RETRY_MESSAGE;
     const admissionConnection = this.connections.get(connId);
     if (!admissionConnection) return "Connection is no longer active.";
     if (admissionConnection.playerId) return "Connection is already joined.";
@@ -662,6 +970,7 @@ export class WorldServer {
     admissionConnection: ClientConnection
   ): string | undefined {
     if (this.shuttingDown) return SHUTDOWN_RETRY_MESSAGE;
+    if (this.movementTurnPersistencePending) return MOVEMENT_PERSISTENCE_RETRY_MESSAGE;
     const currentConnection = this.connections.get(connId);
     if (currentConnection !== admissionConnection) return "Connection is no longer active.";
     if (currentConnection.playerId) return "Connection is already joined.";
@@ -686,6 +995,9 @@ export class WorldServer {
   ): OnlinePlayer | string {
     const auth = this.authorizeResume(trimmed, resumeToken);
     if (auth !== true) return auth;
+    // Re-establish a missing floor authority before detaching an existing
+    // connection. A failed preflight must leave the current owner online.
+    this.getOrCreateFloor(sameName.floorDepth);
     if (sameName.connected) {
       const oldConnId = this.playerConnIds.get(sameName.id);
       if (oldConnId === connId) {
@@ -734,6 +1046,8 @@ export class WorldServer {
     if (resumable) {
       const auth = this.authorizeResume(trimmed, resumeToken);
       if (auth !== true) return auth;
+      // Preflight floor authority before making the durable player resident.
+      this.getOrCreateFloor(resumable.floorDepth);
       this.players.set(resumable.id, resumable);
       return this.reconnectPlayer(connId, resumable);
     }
@@ -754,10 +1068,13 @@ export class WorldServer {
     // owners must be able to reconnect when the legacy origin is full.
     if (this.players.size >= this.maxPlayers) return "World is full. Try again later.";
 
+    // Establish durable floor authority before issuing a character credential.
+    // A sidecar failure must not leave a new resume secret for a rejected join.
+    const floor = this.getOrCreateFloor(1);
+
     // Fresh character — rotate token so a prior owner's secret cannot claim the new run.
     const token = issueResumeToken(trimmed);
     const glyph = this.allocateGlyph(trimmed);
-    const floor = this.getOrCreateFloor(1);
     const spawn = this.findPlayerSpawn(floor, null);
 
     const entity = createPlayer(spawn.x, spawn.y);
@@ -823,7 +1140,7 @@ export class WorldServer {
     this.broadcastChat(`${trimmed} enters the dungeon.`, player.id);
     bridgeSystemMessage(`${trimmed} entered the dungeon`);
     this.broadcastFloor(player.floorDepth, player.id);
-    void savePlayerNow(player);
+    this.persistLifecycleState(player);
     this.scheduleMetaPersist();
     return player;
   }
@@ -834,7 +1151,17 @@ export class WorldServer {
     if (verdict === "ok") return true;
     // A missing/corrupt vault is an operational recovery event, never proof that
     // the next anonymous claimant owns the durable character.
-    return "Resume denied. Provide resumeToken from your original join (localStorage / prior ack).";
+    if (verdict === "missing") {
+      return (
+        "Resume denied. This name has a durable save but no resume key is registered " +
+        "(server vault gap). Pick a different name to start a new run."
+      );
+    }
+    return (
+      "Resume denied. This name already has a save and this browser is missing the " +
+      "matching resume key. Pick a different name, or open the browser/device that " +
+      "first joined this character."
+    );
   }
 
   /**
@@ -846,6 +1173,8 @@ export class WorldServer {
     player: OnlinePlayer,
     opts?: { silent?: boolean }
   ): OnlinePlayer {
+    // Authority durability is a precondition for every reconnect mutation.
+    const floor = this.getOrCreateFloor(player.floorDepth);
     const wasGrace = this.inGrace(player.id);
     const silent = opts?.silent === true || wasGrace;
     this.cancelGrace(player.id);
@@ -880,7 +1209,6 @@ export class WorldServer {
       attachPlayer(conn.sessionId, player.id, player.name, player.kind, player.floorDepth);
     }
 
-    const floor = this.getOrCreateFloor(player.floorDepth);
     // Grace / supersede: fully silent. Cold resume after grace: personal only.
     if (!silent) {
       this.addMessage(player, `Welcome back, ${player.name}! (depth ${player.floorDepth})`);
@@ -888,7 +1216,7 @@ export class WorldServer {
     this.revealFOV(player, floor);
     // No global "returns to the dungeon" chat — reconnect is silent for others.
     this.broadcastFloor(player.floorDepth, player.id);
-    void savePlayerNow(player);
+    this.persistLifecycleState(player);
     return player;
   }
 
@@ -1226,6 +1554,16 @@ export class WorldServer {
     const player = this.players.get(playerId);
     if (!player || !player.connected) return;
 
+    // The one durable preparation is a global authority fence: a turn can
+    // mutate other players and shared floor state through AI/world effects.
+    // Block every input surface, not only movement keys, until the exact
+    // snapshot/outbox completion or cold recovery resolves it.
+    if (this.movementTurnPersistencePending) {
+      this.addMessage(player, MOVEMENT_PERSISTENCE_RETRY_MESSAGE);
+      this.sendToPlayer(player);
+      return;
+    }
+
     player.lastActive = Date.now();
     const key = raw.length === 1 ? raw : raw.trim();
     const conn = [...this.connections.values()].find((c) => c.playerId === playerId);
@@ -1426,35 +1764,204 @@ export class WorldServer {
 
   private tryMove(player: OnlinePlayer, dir: Direction): void {
     if (player.phase !== "playing") return;
-    const floor = this.getOrCreateFloor(player.floorDepth);
-
-    // trap-pressure handoff — bear trap hold
-    if ((player.state.immobilizedTurns ?? 0) > 0) {
-      this.addMessage(player, "You struggle against the trap!");
-      this.endPlayerTurn(player);
+    if (this.movementTurnPersistencePending) {
+      this.addMessage(player, MOVEMENT_PERSISTENCE_RETRY_MESSAGE);
+      return;
+    }
+    const floor = this.floors.get(player.floorDepth);
+    if (!floor) {
+      this.addMessage(player, "Floor unavailable — retry shortly.");
       return;
     }
 
     const nx = player.state.entity.x + dir.dx;
     const ny = player.state.entity.y + dir.dy;
+    const other = this.getPlayerAt(floor.depth, nx, ny, player.id);
+    const monster = floor.monsters.find((m) => m.hp > 0 && m.x === nx && m.y === ny);
+    // Build the authoritative cell snapshot without mutating floor state. Older
+    // loaded floors may not yet have a trap array; materialize it only after the
+    // immutable command record succeeds.
+    const plannedTraps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
+    const tile = (floor.dungeon.tiles[ny]?.[nx] ?? null) as Tile | null;
+    const movementState: MovementState = {
+      authority: floor.movementAuthority ?? this.resolveMovementAuthority(floor.depth, floor.seed, false),
+      x: player.state.entity.x,
+      y: player.state.entity.y,
+      phase: player.phase,
+      alive: player.state.alive,
+      immobilizedTurns: player.state.immobilizedTurns ?? 0,
+      destination: {
+        tile,
+        occupant: other ? "player" : monster ? "monster" : "none",
+        trap: plannedTraps.some((trap) => !trap.sprung && trap.x === nx && trap.y === ny),
+        stairsDown: floor.dungeon.stairsDown.x === nx && floor.dungeon.stairsDown.y === ny,
+      },
+    };
+    const command = { type: "move", dx: dir.dx, dy: dir.dy } as const;
+    const movement = reduceMovement(movementState, command);
+    const noopFingerprint = movement.turnCost === "none"
+      ? [movementStateHash(movementState), command.dx, command.dy, movementEventHash(movement)].join("|")
+      : null;
+    const sampledNoop = noopFingerprint !== null &&
+      !shouldRecordMovementNoopEvidence(
+        this.movementNoopEvidence,
+        player.id,
+        noopFingerprint,
+        MAX_MOVEMENT_NOOP_EVIDENCE_PER_PLAYER,
+        Math.min(this.maxPlayers, MAX_MOVEMENT_NOOP_EVIDENCE_PLAYERS),
+      );
+    let pendingMovement: PendingMovementTurn | null = null;
+    if (!sampledNoop && !this.shadowEvidenceDegraded && this.originJournal) {
+      try {
+        pendingMovement = {
+          streamId: movementTurnJournalStreamId(
+            player.id,
+            movementJournalRunId(player.resumeToken ?? ""),
+            movementState.authority,
+          ),
+          operationId: randomUUID(),
+          command,
+          beforeState: movementState,
+        };
+        // Message-only decisions can be committed before their origin handler.
+        // A turn-consuming decision is held until post-effect vitals exist, so
+        // the pair is published by one envelope commit rather than two records.
+        if (movement.turnCost === "none") {
+          if (!this.originJournal.appendMovementTurn) {
+            throw new Error("movement_turn_outbox_unavailable");
+          }
+          const journalResult = this.originJournal.appendMovementTurn({ ...pendingMovement, turn: null });
+          if (journalResult?.status === "dropped_capacity") {
+            this.reportEvidenceCapacity(player, journalResult);
+          } else if (noopFingerprint !== null) {
+            let evidence = this.movementNoopEvidence.get(player.id);
+            if (!evidence) {
+              evidence = new Map<string, true>();
+              this.movementNoopEvidence.set(player.id, evidence);
+            }
+            evidence.set(noopFingerprint, true);
+          }
+        } else {
+          if (!this.originJournal.appendMovementTurn || !this.originJournal.prepareMovementTurn ||
+              !this.originJournal.markMovementTurnApplied ||
+              !this.originJournal.markMovementTurnPersistenceCommitted ||
+              !this.originJournal.completeMovementTurnPreparation) {
+            throw new Error("movement_turn_outbox_unavailable");
+          }
+          this.originJournal.prepareMovementTurn(pendingMovement);
+          // The synchronous command path admits at most one prepared mutation.
+          // Keep the promotion latch closed until both nested state fields have
+          // rolled forward and the durable marker is resolved.
+          this.shadowEvidenceDegraded = true;
+        }
+      } catch (error) {
+        try {
+          if (this.originJournal.hasPendingMovementTurn?.call(this.originJournal)) {
+            this.shadowEvidenceDegraded = true;
+          }
+        } catch {
+          this.shadowEvidenceDegraded = true;
+        }
+        const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
+        logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
+          playerId: player.id,
+          playerName: player.name,
+          detail: { component: "origin_movement_turn_outbox", message: error instanceof Error ? error.message : String(error) },
+        });
+        this.addMessage(player, "Turn journal unavailable — retry shortly.");
+        return;
+      }
+    }
 
-    if (!isWalkable(floor.dungeon.tiles, nx, ny)) {
+    if (movement.outcome === "ignored") return;
+    if (movement.outcome === "struggle") {
+      this.addMessage(player, "You struggle against the trap!");
+      this.endPlayerTurn(player, "other", pendingMovement ?? undefined, floor);
+      return;
+    }
+    if (movement.outcome === "blocked_terrain") {
       this.addMessage(player, "You bump into a wall.");
       return;
     }
-
-    const other = this.getPlayerAt(floor.depth, nx, ny, player.id);
-    if (other) {
-      this.addMessage(player, `${other.name} is in the way.`);
+    if (movement.outcome === "blocked_player") {
+      this.addMessage(player, `${other?.name ?? "Another player"} is in the way.`);
       return;
     }
-
-    const monster = floor.monsters.find((m) => m.hp > 0 && m.x === nx && m.y === ny);
-    if (monster) {
-      const result = meleeAttack(effectivePlayerEntity(player.state), monster, {
+    if (movement.outcome === "combat_intent") {
+      if (!monster) throw new Error("movement occupant changed before combat");
+      const attacker = effectivePlayerEntity(player.state);
+      const options = {
         weaponName: player.state.equippedWeapon?.name,
         hitPenalty: playerHitPenalty(player.state),
-      });
+      };
+      const attackerSnapshot = combatSnapshotV1(attacker);
+      const defenderSnapshot = combatSnapshotV1(monster);
+      const { transcript, result } = resolveLegacyPlayerMelee(attacker, monster, options);
+      if (pendingMovement) {
+        const beforeTurn: GameplayState = {
+          turns: player.state.turns,
+          depth: player.floorDepth,
+          hunger: player.state.hunger,
+          maxHunger: player.state.maxHunger,
+          hungerState: player.state.hungerState,
+          hp: player.state.entity.hp,
+          alive: player.state.alive,
+        };
+        try {
+          if (!this.originJournal?.planCombatTurn || !this.originJournal.appendCombatTurnEnvelope) {
+            throw new Error("combat_turn_outbox_unavailable");
+          }
+          pendingMovement.combatEnvelope = this.originJournal.planCombatTurn({
+            streamId: combatTurnJournalStreamId(
+              player.id,
+              movementJournalRunId(player.resumeToken ?? ""),
+              movementState.authority,
+            ),
+            route: { ...movementState.authority, rulesetVersion: 1 },
+            operationId: pendingMovement.operationId,
+            attacker: attackerSnapshot,
+            defender: defenderSnapshot,
+            options: { weaponName: options.weaponName ?? null, hitPenalty: options.hitPenalty ?? 0, critChance: null },
+            transcript,
+            turn: { command: { type: "advance_turn", action: "other" }, beforeState: beforeTurn },
+          });
+        } catch (error) {
+          // No combat mutation is applied until immutable outbox bytes exist.
+          // The exact prepared marker is therefore safe to abort only while it
+          // remains uncommitted. Retry once for unlink/directory-fsync
+          // acknowledgement loss; any ambiguous failure keeps admission fenced.
+          let aborted = false;
+          const abort = this.originJournal?.abortMovementTurnPreparation;
+          if (abort) {
+            try {
+              abort.call(this.originJournal, pendingMovement);
+              aborted = true;
+            } catch {
+              try {
+                abort.call(this.originJournal, pendingMovement);
+                aborted = true;
+              } catch {
+                // Preserve the durable marker and fail closed.
+              }
+            }
+          }
+          if (aborted) {
+            try {
+              this.movementTurnPersistencePending = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+            } catch {
+              this.movementTurnPersistencePending = true;
+            }
+          } else {
+            this.movementTurnPersistencePending = true;
+          }
+          this.shadowEvidenceDegraded = this.movementTurnPersistencePending;
+          if (!this.movementTurnPersistencePending) this.drainDeferredLifecyclePersistence();
+          this.logMovementTurnFailure(player, "origin_combat_turn_outbox", error);
+          this.addMessage(player, "Combat journal unavailable — retry shortly.");
+          return;
+        }
+      }
+      monster.hp = result.defender.hp;
       this.addMessage(player, result.message);
       if (result.hit && !result.killed) {
         const enrage = checkBossEnrage(monster);
@@ -1462,16 +1969,16 @@ export class WorldServer {
       }
       if (result.killed) this.killMonster(player, floor, monster);
       this.logCombat(player, monster.name, result.damage, true);
-      this.endPlayerTurn(player);
+      this.endPlayerTurn(player, "other", pendingMovement ?? undefined, floor);
       return;
     }
 
-    player.state.entity.x = nx;
-    player.state.entity.y = ny;
+    player.state.entity.x = movement.state.x;
+    player.state.entity.y = movement.state.y;
     this.tryPickup(player, floor);
 
     // trap-pressure handoff — step-on traps
-    floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
+    floor.traps = plannedTraps;
     if (floor.traps.length) {
       const occupied = new Set<string>();
       for (const m of floor.monsters) {
@@ -1501,6 +2008,7 @@ export class WorldServer {
         this.usedGlyphs.delete(player.glyph);
         this.revealFOV(player, floor);
         this.broadcastFloor(player.floorDepth);
+        this.endPlayerTurn(player, "other", pendingMovement ?? undefined, floor);
         return;
       }
     }
@@ -1511,6 +2019,7 @@ export class WorldServer {
       if (!player.state.alive) {
         this.revealFOV(player, floor);
         this.broadcastFloor(player.floorDepth);
+        this.endPlayerTurn(player, "other", pendingMovement ?? undefined, floor);
         return;
       }
     }
@@ -1518,12 +2027,12 @@ export class WorldServer {
     const { stairsDown } = floor.dungeon;
     const { entity } = player.state;
     if (entity.x === stairsDown.x && entity.y === stairsDown.y) {
-      this.tryDescend(player);
+      this.tryDescend(player, pendingMovement !== null);
     }
-    if (player.phase === "playing") this.endPlayerTurn(player);
+    this.endPlayerTurn(player, "other", pendingMovement ?? undefined, floor);
   }
 
-  private tryDescend(player: OnlinePlayer): void {
+  private tryDescend(player: OnlinePlayer, deferPersistenceToMovementFence = false): void {
     const floor = this.getOrCreateFloor(player.floorDepth);
     const { entity } = player.state;
     const { stairsDown } = floor.dungeon;
@@ -1593,12 +2102,40 @@ export class WorldServer {
     }
     this.revealFOV(player, newFloor);
     this.broadcastFloor(player.floorDepth);
-    this.touchPlayer(player);
-    void saveFloorNow(newFloor);
+    if (!deferPersistenceToMovementFence) {
+      this.touchPlayer(player);
+      void saveFloorNow(newFloor);
+    }
   }
 
-  private endPlayerTurn(player: OnlinePlayer, action: "wait" | "other" = "other"): void {
+  private reportEvidenceCapacity(
+    player: OnlinePlayer,
+    result: Extract<JournalAppendResult, { status: "dropped_capacity" }>,
+  ): void {
+    if (this.evidenceCapacityReported.has(result.domain)) return;
+    const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
+    logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
+      playerId: player.id,
+      playerName: player.name,
+      detail: {
+        component: result.domain === "movement" ? "origin_movement_journal" : "origin_gameplay_journal",
+        message: `${result.domain}_evidence_capacity`,
+        maxEntries: result.maxEntries,
+      },
+    });
+    this.evidenceCapacityReported.add(result.domain);
+  }
+
+  private endPlayerTurn(
+    player: OnlinePlayer,
+    action: "wait" | "other" = "other",
+    pendingMovement?: PendingMovementTurn,
+    movementSourceFloor?: FloorState,
+  ): void {
     const floor = this.getOrCreateFloor(player.floorDepth);
+    const affectedFloors = movementSourceFloor && movementSourceFloor.depth !== floor.depth
+      ? [movementSourceFloor, floor]
+      : [floor];
     const beforeState: GameplayState = {
       turns: player.state.turns,
       depth: player.floorDepth,
@@ -1610,23 +2147,54 @@ export class WorldServer {
     };
     const command = { type: "advance_turn", action } as const;
     const transition = reduceGameplay(beforeState, command);
+    let movementEnvelopeCommitted = false;
+    if (pendingMovement) this.applyGameplayTransitionState(player, transition.state);
     try {
-      this.originJournal?.appendTransition({ streamId: player.id, command, beforeState });
+      if (pendingMovement && this.originJournal &&
+          (!this.originJournal.appendMovementTurn || !this.originJournal.markMovementTurnApplied ||
+            !this.originJournal.markMovementTurnPersistenceCommitted ||
+            !this.originJournal.completeMovementTurnPreparation)) {
+        throw new Error("movement_turn_outbox_unavailable");
+      }
+      const journalResult = pendingMovement
+        ? this.originJournal?.appendMovementTurn?.({
+            ...pendingMovement,
+            turn: { command, beforeState },
+          })
+        : this.originJournal?.appendTransition({ streamId: player.id, command, beforeState });
+      if (journalResult?.status === "dropped_capacity") {
+        this.reportEvidenceCapacity(player, journalResult);
+        if (pendingMovement) throw new Error("movement_turn_evidence_capacity");
+      } else if (pendingMovement) {
+        movementEnvelopeCommitted = true;
+      }
     } catch (error) {
       const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
       logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
         playerId: player.id,
         playerName: player.name,
-        detail: { component: "origin_gameplay_journal", message: error instanceof Error ? error.message : String(error) },
+        detail: {
+          component: pendingMovement ? "origin_movement_turn_outbox" : "origin_gameplay_journal",
+          message: error instanceof Error ? error.message : String(error),
+        },
       });
-      this.addMessage(player, "Turn journal unavailable — retry shortly.");
-      return;
+      if (!pendingMovement) {
+        this.addMessage(player, "Turn journal unavailable — retry shortly.");
+        return;
+      }
+      // Mutation already began before post-effect vitals existed. Rolling the
+      // origin turn forward avoids a free move/attack; the sticky latch makes
+      // the missing atomic evidence visible and blocks any parity promotion.
+      // Planned evidence-capacity exhaustion remains the existing origin-only
+      // availability mode; unexpected append failures retain the global input
+      // fence because their durable outcome is ambiguous.
+      if (!(error instanceof Error && error.message === "movement_turn_evidence_capacity")) {
+        this.movementTurnPersistencePending = true;
+      }
+      this.shadowEvidenceDegraded = true;
+      this.addMessage(player, "Turn completed; shadow evidence is degraded.");
     }
-    player.state.turns = transition.state.turns;
-    player.state.hunger = transition.state.hunger;
-    player.state.hungerState = transition.state.hungerState;
-    player.state.entity.hp = transition.state.hp;
-    player.state.alive = transition.state.alive;
+    if (!pendingMovement) this.applyGameplayTransitionState(player, transition.state);
     this.totalTurns++;
     for (const event of transition.events) {
       if (event.type === "message") this.addMessage(player, event.text);
@@ -1670,8 +2238,219 @@ export class WorldServer {
     this.notePeripheralThreats(player, floor);
     this.revealFOV(player, floor);
     this.broadcastFloor(player.floorDepth, player.id);
-    this.touchPlayer(player);
-    this.touchFloor(floor);
+    const persistBeforeMovementCleanup = pendingMovement !== undefined && movementEnvelopeCommitted &&
+      (this.persistMovementTurn !== undefined || isPersistenceReady());
+    if (persistBeforeMovementCleanup) {
+      // The immediate durability fence below snapshots these objects now.
+      // Avoid also scheduling the normal 400 ms player/floor writes, which
+      // would duplicate every successful movement commit.
+      this.enforceFloorMonsterInvariant(floor, "runtime");
+      this.scheduleMetaPersist();
+    } else {
+      this.touchPlayer(player);
+      this.touchFloor(floor);
+    }
+    if (pendingMovement && movementEnvelopeCommitted) {
+      this.finishMovementTurnEvidence(player, affectedFloors, pendingMovement);
+    }
+  }
+
+  private finishMovementTurnEvidence(
+    player: OnlinePlayer,
+    floors: readonly FloorState[],
+    pendingMovement: PendingMovementTurn,
+  ): void {
+    // From this point the origin mutation and movement envelope exist. Keep
+    // input admission closed through every marker, persistence, publication,
+    // and cleanup failure until exact completion or cold recovery succeeds.
+    this.movementTurnPersistencePending = true;
+    const identity = {
+      streamId: pendingMovement.streamId,
+      operationId: pendingMovement.operationId,
+    };
+    try {
+      this.originJournal?.markMovementTurnApplied?.(identity);
+    } catch (error) {
+      this.logMovementTurnFailure(player, "origin_movement_turn_preparation", error);
+      try {
+        // A rename or directory-fsync acknowledgement may have been lost. This
+        // retry only advances the marker to origin_applied; it never clears the
+        // durability fence before the corresponding state snapshot commits.
+        this.originJournal?.markMovementTurnApplied?.(identity);
+      } catch {
+        this.shadowEvidenceDegraded = true;
+        this.addMessage(player, "Turn completed; shadow evidence is degraded.");
+        return;
+      }
+    }
+
+    const receiptBacked = this.persistMovementTurn === undefined && isPersistenceReady();
+    const persist = this.persistMovementTurn ?? (receiptBacked
+      ? (snapshotPlayer: OnlinePlayer, snapshotFloors: readonly FloorState[],
+          snapshotIdentity: MovementTurnPersistenceIdentity, combatEnvelope?: CombatTurnEnvelopeV1) =>
+          saveMovementTurnNow(
+            snapshotPlayer,
+            snapshotFloors,
+            snapshotIdentity,
+            this.movementTurnPersistenceCrashHooks,
+            combatEnvelope,
+          )
+      : null);
+    if (!persist) {
+      const completed = this.completeMovementTurnEvidence(player, identity, pendingMovement.combatEnvelope);
+      this.movementTurnPersistencePending = !completed;
+      if (completed) this.drainDeferredLifecyclePersistence();
+      return;
+    }
+
+    this.shadowEvidenceDegraded = true;
+    let durability: Promise<void>;
+    try {
+      durability = persist(player, floors, identity, pendingMovement.combatEnvelope);
+    } catch (error) {
+      // The origin mutation has started and the durable preparation remains.
+      // Keep admission closed until exact recovery proves the operation safe.
+      this.movementTurnPersistencePending = true;
+      this.logMovementTurnFailure(player, "origin_movement_turn_persistence", error);
+      this.addMessage(player, "Turn completed; shadow evidence is degraded.");
+      return;
+    }
+    const completion = Promise.resolve(durability).then(
+      async () => {
+        const completed = this.completeMovementTurnEvidence(player, identity, pendingMovement.combatEnvelope);
+        if (completed && receiptBacked) {
+          try {
+            // Delete only after the durable filesystem marker is gone. A crash
+            // between those operations leaves a harmless boot-prunable receipt.
+            await deleteMovementTurnCommit(identity);
+          } catch (error) {
+            this.logMovementTurnFailure(player, "origin_movement_turn_receipt_cleanup", error);
+          }
+        }
+        this.movementTurnPersistencePending = !completed;
+        if (completed) this.drainDeferredLifecyclePersistence();
+      },
+      (error: unknown) => {
+        this.movementTurnPersistencePending = true;
+        this.shadowEvidenceDegraded = true;
+        this.logMovementTurnFailure(player, "origin_movement_turn_persistence", error);
+        this.addMessage(player, "Turn completed; shadow evidence is degraded.");
+      },
+    );
+    this.movementTurnPersistenceTask = completion;
+    const clearCompletion = () => {
+      if (this.movementTurnPersistenceTask === completion) {
+        this.movementTurnPersistenceTask = null;
+      }
+    };
+    void completion.then(clearCompletion, clearCompletion);
+  }
+
+  private completeMovementTurnEvidence(
+    player: OnlinePlayer,
+    identity: { streamId: string; operationId: string },
+    combatEnvelope?: CombatTurnEnvelopeV1,
+  ): boolean {
+    if (combatEnvelope) {
+      try {
+        this.publishCombatTurnEnvelope(combatEnvelope);
+      } catch (error) {
+        this.logMovementTurnFailure(player, "origin_combat_turn_outbox_publish", error);
+        this.shadowEvidenceDegraded = true;
+        this.addMessage(player, "Turn completed; combat evidence is awaiting retry.");
+        return false;
+      }
+    }
+    let persistenceCommitted = false;
+    try {
+      this.originJournal?.markMovementTurnPersistenceCommitted?.(identity);
+      persistenceCommitted = true;
+    } catch (error) {
+      this.logMovementTurnFailure(player, "origin_movement_turn_persistence_marker", error);
+      try {
+        // A rename or directory-fsync acknowledgement may have been lost after
+        // every state write committed. Retry only this monotonic phase advance.
+        this.originJournal?.markMovementTurnPersistenceCommitted?.(identity);
+        persistenceCommitted = true;
+      } catch {
+        // Preserve the earlier durable fence; cold recovery must not infer that
+        // persistence completed without this phase.
+      }
+    }
+    if (!persistenceCommitted) {
+      this.shadowEvidenceDegraded = true;
+      this.addMessage(player, "Turn completed; shadow evidence is degraded.");
+      return false;
+    }
+
+    let completed = false;
+    try {
+      this.originJournal?.completeMovementTurnPreparation?.(identity);
+      completed = true;
+    } catch (error) {
+      this.logMovementTurnFailure(player, "origin_movement_turn_preparation", error);
+      try {
+        // Unlink or directory-fsync acknowledgement loss is safe to retry only
+        // here, after the player and floor snapshots have committed.
+        this.originJournal?.completeMovementTurnPreparation?.(identity);
+        completed = true;
+      } catch {
+        // Preserve the original failure and the durable preparation fence.
+      }
+    }
+    if (completed) {
+      try {
+        this.shadowEvidenceDegraded = this.originJournal?.hasPendingMovementTurn?.call(this.originJournal) ?? true;
+      } catch {
+        this.shadowEvidenceDegraded = true;
+      }
+    } else {
+      this.shadowEvidenceDegraded = true;
+    }
+    if (this.shadowEvidenceDegraded) {
+      this.addMessage(player, "Turn completed; shadow evidence is degraded.");
+    }
+    return completed;
+  }
+
+  private publishCombatTurnEnvelope(envelope: CombatTurnEnvelopeV1): void {
+    const append = this.originJournal?.appendCombatTurnEnvelope;
+    if (!append) throw new Error("combat_turn_outbox_unavailable");
+    const publish = () => append.call(this.originJournal, envelope);
+    try {
+      const result = publish();
+      if (result.envelope.envelopeHash !== envelope.envelopeHash) {
+        throw new Error("combat_turn_outbox_hash_mismatch");
+      }
+    } catch {
+      // A file/commit fsync acknowledgement can be lost after publication.
+      // Exact-envelope retry is either duplicate or reproduces the failure;
+      // no gameplay logic or randomness is executed here.
+      const result = publish();
+      if (result.envelope.envelopeHash !== envelope.envelopeHash) {
+        throw new Error("combat_turn_outbox_hash_mismatch");
+      }
+    }
+  }
+
+  private logMovementTurnFailure(player: OnlinePlayer, component: string, error: unknown): void {
+    const conn = [...this.connections.values()].find((candidate) => candidate.playerId === player.id);
+    logEvent("server_error", conn?.sessionId ?? "shadow-journal", {
+      playerId: player.id,
+      playerName: player.name,
+      detail: {
+        component,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+
+  private applyGameplayTransitionState(player: OnlinePlayer, state: GameplayState): void {
+    player.state.turns = state.turns;
+    player.state.hunger = state.hunger;
+    player.state.hungerState = state.hungerState;
+    player.state.entity.hp = state.hp;
+    player.state.alive = state.alive;
   }
 
   /** world-events: reinforcements + env teeth + ambient flavor (anti-spam). */
@@ -2138,6 +2917,7 @@ export class WorldServer {
   private getOrCreateFloor(depth: number): FloorState {
     let floor = this.floors.get(depth);
     if (floor) {
+      floor.movementAuthority ??= this.resolveMovementAuthority(floor.depth, floor.seed, false);
       this.enforceFloorMonsterInvariant(floor, "runtime");
       // trap-pressure handoff — regenerate traps if floor loaded pre-traps
       floor.traps = ensureFloorTraps(floor.dungeon, floor.depth, floor.seed, floor.traps);
@@ -2151,12 +2931,14 @@ export class WorldServer {
     const rng = new RNG(this.worldSeed + depth * 7919);
     const dungeon = generateDungeon(rng, depth);
     const seed = this.worldSeed + depth * 7919;
+    const movementAuthority = this.resolveMovementAuthority(depth, seed, true);
     floor = {
       depth,
       dungeon,
       monsters: [],
       items: [],
       seed,
+      movementAuthority,
       traps: [],
       eventState: createFloorEventState(),
     };
@@ -2178,8 +2960,39 @@ export class WorldServer {
     }
 
     this.floors.set(depth, floor);
+    this.pendingMovementAuthorityRotations.delete(depth);
     this.touchFloor(floor);
     return floor;
+  }
+
+  private resolveMovementAuthority(depth: number, floorSeed: number, rotate: boolean): MovementState["authority"] {
+    let rotationId = `${this.movementAuthorityBootstrapId}-d${depth}`;
+    if (rotate) {
+      const pending = this.pendingMovementAuthorityRotations.get(depth);
+      rotationId = pending ?? `${randomUUID()}-d${depth}`;
+      if (!pending) this.pendingMovementAuthorityRotations.set(depth, rotationId);
+    }
+    const durable = this.originJournal?.movementAuthorityForFloor;
+    if (durable) {
+      const authority = durable.call(this.originJournal, {
+        realmId: "legacy-1",
+        depth,
+        floorSeed,
+        rotate,
+        rotationId,
+      });
+      return authority;
+    }
+    // Narrow injected-journal tests do not own a sidecar. Keep their authority
+    // process-scoped; production always uses OriginGameplayJournal above.
+    const fallback: MovementState["authority"] = {
+      realmId: "legacy-1",
+      floorInstanceId: rotationId,
+      depth,
+      floorEpoch: 1,
+      rulesetVersion: 1,
+    };
+    return fallback;
   }
 
   private spawnMonsters(floor: FloorState, rng: RNG): void {

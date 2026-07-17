@@ -12,6 +12,8 @@
     "build": "tsc && vite build",
     "build:server": "tsc -p server/tsconfig.json",
     "check:server-types": "node scripts/check-server-type-baseline.mjs",
+    "ci": "bash scripts/ci-local.sh full",
+    "ci:quick": "bash scripts/ci-local.sh quick",
     "lint": "eslint . --max-warnings=0",
     "server": "tsx server/index.ts",
     "tunnel": "cloudflared tunnel --url http://localhost:8080",

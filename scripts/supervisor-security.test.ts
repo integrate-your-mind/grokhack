@@ -150,16 +150,22 @@ if server_process_needed; then printf 'unhealthy=boot\n'; else printf 'unhealthy
   });
 
   it("makes deploys fail closed behind all release gates and the pinned Wrangler", () => {
+    // Canonical free local CI replaces GitHub-hosted Actions (billing lock / $0).
+    expect(deploy).toContain("npm run ci");
+    expect(deploy).toContain("local CI");
+    const localCi = readFileSync(join(import.meta.dirname, "ci-local.sh"), "utf8");
     for (const command of [
       "npm run lint",
       "npm run test:coverage",
       "npm test -- --sequence.shuffle --sequence.seed=20260710",
+      "npm run test:property",
+      "npm run test:shadow-e2e",
       "npm run build",
       "npm run check:server-types",
-      "npm run mcp:build",
       "npm run edge:verify",
+      "npm run mcp:build",
     ]) {
-      expect(deploy).toContain(command);
+      expect(localCi).toContain(command);
     }
     expect(deploy).toContain('local wrangler="$ROOT/edge/node_modules/.bin/wrangler"');
     expect(deploy).not.toContain("npx wrangler pages deploy");

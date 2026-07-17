@@ -1,36 +1,46 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { DuckDBInstance } from "@duckdb/node-api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMonster, createPlayer, createStarterItems, nextId, resetEntityCounterForTests } from "../src/entities.js";
 import type { OnlinePlayer } from "./types.js";
 import {
   appendChatMessages,
   closePersistence,
   countPlayers,
+  deleteMovementTurnCommit,
   listPlayerNames,
   flushPersistence,
   getSchemaVersion,
+  hasMovementTurnCommit,
   initPersistence,
+  isPersistenceReady,
   loadFloorByDepth,
   loadPlayerByName,
   isResumablePlayer,
   loadRecentChat,
   loadResumablePlayerByName,
   loadWorld,
+  readMovementTurnCombatOutbox,
   resetPersistenceForTests,
   saveFloorNow,
+  saveMovementTurnNow,
   savePlayerNow,
   saveWorldMeta,
   scheduleSaveFloor,
   scheduleSavePlayer,
   scheduleSaveWorldMeta,
   SCHEMA_VERSION,
+  SCHEMA_WRITE_VERSION,
 } from "./persistence.js";
 import { WorldServer } from "./world.js";
+import { OriginGameplayJournal } from "./origin-journal.js";
 import type { ClientConnection } from "./types.js";
-import { generateDungeon } from "../src/dungeon.js";
+import { generateDungeon, isWalkable } from "../src/dungeon.js";
 import { RNG } from "../src/rng.js";
+import { createCombatTurnEnvelopeV1 } from "../src/combat-turn-envelope.js";
 
 function mockConn(id: string): ClientConnection {
   return {
@@ -69,6 +79,8 @@ function samplePlayer(name: string): OnlinePlayer {
       inventory: createStarterItems(),
       equippedWeapon: null,
       equippedArmor: null,
+      equippedRing: null,
+      statuses: [],
       gold: 12,
       turns: 9,
       depth: 2,
@@ -82,6 +94,55 @@ function samplePlayer(name: string): OnlinePlayer {
     lastActive: Date.now(),
     scoreRecorded: false,
   };
+}
+
+function movementPersistenceIdentity(operationId = "00000000-0000-4000-8000-000000000001") {
+  return {
+    streamId: `turn_${"a".repeat(48)}`,
+    operationId,
+  };
+}
+
+function ordinaryCombatStep(floor: ReturnType<WorldServer["buildView"]>["floor"]): {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  key: string;
+} {
+  const directions = [
+    { dx: 1, dy: 0, key: "l" },
+    { dx: -1, dy: 0, key: "h" },
+    { dx: 0, dy: 1, key: "j" },
+    { dx: 0, dy: -1, key: "k" },
+  ] as const;
+  const step = floor.dungeon.tiles.flatMap((row, y) => row.map((_tile, x) => ({ x, y })))
+    .flatMap(({ x, y }) => directions.map((direction) => ({ x, y, ...direction })))
+    .find(({ x, y, dx, dy }) =>
+      isWalkable(floor.dungeon.tiles, x, y) &&
+      isWalkable(floor.dungeon.tiles, x + dx, y + dy));
+  if (!step) throw new Error("generated floor has no adjacent combat step");
+  return step;
+}
+
+function sampleCombatEnvelope(
+  identity: ReturnType<typeof movementPersistenceIdentity>,
+  attackerName: string,
+) {
+  return createCombatTurnEnvelopeV1({
+    streamId: `combat_${"c".repeat(48)}`,
+    route: { realmId: "combat-test", floorInstanceId: "floor-2", depth: 2, floorEpoch: 1, rulesetVersion: 1 },
+    cursor: 1,
+    operationId: identity.operationId,
+    attacker: { id: "player", name: attackerName, hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+    defender: { id: "rat", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+    options: { weaponName: "short sword", hitPenalty: 0, critChance: 0 },
+    transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+    turn: {
+      command: { type: "advance_turn", action: "other" },
+      beforeState: { turns: 9, depth: 2, hunger: 700, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true },
+    },
+  });
 }
 
 async function simulateCrashRestart(): Promise<void> {
@@ -107,8 +168,823 @@ describe("duckdb persistence", () => {
   });
 
   it("applies schema migrations and indexes base version", async () => {
-    expect(await getSchemaVersion()).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(1);
+    expect(await getSchemaVersion()).toBe(SCHEMA_WRITE_VERSION);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(SCHEMA_WRITE_VERSION);
+  });
+
+  it("keeps the additive combat outbox at the schema-v2 write epoch", async () => {
+    expect(await getSchemaVersion()).toBe(SCHEMA_WRITE_VERSION);
+
+    await closePersistence();
+    const rollbackProbe = await DuckDBInstance.create(testDbPath());
+    const rollbackConnection = await rollbackProbe.connect();
+    const version = await rollbackConnection.runAndReadAll(
+      `SELECT COALESCE(MAX(version), 0)::INTEGER AS version FROM schema_migrations`,
+    );
+    const outbox = await rollbackConnection.runAndReadAll(`
+      SELECT COUNT(*)::INTEGER AS count
+        FROM information_schema.tables
+       WHERE table_schema = 'main' AND table_name = 'movement_turn_combat_outbox'
+    `);
+    expect(version.getRowObjectsJson()).toEqual([{ version: 2 }]);
+    expect(outbox.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    rollbackConnection.closeSync();
+    await initPersistence();
+  });
+
+  it("continues to read an already-emitted schema-v3 marker without advancing it", async () => {
+    await closePersistence();
+    const incidentDatabase = await DuckDBInstance.create(testDbPath());
+    const incidentConnection = await incidentDatabase.connect();
+    await incidentConnection.run(
+      `INSERT INTO schema_migrations (version, applied_at) VALUES (3, $applied_at)`,
+      { applied_at: Date.now() },
+    );
+    incidentConnection.closeSync();
+
+    await initPersistence();
+    expect(await getSchemaVersion()).toBe(3);
+    const player = samplePlayer("ExistingV3Reader");
+    const floor = {
+      depth: 2,
+      seed: 413,
+      dungeon: generateDungeon(new RNG(413), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000014");
+    await expect(saveMovementTurnNow(player, [floor], identity, {}, sampleCombatEnvelope(identity, player.name)))
+      .resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
+  it("upgrades a version-one database with the additive movement receipt table", async () => {
+    await closePersistence();
+    const legacy = await DuckDBInstance.create(testDbPath());
+    const legacyConnection = await legacy.connect();
+    await legacyConnection.run(`DROP TABLE movement_turn_combat_outbox`);
+    await legacyConnection.run(`DROP TABLE movement_turn_commits`);
+    await legacyConnection.run(`DELETE FROM schema_migrations WHERE version >= 2`);
+    legacyConnection.closeSync();
+
+    await initPersistence();
+    expect(await getSchemaVersion()).toBe(SCHEMA_WRITE_VERSION);
+    const player = samplePlayer("MigrationReceipt");
+    const floor = {
+      depth: 2,
+      seed: 406,
+      dungeon: generateDungeon(new RNG(406), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000006");
+    await saveMovementTurnNow(player, [floor], identity);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
+  it("opens the original schema-v2 receipt table without rewriting its shape", async () => {
+    await closePersistence();
+    const previousV2 = await DuckDBInstance.create(testDbPath());
+    const previousV2Connection = await previousV2.connect();
+    await previousV2Connection.run(`DROP TABLE movement_turn_combat_outbox`);
+    await previousV2Connection.run(`DROP TABLE movement_turn_commits`);
+    await previousV2Connection.run(`
+      CREATE TABLE movement_turn_commits (
+        stream_id VARCHAR NOT NULL,
+        operation_id VARCHAR NOT NULL,
+        player_id VARCHAR NOT NULL,
+        floor_depth_1 INTEGER NOT NULL,
+        floor_depth_2 INTEGER,
+        snapshot_hash VARCHAR NOT NULL,
+        committed_at BIGINT NOT NULL,
+        PRIMARY KEY (stream_id, operation_id)
+      )
+    `);
+    await previousV2Connection.run(`DELETE FROM schema_migrations WHERE version = 3`);
+    previousV2Connection.closeSync();
+
+    await initPersistence();
+    expect(await getSchemaVersion()).toBe(SCHEMA_WRITE_VERSION);
+    const player = samplePlayer("PreviousV2Receipt");
+    const floor = {
+      depth: 2,
+      seed: 408,
+      dungeon: generateDungeon(new RNG(408), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000a");
+    await expect(saveMovementTurnNow(player, [floor], identity)).resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
+  it("supports the transient single-slot schema-v2 table without rewriting it", async () => {
+    await closePersistence();
+    const transientV2 = await DuckDBInstance.create(testDbPath());
+    const transientV2Connection = await transientV2.connect();
+    await transientV2Connection.run(`DROP TABLE movement_turn_combat_outbox`);
+    await transientV2Connection.run(`DELETE FROM schema_migrations WHERE version = 3`);
+    await transientV2Connection.run(`DROP TABLE movement_turn_commits`);
+    await transientV2Connection.run(`
+      CREATE TABLE movement_turn_commits (
+        slot INTEGER PRIMARY KEY CHECK (slot = 1),
+        stream_id VARCHAR NOT NULL,
+        operation_id VARCHAR NOT NULL,
+        player_id VARCHAR NOT NULL,
+        floor_depth_1 INTEGER NOT NULL,
+        floor_depth_2 INTEGER,
+        snapshot_hash VARCHAR NOT NULL,
+        committed_at BIGINT NOT NULL,
+        UNIQUE (stream_id, operation_id)
+      )
+    `);
+    await transientV2Connection.run(`
+      INSERT INTO movement_turn_commits (
+        slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      ) VALUES (
+        1, 'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        '00000000-0000-4000-8000-00000000000d',
+        'transient-writer-player', 1, NULL,
+        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 1
+      )
+    `);
+    transientV2Connection.closeSync();
+
+    await initPersistence();
+    const player = samplePlayer("TransientV2Receipt");
+    const floor = {
+      depth: 2,
+      seed: 410,
+      dungeon: generateDungeon(new RNG(410), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000e");
+    await expect(saveMovementTurnNow(player, [floor], identity)).resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+
+    await closePersistence();
+    const preserved = await DuckDBInstance.create(testDbPath());
+    const preservedConnection = await preserved.connect();
+    const slotColumns = await preservedConnection.runAndReadAll(`
+      SELECT COUNT(*)::INTEGER AS count
+        FROM information_schema.columns
+       WHERE table_schema = 'main' AND table_name = 'movement_turn_commits' AND column_name = 'slot'
+    `);
+    expect(slotColumns.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    const receiptCount = await preservedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count FROM movement_turn_commits`,
+    );
+    expect(receiptCount.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    preservedConnection.closeSync();
+    await initPersistence();
+  });
+
+  it("keeps the schema-v2 table writable by the previous receipt column list", async () => {
+    await closePersistence();
+    const previousWriter = await DuckDBInstance.create(testDbPath());
+    const previousWriterConnection = await previousWriter.connect();
+    await expect(previousWriterConnection.run(`
+      INSERT INTO movement_turn_commits (
+        stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+      ) VALUES (
+        'turn_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        '00000000-0000-4000-8000-00000000000b',
+        'previous-writer-player', 1, NULL,
+        'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 1
+      )
+    `)).resolves.toBeDefined();
+    previousWriterConnection.closeSync();
+
+    await initPersistence();
+    const player = samplePlayer("PreviousWriterReceipt");
+    const floor = {
+      depth: 2,
+      seed: 409,
+      dungeon: generateDungeon(new RNG(409), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-00000000000c");
+    await saveMovementTurnNow(player, [floor], identity);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+  });
+
+  it("rejects a future schema before recreating or writing any table", async () => {
+    await closePersistence();
+    const future = await DuckDBInstance.create(testDbPath());
+    const futureConnection = await future.connect();
+    await futureConnection.run(`DROP TABLE movement_turn_commits`);
+    await futureConnection.run(
+      `INSERT INTO schema_migrations (version, applied_at) VALUES ($version, $applied_at)`,
+      { version: SCHEMA_VERSION + 1, applied_at: Date.now() },
+    );
+    futureConnection.closeSync();
+
+    await expect(initPersistence()).rejects.toThrow("unsupported_persistence_schema_version");
+    expect(isPersistenceReady()).toBe(false);
+    await resetPersistenceForTests();
+
+    const inspected = await DuckDBInstance.create(testDbPath());
+    const inspectedConnection = await inspected.connect();
+    const reader = await inspectedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count
+         FROM information_schema.tables
+        WHERE table_name = 'movement_turn_commits'`,
+    );
+    expect(reader.getRowObjectsJson()).toEqual([{ count: 0 }]);
+    inspectedConnection.closeSync();
+  });
+
+  it("commits the movement snapshot atomically across process-crash boundaries", async () => {
+    const child = `
+      import { createCombatTurnEnvelopeV1 } from "./src/combat-turn-envelope.ts";
+      import {
+        closePersistence,
+        flushPersistence,
+        initPersistence,
+        hasMovementTurnCommit,
+        loadWorld,
+        readMovementTurnCombatOutbox,
+        saveFloorNow,
+        saveMovementTurnNow,
+        savePlayerNow,
+        saveWorldMeta,
+      } from "./server/persistence.ts";
+      const mode = process.argv[1];
+      const crashPoint = process.argv[2] ?? "none";
+      const identity = {
+        streamId: "turn_${"a".repeat(48)}",
+        operationId: process.argv[3] ?? "00000000-0000-4000-8000-000000000001",
+      };
+      await initPersistence();
+      if (mode === "seed_state") {
+        const player = {
+          id: "atomic-player", name: "AtomicMover", glyph: "@", kind: "human",
+          state: { depth: 1, entity: { x: 1, y: 1 }, alive: true },
+          explored: [[true]], messages: [], phase: "playing", floorDepth: 1,
+          connected: false, lastActive: 1, scoreRecorded: false,
+        };
+        const item = { id: "atomic-item", char: "%", name: "atomic ration", type: "food", identified: true, power: 0 };
+        await saveWorldMeta({ worldSeed: 42, totalTurns: 0, startedAt: 1 });
+        await savePlayerNow(player);
+        await saveFloorNow({
+          depth: 1,
+          seed: 101,
+          dungeon: {},
+          monsters: [],
+          items: [{ x: 1, y: 1, item }],
+          traps: [{ id: "atomic-trap", kind: "bear", x: 1, y: 1, revealed: false, sprung: false }],
+          eventState: {
+            turnCounter: 0, lastReinforcementTurn: 0, lastEnvEventTurn: 0, lastAmbientTurn: 0,
+            enteredSpecials: [], discoveredSpecials: [], packSpotted: [], floorEnterDone: false,
+          },
+          eventBook: { lastEventTurn: 0, pollution: 0, lastReinforceCheckTurn: 0, migrationCooldownTurn: 0 },
+        });
+        await saveFloorNow({ depth: 2, seed: 202, dungeon: {}, monsters: [], items: [] });
+        await flushPersistence();
+        await closePersistence();
+      } else if (mode === "move_state") {
+        const world = await loadWorld();
+        if (!world) throw new Error("missing world");
+        const player = world.players.find((candidate) => candidate.name === "AtomicMover");
+        const source = world.floors.find((floor) => floor.depth === 1);
+        const destination = world.floors.find((floor) => floor.depth === 2);
+        if (!player || !source || !destination) throw new Error("missing movement snapshot");
+        player.floorDepth = 2;
+        player.state.depth = 2;
+        const [movedItem] = source.items.splice(0, 1);
+        if (movedItem) destination.items.push(movedItem);
+        source.traps[0].revealed = true;
+        source.traps[0].sprung = true;
+        source.eventState.turnCounter = 1;
+        source.eventBook.pollution = 1;
+        const combatEnvelope = createCombatTurnEnvelopeV1({
+          streamId: "combat_${"b".repeat(48)}",
+          route: { realmId: "atomic-test", floorInstanceId: "source", depth: 1, floorEpoch: 1, rulesetVersion: 1 },
+          cursor: 1,
+          operationId: identity.operationId,
+          attacker: { id: "atomic-player", name: "AtomicMover", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+          defender: { id: "atomic-rat", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+          options: { weaponName: null, hitPenalty: 0, critChance: 0 },
+          transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+          turn: {
+            command: { type: "advance_turn", action: "other" },
+            beforeState: { turns: 0, depth: 1, hunger: 1000, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true },
+          },
+        });
+        const crash = (point) => {
+          if (crashPoint === point) process.exit(71);
+        };
+        try {
+          await saveMovementTurnNow(player, [source, destination], identity, {
+            afterBegin() { crash("after_begin"); },
+            afterStaleCommitReceiptPrune() { crash("after_prune"); },
+            afterPlayerWrite() { crash("after_player"); },
+            afterFloorWrite(_depth, index) {
+              crash(index === 0 ? "after_source" : "after_destination");
+              if (crashPoint === "throw_after_source" && index === 0) {
+                throw new Error("injected movement transaction failure");
+              }
+            },
+            afterCommitReceiptWrite() { crash("after_receipt"); },
+            afterCombatOutboxWrite() { crash("after_outbox"); },
+            beforeCommit() { crash("before_commit"); },
+            afterCommit() { crash("after_commit"); },
+          }, combatEnvelope);
+        } catch (error) {
+          if (crashPoint !== "throw_after_source" ||
+              !(error instanceof Error) || error.message !== "injected movement transaction failure") {
+            throw error;
+          }
+          await closePersistence();
+          process.exit(72);
+        }
+        await flushPersistence();
+        await closePersistence();
+      } else {
+        const world = await loadWorld();
+        if (!world) throw new Error("missing world");
+        const player = world.players.find((candidate) => candidate.name === "AtomicMover");
+        const source = world.floors.find((floor) => floor.depth === 1);
+        const destination = world.floors.find((floor) => floor.depth === 2);
+        console.log("ATOMIC_RESULT=" + JSON.stringify({
+          playerDepth: player?.floorDepth,
+          sourceItems: source?.items.length,
+          destinationItems: destination?.items.length,
+          sourceTrapSprung: source?.traps?.[0]?.sprung,
+          sourceEventTurn: source?.eventState?.turnCounter,
+          sourcePollution: source?.eventBook?.pollution,
+          receipt: await hasMovementTurnCommit(identity),
+          outbox: Boolean(await readMovementTurnCombatOutbox(identity)),
+        }));
+        await closePersistence();
+      }
+    `;
+    const runChild = (
+      database: string,
+      mode: string,
+      crashPoint = "none",
+      operationId = "00000000-0000-4000-8000-000000000001",
+    ) => spawnSync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      child,
+      mode,
+      crashPoint,
+      operationId,
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, GROKHACK_DB_PATH: database },
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    const inspect = (
+      database: string,
+      operationId = "00000000-0000-4000-8000-000000000001",
+    ) => {
+      const inspected = runChild(database, "read_state", "none", operationId);
+      expect(inspected.status, inspected.stderr).toBe(0);
+      const resultLine = inspected.stdout.split("\n").find((line) => line.startsWith("ATOMIC_RESULT="));
+      expect(resultLine).toBeDefined();
+      return JSON.parse(resultLine!.slice("ATOMIC_RESULT=".length)) as Record<string, number>;
+    };
+    const baseline = {
+      playerDepth: 1,
+      sourceItems: 1,
+      destinationItems: 0,
+      sourceTrapSprung: false,
+      sourceEventTurn: 0,
+      sourcePollution: 0,
+      receipt: false,
+      outbox: false,
+    };
+    const committed = {
+      playerDepth: 2,
+      sourceItems: 0,
+      destinationItems: 1,
+      sourceTrapSprung: true,
+      sourceEventTurn: 1,
+      sourcePollution: 1,
+      receipt: true,
+      outbox: true,
+    };
+
+    for (const crashPoint of [
+      "after_begin",
+      "after_prune",
+      "after_player",
+      "after_source",
+      "after_destination",
+      "after_receipt",
+      "after_outbox",
+      "before_commit",
+    ]) {
+      const database = path.join(tmpDir, `${crashPoint}.duckdb`);
+      const seeded = runChild(database, "seed_state");
+      expect(seeded.status, seeded.stderr).toBe(0);
+      const crashed = runChild(database, "move_state", crashPoint);
+      expect(crashed.status, `${crashPoint}: ${crashed.stderr}`).toBe(71);
+      expect(inspect(database), crashPoint).toEqual(baseline);
+    }
+
+    const committedDatabase = path.join(tmpDir, "after_commit.duckdb");
+    expect(runChild(committedDatabase, "seed_state").status).toBe(0);
+    const afterCommit = runChild(committedDatabase, "move_state", "after_commit");
+    expect(afterCommit.status, afterCommit.stderr).toBe(71);
+    expect(inspect(committedDatabase)).toEqual(committed);
+
+    const retryDatabase = path.join(tmpDir, "failure-retry.duckdb");
+    expect(runChild(retryDatabase, "seed_state").status).toBe(0);
+    const failed = runChild(retryDatabase, "move_state", "throw_after_source");
+    expect(failed.status, failed.stderr).toBe(72);
+    expect(inspect(retryDatabase)).toEqual(baseline);
+    const retried = runChild(retryDatabase, "move_state");
+    expect(retried.status, retried.stderr).toBe(0);
+    expect(inspect(retryDatabase)).toEqual(committed);
+
+    const staleReceiptDatabase = path.join(tmpDir, "stale-receipt-after-prune.duckdb");
+    const staleOperationId = "00000000-0000-4000-8000-000000000001";
+    const replacementOperationId = "00000000-0000-4000-8000-000000000010";
+    expect(runChild(staleReceiptDatabase, "seed_state").status).toBe(0);
+    const firstCommit = runChild(staleReceiptDatabase, "move_state", "none", staleOperationId);
+    expect(firstCommit.status, firstCommit.stderr).toBe(0);
+    expect(inspect(staleReceiptDatabase, staleOperationId)).toEqual(committed);
+    const prunedThenCrashed = runChild(
+      staleReceiptDatabase,
+      "move_state",
+      "after_prune",
+      replacementOperationId,
+    );
+    expect(prunedThenCrashed.status, prunedThenCrashed.stderr).toBe(71);
+    expect(inspect(staleReceiptDatabase, staleOperationId)).toEqual(committed);
+    expect(inspect(staleReceiptDatabase, replacementOperationId)).toEqual({
+      ...committed,
+      receipt: false,
+      outbox: false,
+    });
+  }, 30_000);
+
+  it("rejects missing, duplicate, and oversized movement floor sets before writing", async () => {
+    const player = samplePlayer("AtomicFloorValidation");
+    const floor = {
+      depth: 1,
+      seed: 303,
+      dungeon: generateDungeon(new RNG(303), 1),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity();
+    await expect(saveMovementTurnNow(player, [], identity)).rejects.toThrow("invalid_movement_turn_persistence_floors");
+    await expect(saveMovementTurnNow(player, [floor, floor], identity)).rejects.toThrow(
+      "invalid_movement_turn_persistence_floors",
+    );
+    await expect(saveMovementTurnNow(player, [
+      floor,
+      { ...floor, depth: 2 },
+      { ...floor, depth: 3 },
+    ], identity)).rejects.toThrow("invalid_movement_turn_persistence_floors");
+    await expect(saveMovementTurnNow(player, [floor], {
+      ...identity,
+      operationId: "tampered",
+    })).rejects.toThrow("invalid_movement_turn_persistence_identity");
+  });
+
+  it("makes exact receipt retries idempotent and rejects snapshot tampering", async () => {
+    const player = samplePlayer("AtomicReceiptRetry");
+    const floor = {
+      depth: 2,
+      seed: 404,
+      dungeon: generateDungeon(new RNG(404), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000002");
+
+    await saveMovementTurnNow(player, [floor], identity);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+    await expect(saveMovementTurnNow(player, [floor], identity)).resolves.toBeUndefined();
+
+    player.state.hunger -= 1;
+    await savePlayerNow(player);
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+    await expect(saveMovementTurnNow(player, [floor], identity))
+      .rejects.toThrow("movement_turn_persistence_receipt_conflict");
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+  });
+
+  it("stores, retries, rejects tampering, and deletes the exact combat outbox envelope with its receipt", async () => {
+    const player = samplePlayer("CombatOutboxReceipt");
+    const floor = {
+      depth: 2,
+      seed: 411,
+      dungeon: generateDungeon(new RNG(411), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000011");
+    const envelopeInput = {
+      streamId: `combat_${"c".repeat(48)}`,
+      route: { realmId: "combat-test", floorInstanceId: "floor-2", depth: 2, floorEpoch: 1, rulesetVersion: 1 },
+      cursor: 1,
+      operationId: identity.operationId,
+      attacker: { id: "player", name: "CombatOutboxReceipt", hp: 20, maxHp: 20, attack: 8, defense: 2, isPlayer: true, traits: [], enraged: false },
+      defender: { id: "rat", name: "giant rat", hp: 8, maxHp: 8, attack: 2, defense: 1, isPlayer: false, traits: [], enraged: false },
+      options: { weaponName: "short sword", hitPenalty: 0, critChance: 0 },
+      transcript: { hit: 0, crit: 0.9, variance: 0.5, severityFlavor: 0, killFlavor: 0 },
+      turn: {
+        command: { type: "advance_turn", action: "other" },
+        beforeState: { turns: 9, depth: 2, hunger: 700, maxHunger: 1000, hungerState: "normal", hp: 20, alive: true },
+      },
+    } as const;
+    const envelope = createCombatTurnEnvelopeV1(envelopeInput);
+    const tamperedEnvelope = createCombatTurnEnvelopeV1({
+      ...envelopeInput,
+      attacker: { ...envelopeInput.attacker, hp: 19 },
+    });
+    const mismatchedEnvelope = createCombatTurnEnvelopeV1({
+      ...envelopeInput,
+      operationId: "00000000-0000-4000-8000-000000000012",
+    });
+
+    await expect(saveMovementTurnNow(player, [floor], identity, {}, mismatchedEnvelope))
+      .rejects.toThrow("movement_turn_combat_outbox_identity_mismatch");
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+    expect(await readMovementTurnCombatOutbox(identity)).toBeNull();
+    await saveMovementTurnNow(player, [floor], identity, {}, envelope);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+    expect(await readMovementTurnCombatOutbox(identity)).toEqual(envelope);
+    await expect(saveMovementTurnNow(player, [floor], identity, {}, envelope)).resolves.toBeUndefined();
+    await expect(saveMovementTurnNow(player, [floor], identity, {}, tamperedEnvelope))
+      .rejects.toThrow("movement_turn_persistence_receipt_conflict");
+    expect(await readMovementTurnCombatOutbox(identity)).toEqual(envelope);
+
+    await closePersistence();
+    const tampered = await DuckDBInstance.create(testDbPath());
+    const tamperedConnection = await tampered.connect();
+    await tamperedConnection.run(
+      `UPDATE movement_turn_combat_outbox
+          SET envelope_hash = $envelope_hash, envelope_json = $envelope_json
+        WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+      {
+        stream_id: identity.streamId,
+        operation_id: identity.operationId,
+        envelope_hash: tamperedEnvelope.envelopeHash,
+        envelope_json: JSON.stringify(tamperedEnvelope),
+      },
+    );
+    tamperedConnection.closeSync();
+    await initPersistence();
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+
+    await closePersistence();
+    const corrupted = await DuckDBInstance.create(testDbPath());
+    const corruptedConnection = await corrupted.connect();
+    await corruptedConnection.run(
+      `UPDATE movement_turn_combat_outbox
+          SET envelope_json = '{}'
+        WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+      { stream_id: identity.streamId, operation_id: identity.operationId },
+    );
+    corruptedConnection.closeSync();
+    await initPersistence();
+    await expect(readMovementTurnCombatOutbox(identity))
+      .rejects.toThrow("movement_turn_combat_outbox_corrupt");
+
+    await deleteMovementTurnCommit(identity);
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+    expect(await readMovementTurnCombatOutbox(identity)).toBeNull();
+  });
+
+  it("keeps a combat receipt valid while disconnect and resume wait behind publication", async () => {
+    const journal = new OriginGameplayJournal(path.join(tmpDir, "pending-lifecycle-journal"));
+    vi.spyOn(journal, "appendCombatTurnEnvelope").mockImplementation(() => {
+      throw new Error("injected combat publication outage");
+    });
+    const world = new WorldServer({ originJournal: journal });
+    const originalConnection = mockConn("pending-lifecycle-original");
+    world.registerConnection(originalConnection);
+    const player = await world.joinPlayer(originalConnection.id, "PendingLife");
+    if (typeof player === "string" || !player.resumeToken) throw new Error("pending lifecycle join failed");
+    await flushPersistence();
+
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.items = [];
+    floor.monsters = [];
+    const step = ordinaryCombatStep(floor);
+    const monster = createMonster("rat", step.x + step.dx, step.y + step.dy, floor.depth);
+    monster.hp = monster.maxHp = 1;
+    floor.monsters.push(monster);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.entity.attack = 50;
+    player.state.entity.hp = player.state.entity.maxHp = 999;
+    player.state.hunger = 2_000;
+    vi.spyOn(Math, "random").mockReturnValue(0);
+
+    world.handleInput(player.id, step.key);
+
+    let candidate = journal.movementTurnRecoveryCandidate();
+    if (!candidate) throw new Error("missing combat movement recovery candidate");
+    await vi.waitFor(async () => {
+      expect(await hasMovementTurnCommit(candidate!)).toBe(true);
+      expect(await readMovementTurnCombatOutbox(candidate!)).not.toBeNull();
+    });
+
+    world.removeConnection(originalConnection.id);
+    await flushPersistence();
+    expect(await hasMovementTurnCommit(candidate)).toBe(true);
+    expect(await readMovementTurnCombatOutbox(candidate)).not.toBeNull();
+
+    const resumedConnection = mockConn("pending-lifecycle-resume");
+    world.registerConnection(resumedConnection);
+    const resumed = await world.joinPlayer(
+      resumedConnection.id,
+      player.name,
+      "human",
+      player.resumeToken,
+    );
+    expect(resumed).toMatch(/Movement persistence is still committing/i);
+    expect(resumedConnection.playerId).toBeNull();
+    await flushPersistence();
+    expect(await hasMovementTurnCommit(candidate)).toBe(true);
+    expect(await readMovementTurnCombatOutbox(candidate)).not.toBeNull();
+  });
+
+  it("drains a deferred disconnect save after the movement fence clears", async () => {
+    const journal = new OriginGameplayJournal(path.join(tmpDir, "deferred-lifecycle-journal"));
+    let acknowledgePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      acknowledgePersistence = resolve;
+    });
+    const world = new WorldServer({
+      originJournal: journal,
+      persistMovementTurn: () => persistence,
+    });
+    const client = mockConn("deferred-lifecycle-client");
+    world.registerConnection(client);
+    const player = await world.joinPlayer(client.id, "DeferredLife");
+    if (typeof player === "string") throw new Error(player);
+    await flushPersistence();
+
+    const floor = world.buildView(player).floor;
+    floor.traps = [];
+    floor.items = [];
+    floor.monsters = [];
+    const step = ordinaryCombatStep(floor);
+    player.state.entity.x = step.x;
+    player.state.entity.y = step.y;
+    player.state.entity.hp = player.state.entity.maxHp = 999;
+    player.state.hunger = 2_000;
+    world.handleInput(player.id, step.key);
+    expect(journal.hasPendingMovementTurn()).toBe(true);
+
+    world.removeConnection(client.id);
+    await flushPersistence();
+    expect((await loadPlayerByName(player.name))?.connected).toBe(true);
+
+    acknowledgePersistence();
+    await vi.waitFor(() => {
+      expect(journal.hasPendingMovementTurn()).toBe(false);
+    });
+    await flushPersistence();
+    expect((await loadPlayerByName(player.name))?.connected).toBe(false);
+  });
+
+  it("keeps commit receipts in one slot across cleanup loss, later movement, and boot", async () => {
+    const player = samplePlayer("AtomicReceiptCeiling");
+    const floor = {
+      depth: 2,
+      seed: 407,
+      dungeon: generateDungeon(new RNG(407), 2),
+      monsters: [],
+      items: [],
+    };
+    const first = movementPersistenceIdentity("00000000-0000-4000-8000-000000000007");
+    const second = movementPersistenceIdentity("00000000-0000-4000-8000-000000000008");
+
+    // Leaving the first receipt simulates marker cleanup succeeding while its
+    // best-effort receipt DELETE fails.
+    await saveMovementTurnNow(player, [floor], first);
+    expect(await hasMovementTurnCommit(first)).toBe(true);
+    await saveMovementTurnNow(player, [floor], second);
+    expect(await hasMovementTurnCommit(first)).toBe(false);
+    expect(await hasMovementTurnCommit(second)).toBe(true);
+
+    await closePersistence();
+    const bounded = await DuckDBInstance.create(testDbPath());
+    const boundedConnection = await bounded.connect();
+    const receiptCount = await boundedConnection.runAndReadAll(
+      `SELECT COUNT(*)::INTEGER AS count FROM movement_turn_commits`,
+    );
+    expect(receiptCount.getRowObjectsJson()).toEqual([{ count: 1 }]);
+    boundedConnection.closeSync();
+    await initPersistence();
+    expect(await hasMovementTurnCommit(second)).toBe(true);
+
+    const journal = new OriginGameplayJournal(path.join(tmpDir, "receipt-cleanup-journal"));
+    await new WorldServer({ originJournal: journal }).hydrateFromDatabase();
+    expect(await hasMovementTurnCommit(second)).toBe(false);
+  });
+
+  it("fails the shared connection closed when transaction rollback fails", async () => {
+    const player = samplePlayer("AtomicRollbackPoison");
+    const floor = {
+      depth: 2,
+      seed: 405,
+      dungeon: generateDungeon(new RNG(405), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000003");
+
+    await expect(saveMovementTurnNow(player, [floor], identity, {
+      afterPlayerWrite() { throw new Error("injected transaction failure"); },
+      beforeRollback() { throw new Error("injected rollback failure"); },
+    })).rejects.toThrow("movement turn transaction rollback failed");
+    expect(isPersistenceReady()).toBe(false);
+    await expect(saveMovementTurnNow(
+      player,
+      [floor],
+      movementPersistenceIdentity("00000000-0000-4000-8000-000000000004"),
+    )).rejects.toThrow("persistence_connection_poisoned");
+
+    await resetPersistenceForTests();
+    await initPersistence();
+    const recoveryIdentity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000005");
+    await expect(saveMovementTurnNow(player, [floor], recoveryIdentity)).resolves.toBeUndefined();
+    expect(await hasMovementTurnCommit(recoveryIdentity)).toBe(true);
+  });
+
+  it("fails the shared connection closed when receipt cleanup rollback fails", async () => {
+    const player = samplePlayer("CleanupRollbackPoison");
+    const floor = {
+      depth: 2,
+      seed: 412,
+      dungeon: generateDungeon(new RNG(412), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000013");
+    const envelope = sampleCombatEnvelope(identity, player.name);
+    await saveMovementTurnNow(player, [floor], identity, {}, envelope);
+
+    await expect(deleteMovementTurnCommit(identity, {
+      afterCombatOutboxDelete() { throw new Error("injected cleanup failure"); },
+      beforeRollback() { throw new Error("injected cleanup rollback failure"); },
+    })).rejects.toThrow("movement turn cleanup rollback failed");
+    expect(isPersistenceReady()).toBe(false);
+    await expect(savePlayerNow(player)).rejects.toThrow("persistence_connection_poisoned");
+
+    await resetPersistenceForTests();
+    await initPersistence();
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+    expect(await readMovementTurnCombatOutbox(identity)).toEqual(envelope);
+  });
+
+  it("rolls receipt cleanup back without poisoning when rollback succeeds", async () => {
+    const player = samplePlayer("CleanupRollbackHealthy");
+    const floor = {
+      depth: 2,
+      seed: 414,
+      dungeon: generateDungeon(new RNG(414), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000015");
+    const envelope = sampleCombatEnvelope(identity, player.name);
+    await saveMovementTurnNow(player, [floor], identity, {}, envelope);
+
+    await expect(deleteMovementTurnCommit(identity, {
+      afterCombatOutboxDelete() { throw new Error("injected cleanup failure"); },
+    })).rejects.toThrow("injected cleanup failure");
+    expect(isPersistenceReady()).toBe(true);
+    expect(await hasMovementTurnCommit(identity)).toBe(true);
+    expect(await readMovementTurnCombatOutbox(identity)).toEqual(envelope);
+  });
+
+  it("retries cleanup safely after commit acknowledgement loss", async () => {
+    const player = samplePlayer("CleanupCommitAckLoss");
+    const floor = {
+      depth: 2,
+      seed: 415,
+      dungeon: generateDungeon(new RNG(415), 2),
+      monsters: [],
+      items: [],
+    };
+    const identity = movementPersistenceIdentity("00000000-0000-4000-8000-000000000016");
+    const envelope = sampleCombatEnvelope(identity, player.name);
+    await saveMovementTurnNow(player, [floor], identity, {}, envelope);
+
+    await expect(deleteMovementTurnCommit(identity, {
+      afterCommit() { throw new Error("injected cleanup commit acknowledgement loss"); },
+    })).rejects.toThrow("injected cleanup commit acknowledgement loss");
+    expect(isPersistenceReady()).toBe(true);
+    expect(await hasMovementTurnCommit(identity)).toBe(false);
+    expect(await readMovementTurnCombatOutbox(identity)).toBeNull();
+
+    await expect(deleteMovementTurnCommit(identity)).resolves.toBeUndefined();
+    expect(isPersistenceReady()).toBe(true);
   });
 
   it("coalesces turn metadata and flushes the latest snapshot", async () => {
@@ -174,7 +1050,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "!",
       name: "proof gem",
-      type: "misc",
+      type: "ring",
       identified: true,
       power: 0,
     });
@@ -251,7 +1127,7 @@ describe("duckdb persistence", () => {
             id: nextId("item"),
             char: "*",
             name: "crash-recovery gem",
-            type: "misc",
+            type: "ring",
             identified: true,
             power: 0,
           },
@@ -291,7 +1167,7 @@ describe("duckdb persistence", () => {
             id: nextId("item"),
             char: "*",
             name: "close-drain gem",
-            type: "misc",
+            type: "ring",
             identified: true,
             power: 0,
           },
@@ -331,7 +1207,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "/",
       name: "bob wand",
-      type: "misc",
+      type: "wand",
       identified: true,
       power: 1,
     });
@@ -421,7 +1297,7 @@ describe("duckdb persistence", () => {
       id: nextId("item"),
       char: "=",
       name: "ring of proof",
-      type: "misc",
+      type: "ring",
       identified: true,
       power: 0,
     });
@@ -433,7 +1309,7 @@ describe("duckdb persistence", () => {
         id: nextId("item"),
         char: "*",
         name: "floor diamond",
-        type: "misc",
+        type: "ring",
         identified: true,
         power: 0,
       },

@@ -149,6 +149,30 @@ function getResumeToken(name) {
     return undefined;
   }
 }
+function clearResumeToken(name) {
+  if (!name) return;
+  try {
+    const map = loadResumeMap();
+    const key = String(name).toLowerCase();
+    if (!(key in map)) return;
+    delete map[key];
+    localStorage.setItem("grokhack-resume", JSON.stringify(map));
+  } catch {
+    /* private mode */
+  }
+}
+/** Join failed before the server admitted us — do not sticky-reconnect as joined. */
+function resetJoinAttempt(message) {
+  joined = false;
+  resuming = false;
+  if (message) {
+    try {
+      $("join-err").textContent = message;
+    } catch {
+      /* ignore */
+    }
+  }
+}
 let inputLocked = false;
 let inputUnlockTimer = null;
 let pendingKey = null;
@@ -654,6 +678,23 @@ function handleMessage(msg) {
       scheduleReconnect();
       return;
     }
+    // Existing durable character without a matching browser resume key.
+    // Clear the bad local secret and stop pretending we are joined (which
+    // previously looped reconnects on the same failed name forever).
+    if (/resume denied/i.test(msg.message || "")) {
+      clearResumeToken(playerName);
+      const help =
+        "That name already has a save, but this browser does not have its resume key. " +
+        "Pick a new name to start fresh, or open the browser/device that first joined.";
+      resetJoinAttempt(help);
+      toast(help, true);
+      track("resume_denied", { name: playerName || "" });
+      return;
+    }
+    // Any other join/admission failure before playable state.
+    if (!state?.player) {
+      resetJoinAttempt(msg.message);
+    }
     toast(msg.message, true);
     resuming = false;
   } else if (msg.type === "social_snapshot") {
@@ -696,6 +737,22 @@ function handleMessage(msg) {
       state = { player: msg.you, floor: msg.floor, others: msg.visible?.players || [], online: msg.online };
     } else {
       state = msg;
+    }
+    // Only treat the client as joined after the server admitted a playable player.
+    if (state?.player?.name) {
+      joined = true;
+      playerName = state.player.name;
+      try {
+        localStorage.setItem("grokhack-name", playerName);
+      } catch {
+        /* private mode */
+      }
+      resuming = false;
+      try {
+        $("join-err").textContent = "";
+      } catch {
+        /* ignore */
+      }
     }
     if (state?.player?.xHandle) cacheXHandle(state.player.xHandle);
     // Detect :verify X success in log lines
@@ -1804,7 +1861,10 @@ $("join-btn")?.addEventListener("click", () => {
     return;
   }
   playerName = name;
-  joined = true;
+  // Do not set joined=true until the server returns a playable state. Setting it
+  // early made Resume-denied failures sticky-reconnect forever.
+  joined = false;
+  resuming = false;
   try {
     $("name-input")?.blur();
   } catch {
@@ -1815,7 +1875,7 @@ $("join-btn")?.addEventListener("click", () => {
   } catch {
     /* private mode */
   }
-  track("join_attempt", { name, ref: acquireRef || undefined });
+  track("join_attempt", { name, ref: acquireRef || undefined, hasResume: !!getResumeToken(name) });
   if (ws?.readyState === 1) {
     ws.send(JSON.stringify({
       type: "join",

@@ -32,6 +32,7 @@ describe("edge configuration", () => {
       ...(env as Env),
       PLAYER_SESSIONS: undefined,
       REALM_DIRECTORIES: undefined,
+      SHADOW_REPLAYS: undefined,
       EDGE_ENVIRONMENT: "production",
       FLOOR_SOCKET_CAP: "2players",
       ROUTE_TICKET_SECRET: "short",
@@ -43,8 +44,20 @@ describe("edge configuration", () => {
     expect(result.errors.join("\n")).toMatch(/FLOOR_SOCKET_CAP/);
     expect(result.errors.join("\n")).toMatch(/PLAYER_SESSIONS/);
     expect(result.errors.join("\n")).toMatch(/REALM_DIRECTORIES/);
+    expect(result.errors.join("\n")).toMatch(/SHADOW_REPLAYS/);
     expect(result.errors.join("\n")).toMatch(/ROUTE_TICKET_SECRET/);
     expect(result.errors.join("\n")).toMatch(/ALLOWED_BROWSER_ORIGINS/);
+  });
+
+  it("rejects an unknown environment before it can weaken origin transport rules", () => {
+    const result = readEdgeConfig({
+      ...(env as Env),
+      EDGE_ENVIRONMENT: "preview-typo",
+      ALLOWED_BROWSER_ORIGINS: "http://insecure.example",
+    } as unknown as Env);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.join("\n")).toMatch(/EDGE_ENVIRONMENT/);
   });
 
   it("requires an explicit power-of-two support window that includes the active layout", () => {

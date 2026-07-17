@@ -5,8 +5,14 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { DuckDBConnection, DuckDBInstance } from "@duckdb/node-api";
+import { createHash } from "node:crypto";
+import { DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
 import type { FloorState, OnlinePlayer } from "./types.js";
+import {
+  validateCombatTurnEnvelopeV1,
+  type CombatTurnEnvelopeV1,
+} from "../src/combat-turn-envelope.js";
+import { MAX_MOVEMENT_TURN_ENVELOPE_BYTES } from "../src/shadow-journal.js";
 import { dataPath } from "./data-paths.js";
 import { LatestSingleFlightWriter } from "./latest-writer.js";
 
@@ -18,6 +24,8 @@ let ready = false;
 let closing = false;
 let currentPath: string | null = null;
 let dbQueue: Promise<void> = Promise.resolve();
+let persistencePoisoned: Error | null = null;
+let movementTurnCommitUsesSlot = false;
 
 const playerTimers = new Map<string, NodeJS.Timeout>();
 const floorTimers = new Map<number, NodeJS.Timeout>();
@@ -29,8 +37,10 @@ const worldMetaWriter = new LatestSingleFlightWriter<WorldMeta>(writeWorldMeta, 
   retryBackoffMs: 1_000,
   onError: (error) => console.error("[db] save world meta:", error),
 });
-/** Durable schema epoch — bump when adding migrations in applyMigrations(). */
-export const SCHEMA_VERSION = 1;
+/** Maximum schema epoch this binary can read, including the accidentally emitted v3 marker. */
+export const SCHEMA_VERSION = 3;
+/** Highest epoch written by this release; additive outbox storage remains rollback-safe at v2. */
+export const SCHEMA_WRITE_VERSION = 2;
 let chatIdSeq = 0;
 
 function enqueueDb<T>(fn: () => Promise<T>): Promise<T> {
@@ -40,6 +50,27 @@ function enqueueDb<T>(fn: () => Promise<T>): Promise<T> {
     () => undefined
   );
   return run;
+}
+
+function activeConnection(expected?: DuckDBConnection): DuckDBConnection {
+  if (persistencePoisoned) throw persistencePoisoned;
+  if (!conn || (expected && conn !== expected)) throw new Error("persistence not initialized");
+  return conn;
+}
+
+function poisonPersistenceConnection(connection: DuckDBConnection, cause: unknown): Error {
+  const failure = new Error("persistence_connection_poisoned", { cause });
+  persistencePoisoned = failure;
+  ready = false;
+  closing = true;
+  if (conn === connection) conn = null;
+  try {
+    connection.closeSync();
+  } catch (closeError) {
+    console.error("[db] close poisoned connection:", closeError);
+  }
+  instance = null;
+  return failure;
 }
 
 async function waitForDbQueue(): Promise<void> {
@@ -65,29 +96,81 @@ function dbPath(): string {
   return DEFAULT_DB;
 }
 
-async function run(sql: string, values?: Record<string, unknown>): Promise<void> {
-  if (!conn) throw new Error("persistence not initialized");
-  await enqueueDb(() => conn!.run(sql, values));
+async function run(sql: string, values?: Record<string, DuckDBValue>): Promise<void> {
+  const connection = activeConnection();
+  await enqueueDb(() => activeConnection(connection).run(sql, values));
 }
 
-async function queryRows<T extends Record<string, unknown>>(sql: string, values?: Record<string, unknown>): Promise<T[]> {
-  if (!conn) throw new Error("persistence not initialized");
+async function queryRows<T extends Record<string, unknown>>(
+  sql: string,
+  values?: Record<string, DuckDBValue>,
+): Promise<T[]> {
+  const connection = activeConnection();
   return enqueueDb(async () => {
-    const reader = await conn!.runAndReadAll(sql, values);
+    const reader = await activeConnection(connection).runAndReadAll(sql, values);
     const rows = reader.getRowObjectsJson() as T[];
     return rows.map((row) => JSON.parse(JSON.stringify(row)) as T);
   });
 }
 
+/** @internal Process-crash seams for the movement snapshot transaction proof. */
+export interface MovementTurnPersistenceCrashHooks {
+  afterBegin?: () => void;
+  afterPlayerWrite?: () => void;
+  afterFloorWrite?: (depth: number, index: number) => void;
+  afterStaleCommitReceiptPrune?: () => void;
+  afterCommitReceiptWrite?: () => void;
+  afterCombatOutboxWrite?: () => void;
+  beforeCommit?: () => void;
+  afterCommit?: () => void;
+  beforeRollback?: () => void;
+}
+
+/** @internal Fault seams for receipt/outbox cleanup transaction proof. */
+export interface MovementTurnCleanupCrashHooks {
+  afterBegin?: () => void;
+  afterCombatOutboxDelete?: () => void;
+  afterCommitReceiptDelete?: () => void;
+  beforeCommit?: () => void;
+  afterCommit?: () => void;
+  beforeRollback?: () => void;
+}
+
+export interface MovementTurnPersistenceIdentity {
+  streamId: string;
+  operationId: string;
+}
+
+function validateMovementTurnPersistenceIdentity(
+  input: MovementTurnPersistenceIdentity,
+): MovementTurnPersistenceIdentity {
+  if (!/^turn_[0-9a-f]{48}$/u.test(input.streamId) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(input.operationId)) {
+    throw new Error("invalid_movement_turn_persistence_identity");
+  }
+  return { streamId: input.streamId, operationId: input.operationId };
+}
+
 export async function initPersistence(): Promise<void> {
   const file = dbPath();
   if (ready && currentPath === file) return;
-  if (ready) await closePersistence();
+  if (ready || conn || instance || persistencePoisoned) await closePersistence();
+  persistencePoisoned = null;
+  closing = false;
   currentPath = file;
   fs.mkdirSync(path.dirname(file), { recursive: true });
 
   instance = await DuckDBInstance.create(file);
   conn = await instance.connect();
+  try {
+    await assertSupportedSchemaVersionBeforeWrites(conn);
+  } catch (error) {
+    conn.closeSync();
+    conn = null;
+    instance = null;
+    currentPath = null;
+    throw error;
+  }
 
   await run(`
     CREATE TABLE IF NOT EXISTS world_meta (
@@ -152,10 +235,11 @@ export async function initPersistence(): Promise<void> {
   await run(`CREATE INDEX IF NOT EXISTS idx_chat_log_posted_at ON chat_log(posted_at);`);
 
   await applyMigrations();
+  movementTurnCommitUsesSlot = await movementTurnCommitTableUsesSlot();
 
   closing = false;
   ready = true;
-  console.log(`[db] DuckDB ready at ${file} (schema v${SCHEMA_VERSION})`);
+  console.log(`[db] DuckDB ready at ${file} (schema v${await getSchemaVersion()})`);
 }
 
 async function appliedMigrationVersions(): Promise<Set<number>> {
@@ -163,12 +247,38 @@ async function appliedMigrationVersions(): Promise<Set<number>> {
   return new Set(rows.map((r) => Number(r.version)));
 }
 
+async function assertSupportedSchemaVersionBeforeWrites(
+  connection: DuckDBConnection,
+): Promise<void> {
+  const tableRows = await readConnectionRows<{ count: number }>(
+    connection,
+    `SELECT COUNT(*)::INTEGER AS count
+       FROM information_schema.tables
+      WHERE table_schema = 'main' AND table_name = 'schema_migrations'`,
+  );
+  if (Number(tableRows[0]?.count ?? 0) === 0) return;
+  const versionRows = await readConnectionRows<{ version: number }>(
+    connection,
+    `SELECT COALESCE(MAX(version), 0)::INTEGER AS version FROM main.schema_migrations`,
+  );
+  if (Number(versionRows[0]?.version ?? 0) > SCHEMA_VERSION) {
+    throw new Error("unsupported_persistence_schema_version");
+  }
+}
+
 /**
  * Idempotent migrations. Version 1 = base tables/indexes (created above).
- * Future ALTERs land here with next SCHEMA_VERSION.
+ * Version 2 = movement snapshot commit receipts used for cross-store recovery.
+ * The immutable combat outbox is additive and deliberately does not advance
+ * the recorded epoch beyond v2. The exact v2 rollback artifact ignores the
+ * extra table and therefore remains boot-compatible. This binary still reads
+ * the already-emitted v3 marker from pre-release incident databases.
  */
 async function applyMigrations(): Promise<void> {
   const applied = await appliedMigrationVersions();
+  if (Math.max(0, ...applied) > SCHEMA_VERSION) {
+    throw new Error("unsupported_persistence_schema_version");
+  }
   const now = Date.now();
 
   if (!applied.has(1)) {
@@ -178,6 +288,48 @@ async function applyMigrations(): Promise<void> {
       { applied_at: now }
     );
   }
+
+  if (!applied.has(2)) {
+    await run(`
+      CREATE TABLE IF NOT EXISTS movement_turn_commits (
+        stream_id VARCHAR NOT NULL,
+        operation_id VARCHAR NOT NULL,
+        player_id VARCHAR NOT NULL,
+        floor_depth_1 INTEGER NOT NULL,
+        floor_depth_2 INTEGER,
+        snapshot_hash VARCHAR NOT NULL,
+        committed_at BIGINT NOT NULL,
+        PRIMARY KEY (stream_id, operation_id)
+      );
+    `);
+    await run(
+      `INSERT INTO schema_migrations (version, applied_at) VALUES (2, $applied_at)
+       ON CONFLICT (version) DO NOTHING`,
+      { applied_at: now },
+    );
+  }
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS movement_turn_combat_outbox (
+      stream_id VARCHAR NOT NULL,
+      operation_id VARCHAR NOT NULL,
+      envelope_hash VARCHAR NOT NULL,
+      envelope_json VARCHAR NOT NULL,
+      committed_at BIGINT NOT NULL,
+      PRIMARY KEY (stream_id, operation_id)
+    );
+  `);
+}
+
+async function movementTurnCommitTableUsesSlot(): Promise<boolean> {
+  const rows = await queryRows<{ count: number }>(`
+    SELECT COUNT(*)::INTEGER AS count
+      FROM information_schema.columns
+     WHERE table_schema = 'main'
+       AND table_name = 'movement_turn_commits'
+       AND column_name = 'slot'
+  `);
+  return Number(rows[0]?.count ?? 0) === 1;
 }
 
 export async function getSchemaVersion(): Promise<number> {
@@ -247,16 +399,218 @@ function serializeFloor(floor: FloorState) {
       dungeon: floor.dungeon,
       monsters: floor.monsters,
       items: floor.items,
+      traps: floor.traps,
+      eventState: floor.eventState,
+      eventBook: floor.eventBook,
     }),
     updated_at: Date.now(),
   };
 }
+
+interface MovementTurnCommitRow {
+  stream_id: string;
+  operation_id: string;
+  player_id: string;
+  floor_depth_1: number;
+  floor_depth_2: number | null;
+  snapshot_hash: string;
+}
+
+async function readConnectionRows<T extends Record<string, unknown>>(
+  connection: DuckDBConnection,
+  sql: string,
+  values?: Record<string, DuckDBValue>,
+): Promise<T[]> {
+  const reader = await connection.runAndReadAll(sql, values);
+  const rows = reader.getRowObjectsJson() as T[];
+  return rows.map((row) => JSON.parse(JSON.stringify(row)) as T);
+}
+
+interface CombatOutboxHashMaterial {
+  envelopeHash: string;
+  envelopeJson: string;
+}
+
+function movementSnapshotHash(
+  playerRow: Record<string, unknown>,
+  floorRows: readonly Record<string, unknown>[],
+  combatOutbox?: CombatOutboxHashMaterial,
+): string {
+  const player = {
+    id: String(playerRow.id),
+    playerName: String(playerRow.player_name),
+    nameLower: String(playerRow.name_lower),
+    glyph: String(playerRow.glyph),
+    playerKind: String(playerRow.player_kind),
+    floorDepth: Number(playerRow.floor_depth),
+    gamePhase: String(playerRow.game_phase),
+    connected: Number(playerRow.connected),
+    lastActive: Number(playerRow.last_active),
+    scoreRecorded: Number(playerRow.score_recorded),
+    stateJson: String(playerRow.state_json),
+    exploredJson: String(playerRow.explored_json),
+    messagesJson: String(playerRow.messages_json),
+  };
+  const floors = floorRows.map((row) => ({
+    depth: Number(row.depth),
+    seed: Number(row.seed),
+    stateJson: String(row.state_json),
+  })).sort((left, right) => left.depth - right.depth);
+  const material = combatOutbox
+    ? { player, floors, combatOutbox }
+    : { player, floors };
+  return createHash("sha256").update(JSON.stringify(material), "utf8").digest("hex");
+}
+
+function normalizeMovementTurnCommitRow(row: Record<string, unknown>): MovementTurnCommitRow | null {
+  const value: MovementTurnCommitRow = {
+    stream_id: String(row.stream_id),
+    operation_id: String(row.operation_id),
+    player_id: String(row.player_id),
+    floor_depth_1: Number(row.floor_depth_1),
+    floor_depth_2: row.floor_depth_2 == null ? null : Number(row.floor_depth_2),
+    snapshot_hash: String(row.snapshot_hash),
+  };
+  if (!/^turn_[0-9a-f]{48}$/u.test(value.stream_id) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value.operation_id) ||
+      !value.player_id || !Number.isSafeInteger(value.floor_depth_1) ||
+      (value.floor_depth_2 !== null && (!Number.isSafeInteger(value.floor_depth_2) ||
+        value.floor_depth_2 === value.floor_depth_1)) ||
+      !/^[0-9a-f]{64}$/u.test(value.snapshot_hash)) {
+    return null;
+  }
+  return value;
+}
+
+async function movementTurnReceiptMatchesStoredSnapshot(
+  connection: DuckDBConnection,
+  receipt: MovementTurnCommitRow,
+): Promise<boolean> {
+  const playerRows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT id, player_name, name_lower, glyph, player_kind, floor_depth, game_phase,
+            connected, last_active, score_recorded, state_json, explored_json, messages_json
+       FROM players WHERE id = $player_id LIMIT 1`,
+    { player_id: receipt.player_id },
+  );
+  const floorRows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT depth, seed, state_json FROM floors
+      WHERE depth = $floor_depth_1 OR ($floor_depth_2 IS NOT NULL AND depth = $floor_depth_2)
+      ORDER BY depth`,
+    {
+      floor_depth_1: receipt.floor_depth_1,
+      floor_depth_2: receipt.floor_depth_2,
+    },
+  );
+  const expectedFloorCount = receipt.floor_depth_2 === null ? 1 : 2;
+  if (playerRows.length !== 1 || floorRows.length !== expectedFloorCount) return false;
+
+  const combatRows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT envelope_hash, envelope_json
+       FROM movement_turn_combat_outbox
+      WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+    { stream_id: receipt.stream_id, operation_id: receipt.operation_id },
+  );
+  if (combatRows.length > 1) return false;
+  let combatOutbox: CombatOutboxHashMaterial | undefined;
+  if (combatRows.length === 1) {
+    const envelopeHash = String(combatRows[0]!.envelope_hash);
+    const envelopeJson = String(combatRows[0]!.envelope_json);
+    try {
+      const envelope = validateCombatTurnEnvelopeV1(JSON.parse(envelopeJson));
+      if (envelope.operationId !== receipt.operation_id || envelope.envelopeHash !== envelopeHash) {
+        return false;
+      }
+      combatOutbox = { envelopeHash, envelopeJson };
+    } catch {
+      return false;
+    }
+  }
+  return movementSnapshotHash(playerRows[0]!, floorRows, combatOutbox) === receipt.snapshot_hash;
+}
+
+interface CombatOutboxPayload {
+  envelope: CombatTurnEnvelopeV1;
+  json: string;
+}
+
+function combatOutboxPayload(
+  identity: MovementTurnPersistenceIdentity,
+  input: CombatTurnEnvelopeV1,
+): CombatOutboxPayload {
+  const envelope = validateCombatTurnEnvelopeV1(input);
+  if (envelope.operationId !== identity.operationId) {
+    throw new Error("movement_turn_combat_outbox_identity_mismatch");
+  }
+  const json = JSON.stringify(envelope);
+  if (Buffer.byteLength(json, "utf8") + 1 > MAX_MOVEMENT_TURN_ENVELOPE_BYTES) {
+    throw new Error("movement_turn_combat_outbox_too_large");
+  }
+  return { envelope, json };
+}
+
+async function combatOutboxMatches(
+  connection: DuckDBConnection,
+  identity: MovementTurnPersistenceIdentity,
+  expected: CombatOutboxPayload | null,
+): Promise<boolean> {
+  const rows = await readConnectionRows<Record<string, unknown>>(
+    connection,
+    `SELECT envelope_hash, envelope_json
+       FROM movement_turn_combat_outbox
+      WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+    { stream_id: identity.streamId, operation_id: identity.operationId },
+  );
+  if (!expected) return rows.length === 0;
+  if (rows.length !== 1 || String(rows[0]!.envelope_hash) !== expected.envelope.envelopeHash ||
+      String(rows[0]!.envelope_json) !== expected.json) return false;
+  try {
+    return validateCombatTurnEnvelopeV1(JSON.parse(String(rows[0]!.envelope_json))).envelopeHash ===
+      expected.envelope.envelopeHash;
+  } catch {
+    return false;
+  }
+}
+
+const UPSERT_PLAYER_SQL = `INSERT INTO players (
+    id, player_name, name_lower, glyph, player_kind, floor_depth, game_phase, connected,
+    last_active, score_recorded, state_json, explored_json, messages_json, updated_at
+  ) VALUES (
+    $id, $player_name, $name_lower, $glyph, $player_kind, $floor_depth, $game_phase, $connected,
+    $last_active, $score_recorded, $state_json, $explored_json, $messages_json, $updated_at
+  )
+  ON CONFLICT (id) DO UPDATE SET
+    player_name = excluded.player_name,
+    name_lower = excluded.name_lower,
+    glyph = excluded.glyph,
+    player_kind = excluded.player_kind,
+    floor_depth = excluded.floor_depth,
+    game_phase = excluded.game_phase,
+    connected = excluded.connected,
+    last_active = excluded.last_active,
+    score_recorded = excluded.score_recorded,
+    state_json = excluded.state_json,
+    explored_json = excluded.explored_json,
+    messages_json = excluded.messages_json,
+    updated_at = excluded.updated_at`;
+
+const UPSERT_FLOOR_SQL = `INSERT INTO floors (depth, seed, state_json, updated_at)
+  VALUES ($depth, $seed, $state_json, $updated_at)
+  ON CONFLICT (depth) DO UPDATE SET
+    seed = excluded.seed,
+    state_json = excluded.state_json,
+    updated_at = excluded.updated_at`;
 
 function deserializeFloor(row: Record<string, unknown>): FloorState {
   const parsed = parseJsonColumn<{
     dungeon: FloorState["dungeon"];
     monsters: FloorState["monsters"];
     items: FloorState["items"];
+    traps?: FloorState["traps"];
+    eventState?: FloorState["eventState"];
+    eventBook?: FloorState["eventBook"];
   }>(row.state_json);
   return {
     depth: Number(row.depth),
@@ -264,37 +618,18 @@ function deserializeFloor(row: Record<string, unknown>): FloorState {
     dungeon: parsed.dungeon,
     monsters: parsed.monsters,
     items: parsed.items,
+    traps: parsed.traps,
+    eventState: parsed.eventState,
+    eventBook: parsed.eventBook,
   };
 }
 
 export async function savePlayerNow(player: OnlinePlayer): Promise<void> {
+  if (persistencePoisoned) throw persistencePoisoned;
   if (!ready || closing) return;
   pendingPlayers.delete(player.id);
   const row = serializePlayer(player);
-  await run(
-    `INSERT INTO players (
-      id, player_name, name_lower, glyph, player_kind, floor_depth, game_phase, connected,
-      last_active, score_recorded, state_json, explored_json, messages_json, updated_at
-    ) VALUES (
-      $id, $player_name, $name_lower, $glyph, $player_kind, $floor_depth, $game_phase, $connected,
-      $last_active, $score_recorded, $state_json, $explored_json, $messages_json, $updated_at
-    )
-    ON CONFLICT (id) DO UPDATE SET
-      player_name = excluded.player_name,
-      name_lower = excluded.name_lower,
-      glyph = excluded.glyph,
-      player_kind = excluded.player_kind,
-      floor_depth = excluded.floor_depth,
-      game_phase = excluded.game_phase,
-      connected = excluded.connected,
-      last_active = excluded.last_active,
-      score_recorded = excluded.score_recorded,
-      state_json = excluded.state_json,
-      explored_json = excluded.explored_json,
-      messages_json = excluded.messages_json,
-      updated_at = excluded.updated_at`,
-    row
-  );
+  await run(UPSERT_PLAYER_SQL, row);
 }
 
 export async function countPlayers(): Promise<number> {
@@ -324,18 +659,287 @@ export function scheduleSavePlayer(player: OnlinePlayer): void {
 }
 
 export async function saveFloorNow(floor: FloorState): Promise<void> {
+  if (persistencePoisoned) throw persistencePoisoned;
   if (!ready || closing) return;
   pendingFloors.delete(floor.depth);
   const row = serializeFloor(floor);
-  await run(
-    `INSERT INTO floors (depth, seed, state_json, updated_at)
-     VALUES ($depth, $seed, $state_json, $updated_at)
-     ON CONFLICT (depth) DO UPDATE SET
-       seed = excluded.seed,
-       state_json = excluded.state_json,
-       updated_at = excluded.updated_at`,
-    row
+  await run(UPSERT_FLOOR_SQL, row);
+}
+
+/**
+ * Commits the movement player plus its source/destination floor snapshots as
+ * one DuckDB transaction. Row values are captured before entering the shared
+ * database queue, and matching debounced writes are cancelled so no older
+ * timer can interleave with the atomic snapshot.
+ */
+export async function saveMovementTurnNow(
+  player: OnlinePlayer,
+  floors: readonly FloorState[],
+  persistenceIdentity: MovementTurnPersistenceIdentity,
+  crashHooks: MovementTurnPersistenceCrashHooks = {},
+  combatEnvelope?: CombatTurnEnvelopeV1,
+): Promise<void> {
+  if (persistencePoisoned) throw persistencePoisoned;
+  if (!ready || closing) throw new Error("movement_turn_persistence_unavailable");
+  if (floors.length < 1 || floors.length > 2 || new Set(floors.map((floor) => floor.depth)).size !== floors.length) {
+    throw new Error("invalid_movement_turn_persistence_floors");
+  }
+  const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const combatOutbox = combatEnvelope ? combatOutboxPayload(identity, combatEnvelope) : null;
+
+  const playerTimer = playerTimers.get(player.id);
+  if (playerTimer) clearTimeout(playerTimer);
+  playerTimers.delete(player.id);
+  pendingPlayers.delete(player.id);
+  for (const floor of floors) {
+    const floorTimer = floorTimers.get(floor.depth);
+    if (floorTimer) clearTimeout(floorTimer);
+    floorTimers.delete(floor.depth);
+    pendingFloors.delete(floor.depth);
+  }
+
+  const playerRow = serializePlayer(player);
+  const floorRows = floors.map(serializeFloor);
+  const floorDepths = floors.map((floor) => floor.depth).sort((left, right) => left - right);
+  const snapshotHash = movementSnapshotHash(
+    playerRow,
+    floorRows,
+    combatOutbox
+      ? { envelopeHash: combatOutbox.envelope.envelopeHash, envelopeJson: combatOutbox.json }
+      : undefined,
   );
+  const expectedReceipt: MovementTurnCommitRow = {
+    stream_id: identity.streamId,
+    operation_id: identity.operationId,
+    player_id: player.id,
+    floor_depth_1: floorDepths[0]!,
+    floor_depth_2: floorDepths[1] ?? null,
+    snapshot_hash: snapshotHash,
+  };
+  const connection = activeConnection();
+  await enqueueDb(async () => {
+    activeConnection(connection);
+    let committed = false;
+    try {
+      await connection.run("BEGIN TRANSACTION");
+      crashHooks.afterBegin?.();
+      const existingRows = await readConnectionRows<Record<string, unknown>>(
+        connection,
+        `SELECT stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash
+           FROM movement_turn_commits
+          WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+        { stream_id: identity.streamId, operation_id: identity.operationId },
+      );
+      if (existingRows.length) {
+        const existing = normalizeMovementTurnCommitRow(existingRows[0]!);
+        if (existingRows.length !== 1 || !existing ||
+            JSON.stringify(existing) !== JSON.stringify(expectedReceipt) ||
+            !(await movementTurnReceiptMatchesStoredSnapshot(connection, existing)) ||
+            !(await combatOutboxMatches(connection, identity, combatOutbox))) {
+          throw new Error("movement_turn_persistence_receipt_conflict");
+        }
+        await connection.run(
+          `DELETE FROM movement_turn_commits
+            WHERE stream_id <> $stream_id OR operation_id <> $operation_id`,
+          { stream_id: identity.streamId, operation_id: identity.operationId },
+        );
+        await connection.run(
+          `DELETE FROM movement_turn_combat_outbox
+            WHERE stream_id <> $stream_id OR operation_id <> $operation_id`,
+          { stream_id: identity.streamId, operation_id: identity.operationId },
+        );
+        crashHooks.afterStaleCommitReceiptPrune?.();
+        await connection.run("COMMIT");
+        committed = true;
+        crashHooks.afterCommit?.();
+        return;
+      }
+      // The filesystem journal admits only one global prepared movement. A
+      // different receipt is stale cleanup residue from an already completed
+      // marker. Prune it inside the new transaction so the table remains in
+      // one application-managed slot even when cleanup repeatedly fails after
+      // marker removal. enqueueDb serializes every writer around this delete
+      // and replacement insert.
+      await connection.run(`DELETE FROM movement_turn_commits`);
+      await connection.run(`DELETE FROM movement_turn_combat_outbox`);
+      crashHooks.afterStaleCommitReceiptPrune?.();
+      await connection.run(UPSERT_PLAYER_SQL, playerRow);
+      crashHooks.afterPlayerWrite?.();
+      for (let index = 0; index < floorRows.length; index += 1) {
+        const floor = floors[index]!;
+        await connection.run(UPSERT_FLOOR_SQL, floorRows[index]!);
+        crashHooks.afterFloorWrite?.(floor.depth, index);
+      }
+      const receiptValues = { ...expectedReceipt, committed_at: Date.now() };
+      if (movementTurnCommitUsesSlot) {
+        // One unpublished schema-v2 branch briefly required a literal slot.
+        // Preserve that physical shape in place so its QA databases upgrade
+        // without a destructive rewrite; canonical v2 databases use the
+        // original composite-key insert below.
+        await connection.run(
+          `INSERT INTO movement_turn_commits (
+             slot, stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           ) VALUES (
+             1, $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           )`,
+          receiptValues,
+        );
+      } else {
+        await connection.run(
+          `INSERT INTO movement_turn_commits (
+             stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash, committed_at
+           ) VALUES (
+             $stream_id, $operation_id, $player_id, $floor_depth_1, $floor_depth_2, $snapshot_hash, $committed_at
+           )`,
+          receiptValues,
+        );
+      }
+      crashHooks.afterCommitReceiptWrite?.();
+      if (combatOutbox) {
+        await connection.run(
+          `INSERT INTO movement_turn_combat_outbox (
+             stream_id, operation_id, envelope_hash, envelope_json, committed_at
+           ) VALUES (
+             $stream_id, $operation_id, $envelope_hash, $envelope_json, $committed_at
+           )`,
+          {
+            stream_id: identity.streamId,
+            operation_id: identity.operationId,
+            envelope_hash: combatOutbox.envelope.envelopeHash,
+            envelope_json: combatOutbox.json,
+            committed_at: Date.now(),
+          },
+        );
+        crashHooks.afterCombatOutboxWrite?.();
+      }
+      crashHooks.beforeCommit?.();
+      await connection.run("COMMIT");
+      committed = true;
+      crashHooks.afterCommit?.();
+    } catch (error) {
+      if (!committed) {
+        try {
+          crashHooks.beforeRollback?.();
+          await connection.run("ROLLBACK");
+        } catch (rollbackError) {
+          poisonPersistenceConnection(connection, rollbackError);
+          throw new AggregateError(
+            [error, rollbackError],
+            "movement turn transaction rollback failed",
+            { cause: rollbackError },
+          );
+        }
+      }
+      throw error;
+    }
+  });
+}
+
+/** True only when the receipt and the exact committed player/floor snapshot still match. */
+export async function hasMovementTurnCommit(
+  persistenceIdentity: MovementTurnPersistenceIdentity,
+): Promise<boolean> {
+  const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const connection = activeConnection();
+  return enqueueDb(async () => {
+    activeConnection(connection);
+    const rows = await readConnectionRows<Record<string, unknown>>(
+      connection,
+      `SELECT stream_id, operation_id, player_id, floor_depth_1, floor_depth_2, snapshot_hash
+         FROM movement_turn_commits
+        WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+      { stream_id: identity.streamId, operation_id: identity.operationId },
+    );
+    if (rows.length !== 1) return false;
+    const receipt = normalizeMovementTurnCommitRow(rows[0]!);
+    return receipt !== null && await movementTurnReceiptMatchesStoredSnapshot(connection, receipt);
+  });
+}
+
+/** Returns immutable combat evidence committed with the authoritative snapshot. */
+export async function readMovementTurnCombatOutbox(
+  persistenceIdentity: MovementTurnPersistenceIdentity,
+): Promise<CombatTurnEnvelopeV1 | null> {
+  const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const connection = activeConnection();
+  return enqueueDb(async () => {
+    activeConnection(connection);
+    const rows = await readConnectionRows<Record<string, unknown>>(
+      connection,
+      `SELECT envelope_hash, envelope_json
+         FROM movement_turn_combat_outbox
+        WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+      { stream_id: identity.streamId, operation_id: identity.operationId },
+    );
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) throw new Error("movement_turn_combat_outbox_corrupt");
+    try {
+      const envelope = validateCombatTurnEnvelopeV1(JSON.parse(String(rows[0]!.envelope_json)));
+      if (envelope.operationId !== identity.operationId ||
+          envelope.envelopeHash !== String(rows[0]!.envelope_hash)) {
+        throw new Error("movement_turn_combat_outbox_corrupt");
+      }
+      return envelope;
+    } catch (error) {
+      if (error instanceof Error && error.message === "movement_turn_combat_outbox_corrupt") throw error;
+      throw new Error("movement_turn_combat_outbox_corrupt", { cause: error });
+    }
+  });
+}
+
+/** Deletes one receipt only after its durable filesystem preparation has been removed. */
+export async function deleteMovementTurnCommit(
+  persistenceIdentity: MovementTurnPersistenceIdentity,
+  crashHooks: MovementTurnCleanupCrashHooks = {},
+): Promise<void> {
+  const identity = validateMovementTurnPersistenceIdentity(persistenceIdentity);
+  const connection = activeConnection();
+  await enqueueDb(async () => {
+    activeConnection(connection);
+    let committed = false;
+    try {
+      await connection.run("BEGIN TRANSACTION");
+      crashHooks.afterBegin?.();
+      const values = { stream_id: identity.streamId, operation_id: identity.operationId };
+      await connection.run(
+        `DELETE FROM movement_turn_combat_outbox
+          WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+        values,
+      );
+      crashHooks.afterCombatOutboxDelete?.();
+      await connection.run(
+        `DELETE FROM movement_turn_commits
+          WHERE stream_id = $stream_id AND operation_id = $operation_id`,
+        values,
+      );
+      crashHooks.afterCommitReceiptDelete?.();
+      crashHooks.beforeCommit?.();
+      await connection.run("COMMIT");
+      committed = true;
+      crashHooks.afterCommit?.();
+    } catch (error) {
+      if (!committed) {
+        try {
+          crashHooks.beforeRollback?.();
+          await connection.run("ROLLBACK");
+        } catch (rollbackError) {
+          poisonPersistenceConnection(connection, rollbackError);
+          throw new AggregateError(
+            [error, rollbackError],
+            "movement turn cleanup rollback failed",
+            { cause: rollbackError },
+          );
+        }
+      }
+      throw error;
+    }
+  });
+}
+
+/** Boot-only cleanup for receipts whose filesystem preparation already completed. */
+export async function clearMovementTurnCommits(): Promise<void> {
+  await run(`DELETE FROM movement_turn_combat_outbox`);
+  await run(`DELETE FROM movement_turn_commits`);
 }
 
 export async function loadFloorByDepth(depth: number): Promise<FloorState | null> {
@@ -473,6 +1077,7 @@ export async function loadWorld(): Promise<PersistedWorld | null> {
 }
 
 export async function flushPersistence(): Promise<void> {
+  if (persistencePoisoned) throw persistencePoisoned;
   for (const timer of playerTimers.values()) clearTimeout(timer);
   for (const timer of floorTimers.values()) clearTimeout(timer);
   playerTimers.clear();
@@ -498,23 +1103,24 @@ export async function closePersistence(): Promise<void> {
   playerTimers.clear();
   floorTimers.clear();
 
-  const pendingP = [...pendingPlayers.values()];
-  const pendingF = [...pendingFloors.values()];
+  const pendingP = persistencePoisoned ? [] : [...pendingPlayers.values()];
+  const pendingF = persistencePoisoned ? [] : [...pendingFloors.values()];
   pendingPlayers.clear();
   pendingFloors.clear();
 
-  const wasClosing = closing;
-  closing = false;
-  ready = true;
-  try {
-    await Promise.all([
-      ...pendingP.map((p) => savePlayerNow(p)),
-      ...pendingF.map((f) => saveFloorNow(f)),
-      worldMetaWriter.flush(),
-    ]);
-    await waitForDbQueue();
-  } finally {
-    closing = wasClosing;
+  if (!persistencePoisoned && ready) {
+    const wasClosing = closing;
+    closing = false;
+    try {
+      await Promise.all([
+        ...pendingP.map((p) => savePlayerNow(p)),
+        ...pendingF.map((f) => saveFloorNow(f)),
+        worldMetaWriter.flush(),
+      ]);
+      await waitForDbQueue();
+    } finally {
+      closing = wasClosing;
+    }
   }
 
   await waitForDbQueue();
@@ -526,6 +1132,8 @@ export async function closePersistence(): Promise<void> {
   ready = false;
   closing = false;
   currentPath = null;
+  persistencePoisoned = null;
+  movementTurnCommitUsesSlot = false;
 }
 
 /** @internal test helper */
